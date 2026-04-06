@@ -1,0 +1,65 @@
+# Git
+.git/
+.gitignore
+
+# Private / internal
+
+experiments/
+.claude/
+
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Model files (large)
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.dmx
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build artifacts
+*.dll
+*.dylib
+kernel/*.o
+
+# Test/benchmark outputs
+tests/output/
+benchmarks/output/
+output/
+
+# Docker
+Dockerfile
+.dockerignore

@@ -1,0 +1,1962 @@
+#!/usr/bin/env python
+"""
+DMX CLI - Delta Multiplexed Model Compressor
+Patent Pending. (c) 2026 William J. Riley. MIT License.
+
+Compresses neural network model weights using aligned cross-layer
+quantization and stream-separated block floating point encoding.
+
+Usage:
+    python dmx_cli.py compress model.safetensors model.dmx
+    python dmx_cli.py compress model.safetensors model.dmx --mode bfp
+    python dmx_cli.py compress model.safetensors model.dmx --entropy lpc
+    python dmx_cli.py decompress model.dmx model.safetensors
+    python dmx_cli.py info model.dmx
+    python dmx_cli.py verify model.safetensors model.dmx
+"""
+
+import argparse
+import datetime
+import hashlib
+import io
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import wave
+
+import numpy as np
+import torch
+import zstandard as zstd
+from safetensors.torch import load_file, save_file
+
+# --- Constants ---
+DMX_MAGIC = b"DMX1"
+DMX_VERSION = 2
+ZSTD_LEVEL = 19          # Single-file compression (archival, best ratio)
+ZSTD_LEVEL_DELTA = 3     # Delta compression (speed matters for training callbacks)
+
+# Chunk types
+CHUNK_HEADER = 0
+CHUNK_TENSOR = 1
+
+# Encoding modes (zstd entropy)
+ENC_FP16_ZSTD = 0       # Already FP16: store raw bytes + zstd
+ENC_INT16_QUANT = 1      # FP32 -> int16 quantization + zstd
+ENC_DELTA_ZSTD = 2       # Delta-encode int16 view + zstd
+ENC_RAW_ZSTD = 3         # Fallback: raw bytes + zstd (for odd dtypes)
+ENC_BFP_ZSTD = 4         # Block Floating Point: shared exponent + truncated mantissa + zstd
+ENC_INT32_QUANT = 5      # FP32 -> int32 aligned quantization + zstd (practically lossless)
+
+# Encoding modes (LPC/FLAC entropy)
+ENC_FP16_LPC = 10       # Already FP16: store raw bytes as FLAC
+ENC_INT16_QUANT_LPC = 11 # FP32 -> int16 quantization + FLAC
+ENC_DELTA_LPC = 12       # Delta-encode int16 view + FLAC
+ENC_RAW_LPC = 13         # Fallback: raw bytes + FLAC (for odd dtypes)
+ENC_BFP_LPC = 14         # Block Floating Point: shared exponent + truncated mantissa + FLAC
+ENC_INT32_QUANT_LPC = 15 # FP32 -> int32 aligned quantization + FLAC (practically lossless)
+
+# Module-level flag for GPU compression (set by CLI --gpu)
+_use_gpu_compress = False
+
+# Native CUDA kernels (loaded on demand)
+_dmx_cuda = None
+
+def _get_cuda_kernels():
+    """Load native CUDA kernels if available. Returns module or None."""
+    global _dmx_cuda
+    if _dmx_cuda is not None:
+        return _dmx_cuda
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from kernel.build import get_kernels
+        _dmx_cuda = get_kernels()
+        return _dmx_cuda
+    except Exception:
+        return None
+
+# BFP defaults
+BFP_GROUP_SIZE = 32
+BFP_MANTISSA_BITS = 6
+
+# Minimum raw byte count to use FLAC/LPC. Below this, FLAC file overhead
+# (~8KB header/framing) dominates and zstd wins. Measured on svd_xt tensors.
+LPC_MIN_RAW_BYTES = 32768  # 32 KB
+
+# Map zstd encoding to LPC equivalent and back
+_ZSTD_TO_LPC = {
+    ENC_FP16_ZSTD: ENC_FP16_LPC,
+    ENC_INT16_QUANT: ENC_INT16_QUANT_LPC,
+    ENC_DELTA_ZSTD: ENC_DELTA_LPC,
+    ENC_RAW_ZSTD: ENC_RAW_LPC,
+    ENC_BFP_ZSTD: ENC_BFP_LPC,
+    ENC_INT32_QUANT: ENC_INT32_QUANT_LPC,
+}
+_LPC_TO_ZSTD = {v: k for k, v in _ZSTD_TO_LPC.items()}
+
+# All LPC encoding types
+_LPC_ENCODINGS = set(_ZSTD_TO_LPC.values())
+
+
+def _find_ffmpeg():
+    """Find ffmpeg binary. Returns path or None."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    # Check common Windows locations
+    for candidate in [
+        r"C:\tools\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+FFMPEG_PATH = _find_ffmpeg()
+
+
+def _int16_to_flac(int16_bytes, num_samples):
+    """Encode int16 PCM data to FLAC bytes via ffmpeg.
+
+    Args:
+        int16_bytes: raw int16 PCM data (little-endian)
+        num_samples: number of int16 samples
+
+    Returns:
+        FLAC file bytes
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dmx_")
+    wav_path = os.path.join(tmpdir, "input.wav")
+    flac_path = os.path.join(tmpdir, "output.flac")
+    try:
+        # Write WAV file using wave module (44-byte header + raw int16)
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(44100)
+            wf.writeframes(int16_bytes)
+
+        # Encode to FLAC with max compression
+        result = subprocess.run(
+            [FFMPEG_PATH, "-y", "-i", wav_path,
+             "-c:a", "flac", "-compression_level", "12",
+             flac_path],
+            capture_output=True, timeout=300
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg FLAC encode failed: {result.stderr.decode('utf-8', errors='replace')[:500]}")
+
+        with open(flac_path, "rb") as f:
+            return f.read()
+    finally:
+        # Cleanup temp files
+        for p in [wav_path, flac_path]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+def _flac_to_int16(flac_bytes):
+    """Decode FLAC bytes back to int16 PCM data via ffmpeg.
+
+    Returns:
+        numpy array of int16 values
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dmx_")
+    flac_path = os.path.join(tmpdir, "input.flac")
+    wav_path = os.path.join(tmpdir, "output.wav")
+    try:
+        with open(flac_path, "wb") as f:
+            f.write(flac_bytes)
+
+        result = subprocess.run(
+            [FFMPEG_PATH, "-y", "-i", flac_path,
+             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "1",
+             wav_path],
+            capture_output=True, timeout=300
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg FLAC decode failed: {result.stderr.decode('utf-8', errors='replace')[:500]}")
+
+        with wave.open(wav_path, "rb") as wf:
+            raw = wf.readframes(wf.getnframes())
+
+        return np.frombuffer(raw, dtype=np.int16).copy()
+    finally:
+        for p in [flac_path, wav_path]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+def _compress_bytes_lpc(raw_bytes, num_int16_samples):
+    """Compress raw int16 bytes using FLAC/LPC. Returns FLAC bytes."""
+    return _int16_to_flac(raw_bytes, num_int16_samples)
+
+
+def _decompress_bytes_lpc(flac_bytes):
+    """Decompress FLAC bytes back to raw int16 bytes. Returns (bytes, num_samples)."""
+    arr = _flac_to_int16(flac_bytes)
+    return arr.tobytes(), len(arr)
+
+
+def _compress_bytes_uint8_lpc(raw_bytes):
+    """Compress uint8 data via FLAC by packing pairs into int16 samples.
+
+    FLAC requires int16 samples. We pack two uint8 bytes into one int16
+    (low byte + high byte), encode as FLAC, then unpack on decode.
+
+    Returns: (flac_bytes, original_len, padded)
+    """
+    data = np.frombuffer(raw_bytes, dtype=np.uint8)
+    orig_len = len(data)
+    # Pad to even length
+    if orig_len % 2 != 0:
+        data = np.concatenate([data, np.zeros(1, dtype=np.uint8)])
+    # Reinterpret as int16 (pairs of uint8 -> int16 little-endian)
+    int16_data = data.view(np.int16)
+    flac_bytes = _int16_to_flac(int16_data.tobytes(), len(int16_data))
+    return flac_bytes, orig_len
+
+
+def _decompress_bytes_uint8_lpc(flac_bytes, original_len):
+    """Decompress FLAC back to uint8 data."""
+    arr = _flac_to_int16(flac_bytes)
+    # Reinterpret int16 as pairs of uint8
+    uint8_data = arr.view(np.uint8)
+    return uint8_data[:original_len].tobytes()
+
+
+def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
+    """
+    Block Floating Point compression for FP16 tensors.
+
+    For each group of `group_size` values:
+    1. Find the max exponent in the group (shared exponent)
+    2. Shift all mantissas to align with shared exponent
+    3. Truncate mantissa to `mantissa_bits`
+    4. Store: shared exponents stream + sign-mantissa stream (separately zstd'd)
+
+    Effective bits per value: (8/group_size) + 1 + mantissa_bits
+    At g=32, m=6: 7.25 bits/value (vs 16) = 54.7% before entropy coding.
+    """
+    # Convert to FP16 if needed (FP32/BF16 -> FP16)
+    t = tensor.contiguous().cpu()
+    original_dtype = str(t.dtype).replace("torch.", "")
+    if t.dtype == torch.float32 or t.dtype == torch.bfloat16:
+        t = t.half()
+
+    raw = t.view(torch.int16).numpy().astype(np.uint16)
+    flat = raw.flatten()
+    orig_len = len(flat)
+
+    # Pad to multiple of group_size
+    pad_len = (group_size - orig_len % group_size) % group_size
+    if pad_len:
+        flat = np.concatenate([flat, np.zeros(pad_len, dtype=np.uint16)])
+
+    n_groups = len(flat) // group_size
+    groups = flat.reshape(n_groups, group_size)
+
+    # Extract FP16 fields
+    signs = ((groups >> 15) & 1).astype(np.uint8)       # 1 bit
+    exponents = ((groups >> 10) & 0x1F).astype(np.uint8) # 5 bits
+    mantissas = (groups & 0x3FF).astype(np.uint16)       # 10 bits
+
+    # Add implicit leading 1 for normal numbers (exponent != 0)
+    # For subnormals (exp=0), the implicit bit is 0
+    implicit = np.where(exponents > 0, np.uint16(0x400), np.uint16(0))
+    full_mantissa = mantissas | implicit  # 11 bits
+
+    # Shared exponent per group = max exponent in each group
+    shared_exp = exponents.max(axis=1)  # shape [n_groups]
+
+    # Shift mantissas to align with shared exponent
+    exp_diff = shared_exp[:, np.newaxis].astype(np.int16) - exponents.astype(np.int16)
+    # Clamp shift to avoid shifting away everything (max meaningful shift ~ 11 bits)
+    exp_diff = np.clip(exp_diff, 0, 15)
+    shifted_mantissa = full_mantissa >> exp_diff.astype(np.uint16)
+
+    # Truncate to mantissa_bits (keep top bits of 11-bit mantissa)
+    shift_amount = 11 - mantissa_bits
+    truncated = (shifted_mantissa >> shift_amount).astype(np.uint8)
+
+    # Build streams
+    exp_stream = shared_exp.astype(np.uint8)  # n_groups bytes
+
+    # Combine sign (1 bit) + truncated mantissa (mantissa_bits) into one byte
+    # For m=6: 1+6=7 bits, fits in uint8
+    sign_mant = (signs << mantissa_bits) | truncated
+    sign_mant_stream = sign_mant.flatten().astype(np.uint8)
+
+    return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
+
+
+def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
+    """GPU-accelerated BFP compression using PyTorch CUDA ops.
+
+    Same algorithm as bfp_compress but with vectorized GPU operations
+    instead of numpy CPU ops. Returns numpy arrays (same interface).
+    """
+    t = tensor.contiguous().cpu()
+    original_dtype = str(t.dtype).replace("torch.", "")
+    if t.dtype == torch.float32 or t.dtype == torch.bfloat16:
+        t = t.half()
+
+    # View as uint16 via int16 reinterpret
+    raw = t.view(torch.int16).flatten()
+    orig_len = len(raw)
+
+    # Pad to multiple of group_size
+    pad_len = (group_size - orig_len % group_size) % group_size
+    if pad_len:
+        raw = torch.cat([raw, torch.zeros(pad_len, dtype=torch.int16)])
+
+    # Transfer to GPU as int32 for bit ops
+    flat = raw.to(dtype=torch.int32, device='cuda')
+    # Convert signed int16 view to unsigned: mask with 0xFFFF
+    flat = flat & 0xFFFF
+
+    n_groups = len(flat) // group_size
+    groups = flat.reshape(n_groups, group_size)
+
+    # Extract FP16 fields (all vectorized on GPU)
+    signs = ((groups >> 15) & 1)           # 1 bit
+    exponents = ((groups >> 10) & 0x1F)    # 5 bits
+    mantissas = (groups & 0x3FF)           # 10 bits
+
+    # Add implicit leading 1 for normal numbers (exponent != 0)
+    implicit = torch.where(exponents > 0,
+                          torch.ones_like(exponents) * 0x400,
+                          torch.zeros_like(exponents))
+    full_mantissa = mantissas | implicit   # 11 bits
+
+    # Shared exponent per group = max exponent in each group
+    shared_exp = exponents.max(dim=1).values  # [n_groups]
+
+    # Shift mantissas to align with shared exponent
+    exp_diff = shared_exp.unsqueeze(1) - exponents  # [n_groups, group_size]
+    exp_diff = exp_diff.clamp(0, 15)
+    shifted_mantissa = full_mantissa >> exp_diff
+
+    # Truncate to mantissa_bits
+    shift_amount = 11 - mantissa_bits
+    truncated = shifted_mantissa >> shift_amount
+
+    # Build streams: sign (1 bit) + truncated mantissa (mantissa_bits)
+    sign_mant = (signs << mantissa_bits) | truncated
+
+    # Transfer back to CPU as numpy
+    exp_stream = shared_exp.to(torch.uint8).cpu().numpy()
+    sign_mant_stream = sign_mant.flatten().to(torch.uint8).cpu().numpy()
+
+    return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
+
+
+def bfp_decompress(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
+                   original_dtype, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
+    """Decompress BFP back to FP16 (or original dtype).
+
+    During compression, values with smaller exponents than the group max had their
+    mantissas shifted right, moving the implicit leading 1 to a lower bit position.
+    To decompress, we find where that leading 1 ended up, derive the actual exponent
+    offset from shared_exp, and reconstruct the FP16 value properly.
+    """
+    n_groups = len(exp_stream)
+    sign_mant = sign_mant_stream.reshape(n_groups, group_size)
+
+    signs = ((sign_mant >> mantissa_bits) & 1).astype(np.uint16)
+    truncated = (sign_mant & ((1 << mantissa_bits) - 1)).astype(np.uint16)
+
+    # Reconstruct to 11-bit position
+    shift_amount = 11 - mantissa_bits
+    recon_11 = truncated.astype(np.uint16) << shift_amount
+
+    shared_exp = exp_stream[:, np.newaxis].astype(np.int16)
+
+    # Find the leading 1 bit to determine actual exponent
+    # Bit 10 = value had same exponent as shared (offset 0)
+    # Bit 9 = exponent was shared_exp - 1, etc.
+    result_exp = np.zeros_like(recon_11, dtype=np.int16)
+    result_mant = np.zeros_like(recon_11, dtype=np.uint16)
+    found = np.zeros_like(recon_11, dtype=bool)
+
+    for bit_pos in range(10, -1, -1):
+        mask = np.uint16(1 << bit_pos)
+        has_bit = (recon_11 & mask) != 0
+        unprocessed = (~found) & has_bit
+
+        actual_exp = shared_exp - np.int16(10 - bit_pos)
+        shift_up = np.uint16(10 - bit_pos)
+        shifted_up = recon_11.astype(np.uint32) << shift_up
+        mant_10 = (shifted_up & 0x3FF).astype(np.uint16)
+
+        result_exp = np.where(unprocessed, actual_exp, result_exp)
+        result_mant = np.where(unprocessed, mant_10, result_mant)
+        found = found | unprocessed
+
+    # Clamp to valid FP16 exponent range [0, 31]
+    result_exp = np.clip(result_exp, 0, 31).astype(np.uint16)
+
+    # Zero values: if truncated was 0, output zero
+    is_zero = (truncated == 0)
+    result_exp = np.where(is_zero, np.uint16(0), result_exp)
+    result_mant = np.where(is_zero, np.uint16(0), result_mant)
+
+    # Reassemble FP16: sign(1) | exponent(5) | mantissa(10)
+    fp16_values = (signs << 15) | (result_exp << 10) | result_mant
+    fp16_values = fp16_values.astype(np.uint16)
+
+    flat = fp16_values.flatten()[:orig_len]
+
+    result = torch.from_numpy(flat.astype(np.int16).copy()).view(torch.float16).reshape(shape)
+
+    if original_dtype == "float32":
+        result = result.float()
+    elif original_dtype == "bfloat16":
+        result = result.to(torch.bfloat16)
+
+    return result
+
+
+def bfp_decompress_gpu(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
+                       original_dtype, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
+    """GPU-accelerated BFP decompression using PyTorch CUDA ops.
+
+    Replaces the CPU leading-one-bit scan loop with parallel GPU bit operations.
+    The exponent and sign-mantissa streams are transferred to GPU, reconstructed
+    via bitwise ops, and the result transferred back to CPU.
+    """
+    n_groups = len(exp_stream)
+
+    # Transfer compressed streams to GPU as int32 (for bit ops without overflow)
+    sign_mant_gpu = torch.from_numpy(sign_mant_stream.copy()).to(
+        dtype=torch.int32, device='cuda'
+    ).reshape(n_groups, group_size)
+
+    # Extract sign and truncated mantissa
+    mant_mask = (1 << mantissa_bits) - 1
+    signs = (sign_mant_gpu >> mantissa_bits) & 1            # [n_groups, group_size]
+    truncated = sign_mant_gpu & mant_mask                   # [n_groups, group_size]
+
+    # Reconstruct to 11-bit position
+    shift_amount = 11 - mantissa_bits
+    recon_11 = truncated << shift_amount                     # [n_groups, group_size]
+
+    # Shared exponent per group, broadcast to [n_groups, 1]
+    shared_exp = torch.from_numpy(exp_stream.copy()).to(
+        dtype=torch.int32, device='cuda'
+    ).unsqueeze(1)                                           # [n_groups, 1]
+
+    # Find leading-one bit position using parallel scan
+    # For each value, find the highest set bit in the 11-bit recon_11 field.
+    # bit_pos 10 means offset=0 from shared_exp, bit_pos 9 means offset=1, etc.
+    #
+    # Strategy: iterate from high bit to low, but all ops are vectorized on GPU.
+    # This is 11 iterations of pure tensor ops -- no Python-level per-element work.
+    result_exp = torch.zeros_like(recon_11)
+    result_mant = torch.zeros_like(recon_11)
+    found = torch.zeros(n_groups, group_size, dtype=torch.bool, device='cuda')
+
+    for bit_pos in range(10, -1, -1):
+        mask = 1 << bit_pos
+        has_bit = (recon_11 & mask) != 0
+        unprocessed = (~found) & has_bit
+
+        offset = 10 - bit_pos
+        actual_exp = shared_exp - offset
+        shifted_up = (recon_11 << offset) & 0x3FF
+
+        result_exp = torch.where(unprocessed, actual_exp, result_exp)
+        result_mant = torch.where(unprocessed, shifted_up, result_mant)
+        found = found | unprocessed
+
+    # Clamp exponent to valid FP16 range [0, 31]
+    result_exp = result_exp.clamp(0, 31)
+
+    # Zero values: if truncated was 0, output zero
+    is_zero = (truncated == 0)
+    result_exp = torch.where(is_zero, torch.zeros_like(result_exp), result_exp)
+    result_mant = torch.where(is_zero, torch.zeros_like(result_mant), result_mant)
+
+    # Reassemble FP16 bits: sign(1) | exponent(5) | mantissa(10)
+    fp16_bits = (signs << 15) | (result_exp << 10) | result_mant
+
+    # Flatten and trim padding
+    flat = fp16_bits.flatten()[:orig_len].to(torch.int16)
+
+    # Transfer back to CPU and reinterpret as float16
+    result = flat.cpu().view(torch.float16).reshape(shape)
+
+    if original_dtype == "float32":
+        result = result.float()
+    elif original_dtype == "bfloat16":
+        result = result.to(torch.bfloat16)
+
+    return result
+
+
+def detect_encoding(tensor, mode="auto", entropy="zstd"):
+    """Decide best encoding for a tensor.
+    mode: 'auto' (detect), 'bfp' (force BFP), 'int16' (legacy behavior)
+    entropy: 'zstd' or 'lpc' -- selects entropy coding backend
+    """
+    # First, pick the zstd-based encoding as baseline
+    if mode == "bfp":
+        if tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            enc = ENC_BFP_ZSTD
+        else:
+            enc = ENC_RAW_ZSTD
+    elif mode == "int32":
+        if tensor.dtype == torch.float32:
+            flat = tensor.flatten().float()
+            scale = flat.abs().max().item()
+            if scale == 0:
+                enc = ENC_FP16_ZSTD
+            else:
+                enc = ENC_INT32_QUANT
+        elif tensor.dtype in (torch.float16, torch.bfloat16):
+            enc = ENC_BFP_ZSTD  # FP16/BF16 already small, use BFP
+        else:
+            enc = ENC_RAW_ZSTD
+    elif mode == "int16":
+        if tensor.dtype == torch.float16 or tensor.dtype == torch.bfloat16:
+            raw = tensor.contiguous().cpu().numpy().view(np.int16)
+            if raw.size > 16:
+                delta = np.diff(raw.flatten().astype(np.int32)).astype(np.int16)
+                zero_frac = np.sum(delta == 0) / delta.size
+                if zero_frac > 0.20:
+                    enc = ENC_DELTA_ZSTD
+                else:
+                    enc = ENC_FP16_ZSTD
+            else:
+                enc = ENC_FP16_ZSTD
+        elif tensor.dtype == torch.float32:
+            flat = tensor.flatten().float()
+            scale = flat.abs().max().item()
+            if scale == 0:
+                enc = ENC_FP16_ZSTD
+            else:
+                enc = ENC_INT16_QUANT
+        else:
+            enc = ENC_RAW_ZSTD
+    else:
+        # Auto mode
+        if tensor.dtype == torch.float16 or tensor.dtype == torch.bfloat16:
+            enc = ENC_BFP_ZSTD
+        elif tensor.dtype == torch.float32:
+            flat = tensor.flatten().float()
+            scale = flat.abs().max().item()
+            if scale == 0:
+                enc = ENC_FP16_ZSTD
+            else:
+                enc = ENC_INT16_QUANT
+        else:
+            enc = ENC_RAW_ZSTD
+
+    # If LPC entropy requested, map to LPC variant (only for tensors large enough)
+    # Exception: BFP mantissa streams are uint8, where zstd beats FLAC.
+    # Only use LPC for int16-native paths (FP16, INT16Q, DELTA, RAW).
+    if entropy == "lpc" and enc in _ZSTD_TO_LPC and enc not in (ENC_BFP_ZSTD, ENC_INT32_QUANT):
+        # INT32_QUANT stays zstd — FLAC is int16-native, int32 values need splitting
+        raw_bytes = tensor.numel() * tensor.element_size()
+        if raw_bytes >= LPC_MIN_RAW_BYTES:
+            enc = _ZSTD_TO_LPC[enc]
+        # else: keep zstd -- FLAC header overhead dominates for tiny tensors
+
+    return enc
+
+
+def _is_lpc_encoding(encoding):
+    """Check if encoding uses LPC/FLAC entropy coding."""
+    return encoding in _LPC_ENCODINGS
+
+
+def _base_encoding(encoding):
+    """Map LPC encoding back to its zstd equivalent for logic branching."""
+    if encoding in _LPC_TO_ZSTD:
+        return _LPC_TO_ZSTD[encoding]
+    return encoding
+
+
+def encode_tensor(tensor, encoding):
+    """Encode a single tensor. Returns (encoded_bytes, metadata_dict)."""
+    meta = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype).replace("torch.", ""),
+        "encoding": encoding,
+    }
+
+    use_lpc = _is_lpc_encoding(encoding)
+    base_enc = _base_encoding(encoding)
+
+    t = tensor.contiguous().cpu()
+
+    if base_enc == ENC_FP16_ZSTD:
+        if t.dtype == torch.float32:
+            t = t.half()
+            meta["original_dtype"] = "float32"
+        raw = t.numpy().tobytes()
+        meta["raw_size"] = len(raw)
+        # FP16 raw bytes are not int16 weight data per se, but the bit pattern
+        # is int16-compatible (same 2 bytes per value)
+        num_samples = len(raw) // 2
+
+    elif base_enc == ENC_INT16_QUANT:
+        flat = t.flatten().float()
+        scale = flat.abs().max().item()
+        if scale == 0:
+            scale = 1.0
+        quantized = torch.clamp(torch.round(flat / scale * 32767), -32767, 32767).to(torch.int16)
+        raw = quantized.numpy().tobytes()
+        meta["scale"] = scale
+        meta["raw_size"] = len(raw)
+        num_samples = len(raw) // 2
+
+    elif base_enc == ENC_INT32_QUANT:
+        flat = t.flatten().float()
+        scale = flat.abs().max().item()
+        if scale == 0:
+            scale = 1.0
+        quantized = torch.clamp(torch.round(flat / scale * 2147483647), -2147483647, 2147483647).to(torch.int32)
+        raw = quantized.numpy().tobytes()
+        meta["scale"] = scale
+        meta["raw_size"] = len(raw)
+        num_samples = len(raw) // 2  # int32 = 4 bytes, but FLAC needs int16 pairs
+
+    elif base_enc == ENC_DELTA_ZSTD:
+        arr = t.numpy().view(np.int16).flatten().copy()
+        delta = np.empty_like(arr)
+        delta[0] = arr[0]
+        delta[1:] = np.diff(arr.astype(np.int32)).astype(np.int16)
+        raw = delta.tobytes()
+        meta["raw_size"] = len(raw)
+        num_samples = len(raw) // 2
+
+    elif base_enc == ENC_RAW_ZSTD:
+        raw = t.numpy().tobytes()
+        meta["raw_size"] = len(raw)
+        num_samples = len(raw) // 2  # may not be int16, but FLAC needs int16
+
+    elif base_enc == ENC_BFP_ZSTD:
+        if _use_gpu_compress and torch.cuda.is_available():
+            exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress_gpu(t)
+        else:
+            exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress(t)
+        meta["bfp_pad_len"] = pad_len
+        meta["bfp_orig_len"] = orig_len
+        meta["bfp_group_size"] = BFP_GROUP_SIZE
+        meta["bfp_mantissa_bits"] = BFP_MANTISSA_BITS
+        if orig_dtype != meta["dtype"]:
+            meta["original_dtype"] = orig_dtype
+
+        meta["bfp_exp_size"] = len(exp_stream)
+        meta["bfp_mant_size"] = len(sign_mant_stream)
+        meta["raw_size"] = len(exp_stream) + len(sign_mant_stream)
+
+        if use_lpc:
+            # LPC for mantissa stream (the big one), zstd for exponents (tiny)
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            exp_compressed = cctx.compress(exp_stream.tobytes())
+
+            # Pack mantissa uint8 stream into int16 for FLAC
+            mant_flac, mant_orig_len = _compress_bytes_uint8_lpc(sign_mant_stream.tobytes())
+            meta["bfp_mant_orig_len"] = mant_orig_len
+
+            meta["bfp_exp_compressed"] = len(exp_compressed)
+            meta["bfp_mant_compressed"] = len(mant_flac)
+        else:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            exp_compressed = cctx.compress(exp_stream.tobytes())
+            mant_compressed = cctx.compress(sign_mant_stream.tobytes())
+
+            meta["bfp_exp_compressed"] = len(exp_compressed)
+            meta["bfp_mant_compressed"] = len(mant_compressed)
+
+        # Pack: [4B exp_compressed_len][exp_data][mant_data]
+        mant_data = mant_flac if use_lpc else mant_compressed
+        packed = struct.pack("<I", len(exp_compressed)) + exp_compressed + mant_data
+        meta["compressed_size"] = len(packed)
+        return packed, meta
+
+    # Entropy coding for non-BFP paths
+    if use_lpc:
+        # For RAW_LPC with non-int16 data, we need to handle the byte stream
+        if base_enc == ENC_RAW_ZSTD and len(raw) % 2 != 0:
+            # Odd byte count: pad with a zero byte so int16 view works
+            meta["lpc_raw_orig_len"] = len(raw)
+            raw = raw + b'\x00'
+            num_samples = len(raw) // 2
+
+        compressed = _int16_to_flac(raw, num_samples)
+        meta["lpc_num_samples"] = num_samples
+    else:
+        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        compressed = cctx.compress(raw)
+
+    meta["compressed_size"] = len(compressed)
+    return compressed, meta
+
+
+def decode_tensor(compressed_bytes, meta):
+    """Decode a tensor from compressed bytes + metadata."""
+    encoding = meta["encoding"]
+    shape = meta["shape"]
+    dtype_str = meta.get("original_dtype", meta["dtype"])
+    use_lpc = _is_lpc_encoding(encoding)
+    base_enc = _base_encoding(encoding)
+
+    # BFP handles its own decompression (two separate streams)
+    if base_enc == ENC_BFP_ZSTD:
+        exp_comp_len = struct.unpack("<I", compressed_bytes[:4])[0]
+        exp_compressed = compressed_bytes[4:4 + exp_comp_len]
+        mant_data = compressed_bytes[4 + exp_comp_len:]
+
+        # Exponents always use zstd (tiny stream)
+        dctx = zstd.ZstdDecompressor()
+        exp_stream = np.frombuffer(
+            dctx.decompress(exp_compressed, max_output_size=meta["bfp_exp_size"]),
+            dtype=np.uint8
+        ).copy()
+
+        if use_lpc:
+            # Mantissa stream was FLAC-encoded
+            mant_orig_len = meta["bfp_mant_orig_len"]
+            mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
+            sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
+        else:
+            sign_mant_stream = np.frombuffer(
+                dctx.decompress(mant_data, max_output_size=meta["bfp_mant_size"]),
+                dtype=np.uint8
+            ).copy()
+
+        original_dtype = meta.get("original_dtype", meta["dtype"])
+        return bfp_decompress(
+            exp_stream, sign_mant_stream,
+            meta["bfp_pad_len"], meta["bfp_orig_len"],
+            shape, original_dtype,
+            meta.get("bfp_group_size", BFP_GROUP_SIZE),
+            meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
+        )
+
+    # Decompress the main payload
+    if use_lpc:
+        arr_int16 = _flac_to_int16(compressed_bytes)
+        raw_size = meta.get("lpc_raw_orig_len", meta["raw_size"])
+        raw = arr_int16.tobytes()[:raw_size]
+    else:
+        dctx = zstd.ZstdDecompressor()
+        raw = dctx.decompress(compressed_bytes, max_output_size=meta["raw_size"])
+
+    if base_enc == ENC_FP16_ZSTD:
+        arr = np.frombuffer(raw, dtype=np.float16).reshape(shape).copy()
+        t = torch.from_numpy(arr)
+        if dtype_str == "float32":
+            t = t.float()
+        return t
+
+    elif base_enc == ENC_INT16_QUANT:
+        scale = meta["scale"]
+        quantized = np.frombuffer(raw, dtype=np.int16).copy()
+        dequantized = quantized.astype(np.float32) * (scale / 32767.0)
+        t = torch.from_numpy(dequantized.reshape(shape))
+        if dtype_str == "float16":
+            t = t.half()
+        return t
+
+    elif base_enc == ENC_INT32_QUANT:
+        scale = meta["scale"]
+        quantized = np.frombuffer(raw, dtype=np.int32).copy()
+        dequantized = quantized.astype(np.float64) * (scale / 2147483647.0)
+        t = torch.from_numpy(dequantized.astype(np.float32).reshape(shape))
+        if dtype_str == "float16":
+            t = t.half()
+        return t
+
+    elif base_enc == ENC_DELTA_ZSTD:
+        delta = np.frombuffer(raw, dtype=np.int16).copy()
+        arr = np.cumsum(delta.astype(np.int32)).astype(np.int16)
+        if meta["dtype"] == "float16":
+            result = arr.view(np.float16).reshape(shape).copy()
+            return torch.from_numpy(result)
+        elif meta["dtype"] == "bfloat16":
+            result = torch.from_numpy(arr.copy()).view(torch.bfloat16).reshape(shape)
+            return result
+        else:
+            return torch.from_numpy(arr.reshape(shape).copy())
+
+    elif base_enc == ENC_RAW_ZSTD:
+        np_dtype = {
+            "float16": np.float16,
+            "float32": np.float32,
+            "float64": np.float64,
+            "int8": np.int8,
+            "int16": np.int16,
+            "int32": np.int32,
+            "int64": np.int64,
+        }.get(meta["dtype"])
+        if np_dtype:
+            arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape).copy()
+            return torch.from_numpy(arr)
+        else:
+            raise ValueError(f"Unsupported dtype for RAW: {meta['dtype']}")
+
+    raise ValueError(f"Unknown encoding: {encoding}")
+
+
+def decode_tensor_gpu(compressed_bytes, meta):
+    """GPU-accelerated tensor decoding. zstd/FLAC on CPU, reconstruction on GPU.
+
+    Supported GPU paths:
+    - BFP: leading-one-bit scan parallelized on GPU (biggest speedup)
+    - INT16_QUANT: dequantize on GPU
+    - DELTA: cumsum on GPU
+    - FP16/RAW: no computation needed, pass through
+    """
+    encoding = meta["encoding"]
+    shape = meta["shape"]
+    dtype_str = meta.get("original_dtype", meta["dtype"])
+    use_lpc = _is_lpc_encoding(encoding)
+    base_enc = _base_encoding(encoding)
+
+    # BFP: GPU-accelerated reconstruction
+    if base_enc == ENC_BFP_ZSTD:
+        exp_comp_len = struct.unpack("<I", compressed_bytes[:4])[0]
+        exp_compressed = compressed_bytes[4:4 + exp_comp_len]
+        mant_data = compressed_bytes[4 + exp_comp_len:]
+
+        # Exponents: zstd decompress on CPU (tiny stream)
+        dctx = zstd.ZstdDecompressor()
+        exp_stream = np.frombuffer(
+            dctx.decompress(exp_compressed, max_output_size=meta["bfp_exp_size"]),
+            dtype=np.uint8
+        ).copy()
+
+        # Mantissa: zstd or FLAC decompress on CPU
+        if use_lpc:
+            mant_orig_len = meta["bfp_mant_orig_len"]
+            mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
+            sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
+        else:
+            sign_mant_stream = np.frombuffer(
+                dctx.decompress(mant_data, max_output_size=meta["bfp_mant_size"]),
+                dtype=np.uint8
+            ).copy()
+
+        original_dtype = meta.get("original_dtype", meta["dtype"])
+        return bfp_decompress_gpu(
+            exp_stream, sign_mant_stream,
+            meta["bfp_pad_len"], meta["bfp_orig_len"],
+            shape, original_dtype,
+            meta.get("bfp_group_size", BFP_GROUP_SIZE),
+            meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
+        )
+
+    # INT16_QUANT, DELTA, FP16, RAW: the dequantization math is trivial
+    # compared to the zstd/FLAC decompression (which must run on CPU anyway).
+    # GPU transfer overhead makes these slower, so fall back to CPU path.
+    return decode_tensor(compressed_bytes, meta)
+
+
+def auto_detect_mode(tensors):
+    """Detect whether a model is primarily FP16/BF16 or FP32.
+    Returns 'bfp' if >80% of params are FP16/BF16, 'int16' if >80% are FP32.
+    Falls back to 'int16' for mixed models.
+    """
+    fp16_params = 0
+    fp32_params = 0
+    total_params = 0
+    for tensor in tensors.values():
+        n = tensor.numel()
+        total_params += n
+        if tensor.dtype in (torch.float16, torch.bfloat16):
+            fp16_params += n
+        elif tensor.dtype == torch.float32:
+            fp32_params += n
+    if total_params == 0:
+        return "int16"
+    if fp16_params / total_params > 0.80:
+        return "bfp"
+    if fp32_params / total_params > 0.80:
+        return "int16"
+    return "int16"
+
+
+def compress_file(input_path, output_path, mode="auto", entropy="zstd", use_gpu=False):
+    """Compress a safetensors file to .dmx format.
+    mode: 'auto', 'bfp', or 'int16'
+    entropy: 'zstd', 'lpc', or 'auto'
+    use_gpu: use GPU-accelerated BFP compression (CUDA required)
+    """
+    global _use_gpu_compress
+    # Auto-detect GPU: use CUDA if available unless explicitly disabled
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    if use_gpu:
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"  GPU accelerated compression: {gpu_name}")
+            _use_gpu_compress = True
+        else:
+            print("  WARNING: --gpu requested but CUDA not available. Falling back to CPU.")
+            _use_gpu_compress = False
+    else:
+        _use_gpu_compress = False
+    # Resolve entropy=auto: try LPC, fall back to zstd
+    if entropy == "auto":
+        if FFMPEG_PATH:
+            entropy = "lpc"
+            print("  Entropy auto: ffmpeg found, using LPC/FLAC")
+        else:
+            entropy = "zstd"
+            print("  WARNING: ffmpeg not found, falling back to zstd entropy")
+    elif entropy == "lpc":
+        if not FFMPEG_PATH:
+            print("  WARNING: ffmpeg not found, --entropy lpc requires ffmpeg. Falling back to zstd.")
+            entropy = "zstd"
+
+    print(f"Loading {input_path}...")
+    start = time.time()
+    tensors = load_file(input_path)
+    load_time = time.time() - start
+    print(f"  Loaded {len(tensors)} tensors in {load_time:.1f}s")
+
+    original_size = os.path.getsize(input_path)
+    print(f"  Original size: {original_size / 1024 / 1024:.1f} MB")
+
+    # Resolve auto mode
+    if mode == "auto":
+        mode = auto_detect_mode(tensors)
+        print(f"  Auto-detected mode: {mode}")
+    else:
+        print(f"  Mode: {mode}")
+
+    print(f"  Entropy coding: {entropy}")
+
+    # Build manifest and compressed chunks
+    manifest = {
+        "version": DMX_VERSION,
+        "mode": mode,
+        "entropy": entropy,
+        "source_file": os.path.basename(input_path),
+        "source_size": original_size,
+        "tensor_count": len(tensors),
+        "tensors": {},
+    }
+
+    compressed_chunks = {}
+    total_raw = 0
+    total_compressed = 0
+    enc_counts = {}
+    enc_names = {
+        ENC_FP16_ZSTD: "FP16+zstd", ENC_INT16_QUANT: "INT16Q+zstd",
+        ENC_DELTA_ZSTD: "Delta+zstd", ENC_RAW_ZSTD: "Raw+zstd",
+        ENC_BFP_ZSTD: "BFP+zstd", ENC_INT32_QUANT: "INT32Q+zstd",
+        ENC_FP16_LPC: "FP16+lpc", ENC_INT16_QUANT_LPC: "INT16Q+lpc",
+        ENC_DELTA_LPC: "Delta+lpc", ENC_RAW_LPC: "Raw+lpc",
+        ENC_BFP_LPC: "BFP+lpc", ENC_INT32_QUANT_LPC: "INT32Q+lpc",
+    }
+
+    keys = sorted(tensors.keys())
+    for i, key in enumerate(keys):
+        tensor = tensors[key]
+        encoding = detect_encoding(tensor, mode=mode, entropy=entropy)
+        enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
+
+        compressed, meta = encode_tensor(tensor, encoding)
+        manifest["tensors"][key] = meta
+        compressed_chunks[key] = compressed
+
+        total_raw += meta["raw_size"]
+        total_compressed += meta["compressed_size"]
+
+        if (i + 1) % 100 == 0 or (i + 1) == len(keys):
+            print(f"  Compressed {i+1}/{len(keys)} tensors...")
+
+    # Write .dmx file
+    # Format: [MAGIC 4B][VERSION 4B][MANIFEST_SIZE 4B][MANIFEST JSON][CHUNK DATA...]
+    # Each chunk is written sequentially, manifest has offsets
+    manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    # Calculate offsets for chunks
+    header_size = 4 + 4 + 4 + len(manifest_json)
+    offset = header_size
+    chunk_offsets = {}
+    for key in keys:
+        chunk_offsets[key] = offset
+        offset += len(compressed_chunks[key])
+        manifest["tensors"][key]["offset"] = chunk_offsets[key]
+
+    # Re-serialize manifest with offsets
+    manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    # Recalculate offsets since manifest size may have changed
+    header_size = 4 + 4 + 4 + len(manifest_json)
+    offset = header_size
+    for key in keys:
+        manifest["tensors"][key]["offset"] = offset
+        offset += len(compressed_chunks[key])
+
+    # Final manifest
+    manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    # One more pass to stabilize (offset digits may grow)
+    header_size_check = 4 + 4 + 4 + len(manifest_json)
+    if header_size_check != header_size:
+        header_size = header_size_check
+        offset = header_size
+        for key in keys:
+            manifest["tensors"][key]["offset"] = offset
+            offset += len(compressed_chunks[key])
+        manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    with open(output_path, "wb") as f:
+        f.write(DMX_MAGIC)
+        f.write(struct.pack("<I", DMX_VERSION))
+        f.write(struct.pack("<I", len(manifest_json)))
+        f.write(manifest_json)
+        for key in keys:
+            f.write(compressed_chunks[key])
+
+    output_size = os.path.getsize(output_path)
+    elapsed = time.time() - start
+    ratio = output_size / original_size * 100
+
+    print(f"  Encoding breakdown:")
+    for enc, count in enc_counts.items():
+        if count > 0:
+            print(f"    {enc_names[enc]}: {count} tensors")
+    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB ({ratio:.1f}% of original)")
+    print(f"  Savings: {(original_size - output_size) / 1024 / 1024:.1f} MB")
+    print(f"  Time: {elapsed:.1f}s")
+
+    return original_size, output_size
+
+
+def decompress_file(input_path, output_path, use_gpu=None):
+    """Decompress a .dmx file back to safetensors.
+
+    If use_gpu=True, uses GPU-accelerated decompression for BFP, INT16, and
+    DELTA encoded tensors. zstd/FLAC entropy decoding stays on CPU.
+    If use_gpu=None (default), auto-detects CUDA availability.
+    """
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    if use_gpu:
+        if not torch.cuda.is_available():
+            print("  WARNING: --gpu requested but CUDA not available. Falling back to CPU.")
+            use_gpu = False
+        else:
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"  GPU accelerated mode: {gpu_name}")
+
+    decode_fn = decode_tensor_gpu if use_gpu else decode_tensor
+
+    print(f"Loading {input_path}...")
+    start = time.time()
+
+    with open(input_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            raise ValueError(f"Not a DMX file (magic: {magic})")
+
+        version = struct.unpack("<I", f.read(4))[0]
+        if version > DMX_VERSION:
+            raise ValueError(f"Unsupported DMX version: {version}")
+
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest_json = f.read(manifest_size)
+        manifest = json.loads(manifest_json)
+
+        tensors = {}
+        keys = sorted(manifest["tensors"].keys())
+
+        # Track time breakdown for GPU mode
+        t_zstd = 0.0
+        t_gpu = 0.0
+
+        for i, key in enumerate(keys):
+            meta = manifest["tensors"][key]
+            f.seek(meta["offset"])
+            compressed = f.read(meta["compressed_size"])
+            tensors[key] = decode_fn(compressed, meta)
+
+            if (i + 1) % 500 == 0 or (i + 1) == len(keys):
+                print(f"  Decompressed {i+1}/{len(keys)} tensors...")
+
+    if use_gpu:
+        torch.cuda.synchronize()
+
+    print(f"  Saving to {output_path}...")
+    save_file(tensors, output_path)
+
+    elapsed = time.time() - start
+    output_size = os.path.getsize(output_path)
+    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB")
+    print(f"  Time: {elapsed:.1f}s")
+
+    return output_size
+
+
+def info_file(input_path):
+    """Display info about a .dmx file."""
+    with open(input_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            raise ValueError(f"Not a DMX file (magic: {magic})")
+
+        version = struct.unpack("<I", f.read(4))[0]
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest_json = f.read(manifest_size)
+        manifest = json.loads(manifest_json)
+
+    dmx_size = os.path.getsize(input_path)
+    src_size = manifest.get("source_size", 0)
+
+    enc_names = {
+        ENC_FP16_ZSTD: "FP16+zstd", ENC_INT16_QUANT: "INT16Q+zstd",
+        ENC_DELTA_ZSTD: "Delta+zstd", ENC_RAW_ZSTD: "Raw+zstd",
+        ENC_BFP_ZSTD: "BFP+zstd", ENC_INT32_QUANT: "INT32Q+zstd",
+        ENC_FP16_LPC: "FP16+lpc", ENC_INT16_QUANT_LPC: "INT16Q+lpc",
+        ENC_DELTA_LPC: "Delta+lpc", ENC_RAW_LPC: "Raw+lpc",
+        ENC_BFP_LPC: "BFP+lpc", ENC_INT32_QUANT_LPC: "INT32Q+lpc",
+    }
+
+    print(f"DMX File: {input_path}")
+    print(f"  Version: {version}")
+    print(f"  Entropy: {manifest.get('entropy', 'zstd')}")
+    print(f"  Source: {manifest.get('source_file', 'unknown')}")
+    print(f"  Source size: {src_size / 1024 / 1024:.1f} MB")
+    print(f"  DMX size: {dmx_size / 1024 / 1024:.1f} MB")
+    if src_size > 0:
+        print(f"  Ratio: {dmx_size / src_size * 100:.1f}%")
+        print(f"  Savings: {(src_size - dmx_size) / 1024 / 1024:.1f} MB")
+    print(f"  Tensors: {manifest.get('tensor_count', len(manifest['tensors']))}")
+
+    # Encoding breakdown
+    enc_counts = {}
+    total_raw = 0
+    total_compressed = 0
+    for key, meta in manifest["tensors"].items():
+        enc = meta["encoding"]
+        enc_counts[enc] = enc_counts.get(enc, 0) + 1
+        total_raw += meta.get("raw_size", 0)
+        total_compressed += meta.get("compressed_size", 0)
+
+    print(f"  Encoding breakdown:")
+    for enc, count in sorted(enc_counts.items()):
+        print(f"    {enc_names.get(enc, f'Unknown({enc})')}: {count} tensors")
+
+    # Show a few sample tensors
+    keys = sorted(manifest["tensors"].keys())
+    print(f"  Sample tensors (first 5):")
+    for key in keys[:5]:
+        meta = manifest["tensors"][key]
+        shape = meta["shape"]
+        dtype = meta["dtype"]
+        csz = meta["compressed_size"]
+        rsz = meta["raw_size"]
+        print(f"    {key}: {shape} {dtype} -> {csz/1024:.1f}KB ({csz/rsz*100:.0f}%)")
+
+
+def _sha256_file(path):
+    """Compute SHA-256 of a file, reading in 64KB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_dmx_mode(dmx_path):
+    """Read the compression mode from a DMX file's manifest."""
+    with open(dmx_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            return "unknown"
+        _version = struct.unpack("<I", f.read(4))[0]
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest_json = f.read(manifest_size)
+        manifest = json.loads(manifest_json)
+    return manifest.get("mode", "unknown")
+
+
+def verify_file(source_path, dmx_path, mode="auto", entropy="zstd", report_path=None, use_gpu=None):
+    """Compress, decompress, and compare tensor-by-tensor.
+
+    If report_path is provided, writes a structured JSON verification report.
+    If use_gpu is True, uses GPU-accelerated decompression.
+    """
+    import tempfile
+
+    print(f"=== DMX Verify: {os.path.basename(source_path)} ===")
+    print()
+
+    # Step 1: Compress if dmx doesn't exist, or use existing
+    if not os.path.exists(dmx_path):
+        print("[1/3] Compressing...")
+        compress_file(source_path, dmx_path, mode=mode, entropy=entropy)
+    else:
+        print(f"[1/3] Using existing DMX: {dmx_path}")
+    print()
+
+    # Step 2: Decompress to temp file
+    print("[2/3] Decompressing to temp file...")
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, "verify_roundtrip.safetensors")
+    decompress_file(dmx_path, tmp_path, use_gpu=use_gpu)
+    print()
+
+    # Determine actual mode from DMX manifest
+    actual_mode = _read_dmx_mode(dmx_path)
+
+    # Set cosine similarity threshold based on mode
+    if actual_mode == "int16":
+        pass_threshold = 0.9999
+    else:
+        pass_threshold = 0.99
+
+    # Step 3: Compare
+    print("[3/3] Comparing tensors...")
+    original = load_file(source_path)
+    roundtrip = load_file(tmp_path)
+
+    if set(original.keys()) != set(roundtrip.keys()):
+        missing = set(original.keys()) - set(roundtrip.keys())
+        extra = set(roundtrip.keys()) - set(original.keys())
+        print(f"  KEY MISMATCH! Missing: {len(missing)}, Extra: {len(extra)}")
+        return False
+
+    max_diff_global = 0.0
+    min_cosine_global = 1.0
+    best_cosine_global = 0.0
+    worst_key = ""
+    best_cosine_key = ""
+    all_exact = True
+    mismatched = 0
+    num_passed = 0
+    num_failed = 0
+    per_tensor_stats = []
+    all_cosines = []
+    all_max_diffs = []
+
+    for key in sorted(original.keys()):
+        orig_t = original[key].float()
+        rt_t = roundtrip[key].float()
+
+        if orig_t.shape != rt_t.shape:
+            print(f"  SHAPE MISMATCH: {key}: {orig_t.shape} vs {rt_t.shape}")
+            mismatched += 1
+            num_failed += 1
+            per_tensor_stats.append({
+                "name": key,
+                "shape": list(orig_t.shape),
+                "dtype": str(original[key].dtype).replace("torch.", ""),
+                "max_abs_diff": None,
+                "mean_abs_diff": None,
+                "cosine_similarity": None,
+                "relative_error": None,
+                "verdict": "FAIL (shape mismatch)",
+            })
+            continue
+
+        diff = (orig_t - rt_t).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+
+        if max_diff > 0:
+            all_exact = False
+
+        if max_diff > max_diff_global:
+            max_diff_global = max_diff
+            worst_key = key
+
+        # Cosine similarity (skip scalars)
+        if orig_t.numel() > 1:
+            cos = torch.nn.functional.cosine_similarity(
+                orig_t.flatten().unsqueeze(0),
+                rt_t.flatten().unsqueeze(0)
+            ).item()
+        else:
+            cos = 1.0 if max_diff == 0 else 0.0
+
+        if cos < min_cosine_global:
+            min_cosine_global = cos
+        if cos > best_cosine_global:
+            best_cosine_global = cos
+            best_cosine_key = key
+
+        all_cosines.append(cos)
+        all_max_diffs.append(max_diff)
+
+        # Relative error
+        orig_norm = orig_t.norm().item()
+        rel_err = (diff.norm().item() / orig_norm) if orig_norm > 0 else 0.0
+
+        # Per-tensor verdict
+        tensor_pass = cos >= pass_threshold
+        if tensor_pass:
+            num_passed += 1
+        else:
+            num_failed += 1
+
+        per_tensor_stats.append({
+            "name": key,
+            "shape": list(orig_t.shape),
+            "dtype": str(original[key].dtype).replace("torch.", ""),
+            "max_abs_diff": round(max_diff, 8),
+            "mean_abs_diff": round(mean_diff, 8),
+            "cosine_similarity": round(cos, 8),
+            "relative_error": round(rel_err, 8),
+            "verdict": "PASS" if tensor_pass else "FAIL",
+        })
+
+    num_tensors = len(original)
+    overall_pass = num_failed == 0
+
+    # Print summary to stdout (existing behavior)
+    print(f"  Tensors compared: {num_tensors}")
+    print(f"  Shape mismatches: {mismatched}")
+    if all_exact:
+        print(f"  Result: LOSSLESS - all tensors exactly match")
+    else:
+        print(f"  Max absolute difference: {max_diff_global:.8f}")
+        print(f"  Worst tensor: {worst_key}")
+        print(f"  Min cosine similarity: {min_cosine_global:.8f}")
+        print(f"  Pass threshold (cosine): {pass_threshold}")
+        print(f"  Tensors passed: {num_passed}/{num_tensors}")
+        if num_failed > 0:
+            print(f"  Tensors FAILED: {num_failed}")
+        if max_diff_global < 1e-3:
+            print(f"  Result: EXCELLENT - differences within quantization noise")
+        elif max_diff_global < 1e-2:
+            print(f"  Result: GOOD - small quantization differences")
+        else:
+            print(f"  Result: WARNING - significant differences detected")
+    print(f"  Overall verdict: {'PASS' if overall_pass else 'FAIL'}")
+
+    # Write JSON report if requested
+    if report_path:
+        print()
+        print(f"  Writing verification report to {report_path}...")
+
+        original_size = os.path.getsize(source_path)
+        compressed_size = os.path.getsize(dmx_path)
+        compression_ratio = round(compressed_size / original_size, 4) if original_size > 0 else 0.0
+        savings_pct = round((1.0 - compressed_size / original_size) * 100, 2) if original_size > 0 else 0.0
+
+        # Find worst cosine tensor name
+        worst_cosine_name = ""
+        worst_cosine_val = 1.0
+        for stat in per_tensor_stats:
+            cs = stat.get("cosine_similarity")
+            if cs is not None and cs < worst_cosine_val:
+                worst_cosine_val = cs
+                worst_cosine_name = stat["name"]
+
+        mean_cosine = round(sum(all_cosines) / len(all_cosines), 8) if all_cosines else 1.0
+        mean_max_diff = round(sum(all_max_diffs) / len(all_max_diffs), 8) if all_max_diffs else 0.0
+        worst_max_diff = round(max(all_max_diffs), 8) if all_max_diffs else 0.0
+
+        report = {
+            "dmx_version": "0.3",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "original_file": os.path.basename(source_path),
+            "original_sha256": _sha256_file(source_path),
+            "original_size_bytes": original_size,
+            "compressed_file": os.path.basename(dmx_path),
+            "compressed_sha256": _sha256_file(dmx_path),
+            "compressed_size_bytes": compressed_size,
+            "compression_ratio": compression_ratio,
+            "savings_percent": savings_pct,
+            "mode": actual_mode,
+            "num_tensors": num_tensors,
+            "num_tensors_verified": num_tensors,
+            "num_tensors_passed": num_passed,
+            "num_tensors_failed": num_failed,
+            "pass_threshold_cosine_sim": pass_threshold,
+            "overall_verdict": "PASS" if overall_pass else "FAIL",
+            "per_tensor": per_tensor_stats,
+            "summary_stats": {
+                "worst_cosine_similarity": round(worst_cosine_val, 8),
+                "worst_tensor_name": worst_cosine_name,
+                "best_cosine_similarity": round(best_cosine_global, 8),
+                "mean_cosine_similarity": mean_cosine,
+                "worst_max_abs_diff": worst_max_diff,
+                "mean_max_abs_diff": mean_max_diff,
+            },
+        }
+
+        os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print(f"  Report written: {report_path}")
+
+    # Cleanup
+    try:
+        os.remove(tmp_path)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    return all_exact or (overall_pass and max_diff_global < 1e-2)
+
+
+### Delta compression / reconstruction ###
+
+DELTA_MAGIC = b"DMXD"
+DELTA_VERSION = 1
+
+
+SMALL_TENSOR_THRESHOLD = 4096  # Tensors below this size get per-tensor scales
+
+def _compute_aligned_scales(state_dict, precision="int16"):
+    """Compute aligned scales per component type .
+
+    Groups tensors by their component name (e.g., all 'self_attn.q_proj.weight'
+    across layers share one scale). This enables exact integer subtraction
+    between checkpoints.
+
+    Small tensors (bias, norm — below SMALL_TENSOR_THRESHOLD params) get
+    per-tensor scales instead of shared group scales. This prevents scale
+    overflow at int32 precision where the range mismatch between large
+    weight matrices and tiny bias vectors causes quantization errors.
+
+    precision: 'int16' (32767 levels) or 'int32' (2147483647 levels)
+    """
+    from collections import defaultdict
+    max_val = 32767 if precision == "int16" else 2147483647
+    groups = defaultdict(list)
+    for key in state_dict:
+        parts = key.split(".")
+        ctype = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+        groups[ctype].append(key)
+
+    scales = {}
+    for ctype, keys in groups.items():
+        # Split into large (aligned) and small (per-tensor) groups
+        large_keys = [k for k in keys if state_dict[k].numel() >= SMALL_TENSOR_THRESHOLD]
+        small_keys = [k for k in keys if state_dict[k].numel() < SMALL_TENSOR_THRESHOLD]
+
+        if large_keys:
+            max_abs = max(state_dict[k].float().abs().max().item() for k in large_keys)
+            scales[ctype] = max_abs / max_val if max_abs > 0 else 1.0
+
+        # ALL small tensors get per-tensor scales (no group sharing)
+        # This prevents int32 overflow when small tensors have very different ranges
+        for k in small_keys:
+            max_abs = state_dict[k].float().abs().max().item()
+            scales[k] = max_abs / max_val if max_abs > 0 else 1.0
+
+        # Fallback group entry for key_type lookup
+        if not large_keys and small_keys:
+            scales[ctype] = scales[small_keys[0]]
+
+    return scales
+
+
+def _key_type(key):
+    parts = key.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+
+
+def _get_scale(scales, key):
+    """Get scale for a tensor — per-tensor override if exists, else group scale."""
+    if key in scales:
+        return scales[key]
+    return scales[_key_type(key)]
+
+
+def delta_compress(base_path, target_path, output_path, precision="int16", zstd_level=None):
+    """Delta-compress a target checkpoint against a base checkpoint.
+
+    Precision modes:
+    - int16: Aligned quantization to int16, delta, zstd. ~87% savings, +0.06% RelL2.
+    - int32: Aligned quantization to int32, delta, zstd. ~87% savings, error below FP32 noise floor.
+             (Replaced raw XOR in April 2026 after validation showed XOR produces 0% sparsity.)
+
+    Algorithm:
+    1. Load base and target safetensors
+    2. Compute aligned scales per component type 
+    3. Quantize both to int16 or int32, integer subtract to produce delta
+    4. Entropy-code the sparse delta with zstd
+    5. Save as .dmxd file with metadata
+    """
+    print(f"  Base: {base_path}")
+    print(f"  Target: {target_path}")
+    precision_label = {"int16": "near-lossless", "int32": "practically lossless"}
+    print(f"  Precision: {precision} ({precision_label.get(precision, '')})")
+    start = time.time()
+
+    base = load_file(base_path)
+    target = load_file(target_path)
+
+    base_size = os.path.getsize(base_path)
+    target_size = os.path.getsize(target_path)
+
+    # Verify compatible keys
+    base_keys = set(base.keys())
+    target_keys = set(target.keys())
+    if base_keys != target_keys:
+        missing = base_keys - target_keys
+        extra = target_keys - base_keys
+        if missing:
+            print(f"  WARNING: {len(missing)} keys in base but not target")
+        if extra:
+            print(f"  WARNING: {len(extra)} keys in target but not base")
+    common_keys = sorted(base_keys & target_keys)
+    print(f"  Common tensors: {len(common_keys)}")
+
+    # Compute aligned scales from max of BOTH base and target (prevents clamping)
+    combined_max = {}
+    for key in common_keys:
+        b_max = base[key].float().abs().max().item()
+        t_max = target[key].float().abs().max().item()
+        combined_max[key] = base[key] if b_max >= t_max else target[key]
+    scales = _compute_aligned_scales(combined_max, precision=precision)
+    print(f"  Aligned component groups: {len(scales)}")
+
+    max_val = 32767 if precision == "int16" else 2147483647
+
+    # Quantize and compute deltas, encode per-tensor
+    level = zstd_level if zstd_level is not None else ZSTD_LEVEL_DELTA
+    print(f"  zstd level: {level}")
+    cctx = zstd.ZstdCompressor(level=level, write_content_size=True)
+    tensor_meta = {}
+    compressed_chunks = {}
+    total_params = 0
+    total_zero = 0
+    total_compressed = 0
+
+    # Try native CUDA kernels for GPU acceleration
+    cuda_kernels = _get_cuda_kernels() if torch.cuda.is_available() else None
+    if cuda_kernels:
+        print("  GPU-accelerated delta compression (native CUDA kernels)")
+
+    for i, key in enumerate(common_keys):
+        scale = _get_scale(scales, key)
+
+        if cuda_kernels and base[key].numel() > 1024:
+            # Native CUDA path: fused quantize + subtract in one kernel call
+            b_gpu = base[key].float().cuda()
+            t_gpu = target[key].float().cuda()
+            # Kernel expects max_abs, not scale (scale = max_abs / max_val)
+            max_abs = scale * max_val
+            if precision == "int32":
+                delta = cuda_kernels.delta_compute_i32(b_gpu, t_gpu, max_abs).cpu()
+            else:
+                delta = cuda_kernels.delta_compute_i16(b_gpu, t_gpu, max_abs).cpu()
+            delta_bytes = delta.numpy().tobytes()
+            del b_gpu, t_gpu
+        elif precision == "int32":
+            # CPU fallback: practically lossless aligned quantization to int32
+            # Use float64 for int32 quantization to avoid precision loss
+            base_int = torch.clamp(
+                torch.round(base[key].double() / scale), -max_val, max_val
+            ).to(torch.int32)
+            target_int = torch.clamp(
+                torch.round(target[key].double() / scale), -max_val, max_val
+            ).to(torch.int32)
+            delta = (target_int.to(torch.int64) - base_int.to(torch.int64)).to(torch.int32)
+            delta_bytes = delta.numpy().tobytes()
+        else:
+            # CPU fallback: near-lossless aligned quantization to int16
+            base_int = torch.clamp(
+                torch.round(base[key].float() / scale), -max_val, max_val
+            ).to(torch.int16)
+            target_int = torch.clamp(
+                torch.round(target[key].float() / scale), -max_val, max_val
+            ).to(torch.int16)
+            delta = (target_int.to(torch.int32) - base_int.to(torch.int32)).to(torch.int16)
+            delta_bytes = delta.numpy().tobytes()
+
+        # Stats
+        n = delta.numel()
+        nz = (delta == 0).sum().item()
+        total_params += n
+        total_zero += nz
+
+        # Compress delta with zstd
+        compressed = cctx.compress(delta_bytes)
+        total_compressed += len(compressed)
+
+        tensor_meta[key] = {
+            "shape": list(base[key].shape),
+            "dtype": str(base[key].dtype).replace("torch.", ""),
+            "scale": scale,
+            "component_type": _key_type(key),
+            "precision": precision,
+            "params": n,
+            "zeros": nz,
+            "raw_size": len(delta_bytes),
+            "compressed_size": len(compressed),
+        }
+        compressed_chunks[key] = compressed
+
+        if (i + 1) % 100 == 0 or (i + 1) == len(common_keys):
+            print(f"  Delta-compressed {i+1}/{len(common_keys)} tensors...")
+
+    # Build manifest
+    manifest = {
+        "version": DELTA_VERSION,
+        "format": "delta",
+        "precision": precision,
+        "base_file": os.path.basename(base_path),
+        "target_file": os.path.basename(target_path),
+        "base_size": base_size,
+        "target_size": target_size,
+        "tensor_count": len(common_keys),
+        "total_params": total_params,
+        "total_zeros": total_zero,
+        "scales": {ct: s for ct, s in scales.items()} if scales else {},
+        "tensors": tensor_meta,
+    }
+
+    # Write .dmxd file: [MAGIC 4B][VERSION 4B][MANIFEST_LEN 4B][MANIFEST][CHUNKS...]
+    # Stabilize offsets (manifest size changes when offsets are added)
+    for _pass in range(5):
+        manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+        header_size = 4 + 4 + 4 + len(manifest_json)
+        offset = header_size
+        changed = False
+        for key in common_keys:
+            if tensor_meta[key].get("offset") != offset:
+                changed = True
+            tensor_meta[key]["offset"] = offset
+            offset += len(compressed_chunks[key])
+        if not changed:
+            break
+
+    with open(output_path, "wb") as f:
+        f.write(DELTA_MAGIC)
+        f.write(struct.pack("<I", DELTA_VERSION))
+        f.write(struct.pack("<I", len(manifest_json)))
+        f.write(manifest_json)
+        for key in common_keys:
+            f.write(compressed_chunks[key])
+
+    output_size = os.path.getsize(output_path)
+    elapsed = time.time() - start
+    pct_zero = 100.0 * total_zero / total_params if total_params > 0 else 0
+    ratio = output_size / target_size * 100
+
+    print(f"\n  Results:")
+    print(f"    Base size:    {base_size / 1024 / 1024:.1f} MB")
+    print(f"    Target size:  {target_size / 1024 / 1024:.1f} MB")
+    print(f"    Delta size:   {output_size / 1024 / 1024:.1f} MB ({ratio:.1f}% of target)")
+    print(f"    Savings:      {(target_size - output_size) / 1024 / 1024:.1f} MB ({100-ratio:.1f}%)")
+    print(f"    Zero deltas:  {pct_zero:.1f}%")
+    print(f"    Time:         {elapsed:.1f}s")
+
+    return output_size
+
+
+def delta_reconstruct(base_path, delta_path, output_path):
+    """Reconstruct a checkpoint from base + delta.
+
+    Loads the base safetensors, applies the integer deltas from the .dmxd file,
+    and dequantizes back to the original dtype.
+    """
+    print(f"  Base: {base_path}")
+    print(f"  Delta: {delta_path}")
+    start = time.time()
+
+    # Read delta file
+    with open(delta_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DELTA_MAGIC:
+            raise ValueError(f"Not a DMX delta file (got {magic!r}, expected {DELTA_MAGIC!r})")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version > DELTA_VERSION:
+            raise ValueError(f"Delta version {version} not supported (max {DELTA_VERSION})")
+        manifest_len = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_len))
+        delta_data = f.read()
+
+    # Load base
+    base = load_file(base_path)
+    precision = manifest.get("precision", "int16")
+    scales = manifest.get("scales", {})
+    tensors_meta = manifest["tensors"]
+    header_size = 4 + 4 + 4 + manifest_len
+
+    precision_label = {"int16": "near-lossless", "int32": "practically lossless"}
+    print(f"  Precision: {precision} ({precision_label.get(precision, '')})")
+
+    dctx = zstd.ZstdDecompressor()
+    result = {}
+
+    cuda_kernels = _get_cuda_kernels() if torch.cuda.is_available() else None
+    if cuda_kernels:
+        print("  GPU-accelerated delta reconstruction (native CUDA kernels)")
+
+    keys = sorted(tensors_meta.keys())
+    for i, key in enumerate(keys):
+        meta = tensors_meta[key]
+        shape = meta["shape"]
+        dtype_str = meta["dtype"]
+        scale = meta.get("scale", 0.0)
+        tensor_precision = meta.get("precision", precision)
+        offset = meta["offset"] - header_size  # offset into delta_data
+        comp_size = meta["compressed_size"]
+
+        # Decompress delta
+        chunk = delta_data[offset:offset + comp_size]
+        delta_bytes = zstd.ZstdDecompressor().decompress(chunk)
+
+        if tensor_precision == "int32":
+            if scale == 0.0:
+                # Legacy int32 XOR mode (pre-April 2026 files)
+                delta = torch.frombuffer(bytearray(delta_bytes), dtype=torch.int32).clone()
+                base_bits = base[key].contiguous().view(torch.int32).flatten()
+                recon_bits = torch.bitwise_xor(base_bits, delta)
+                if dtype_str == "float32":
+                    result[key] = recon_bits.view(torch.float32).reshape(shape)
+                elif dtype_str == "float16":
+                    result[key] = recon_bits.to(torch.int16).view(torch.float16).reshape(shape)
+                elif dtype_str == "bfloat16":
+                    result[key] = recon_bits.to(torch.int16).view(torch.bfloat16).reshape(shape)
+                else:
+                    result[key] = recon_bits.view(torch.float32).reshape(shape)
+            else:
+                # int32 aligned quantization mode (April 2026+)
+                delta = torch.frombuffer(bytearray(delta_bytes), dtype=torch.int32).clone()
+                if cuda_kernels and delta.numel() > 1024:
+                    max_abs_val = scale * 2147483647
+                    base_q = cuda_kernels.quantize_int32(base[key].float().flatten().cuda(), max_abs_val).cpu()
+                    recon_float = cuda_kernels.delta_apply_i32(base_q.cuda(), delta.cuda(), scale).cpu()
+                else:
+                    max_val = 2147483647
+                    base_int = torch.clamp(
+                        torch.round(base[key].double().flatten() / scale), -max_val, max_val
+                    ).to(torch.int32)
+                    recon_int = base_int.to(torch.int64) + delta.to(torch.int64)
+                    recon_float = (recon_int.double() * scale).float()
+
+                if dtype_str == "float16":
+                    recon_float = recon_float.half()
+                elif dtype_str == "bfloat16":
+                    recon_float = recon_float.to(torch.bfloat16)
+
+                result[key] = recon_float.reshape(shape)
+        else:
+            # Near-lossless: int16 aligned quantization
+            delta = torch.frombuffer(bytearray(delta_bytes), dtype=torch.int16).clone()
+
+            if cuda_kernels and delta.numel() > 1024:
+                max_abs_val = scale * 32767
+                base_q = cuda_kernels.quantize_int16(base[key].float().flatten().cuda(), max_abs_val).cpu()
+                recon_float = cuda_kernels.delta_apply_i16(base_q.cuda(), delta.cuda(), scale).cpu()
+            else:
+                base_int = torch.clamp(
+                    torch.round(base[key].float().flatten() / scale), -32767, 32767
+                ).to(torch.int16)
+                recon_int = (base_int.to(torch.int32) + delta.to(torch.int32)).to(torch.int16)
+                recon_float = recon_int.float() * scale
+
+            if dtype_str == "float16":
+                recon_float = recon_float.half()
+            elif dtype_str == "bfloat16":
+                recon_float = recon_float.to(torch.bfloat16)
+
+            result[key] = recon_float.reshape(shape)
+
+        if (i + 1) % 100 == 0 or (i + 1) == len(keys):
+            print(f"  Reconstructed {i+1}/{len(keys)} tensors...")
+
+    # Save
+    save_file(result, output_path)
+    output_size = os.path.getsize(output_path)
+    elapsed = time.time() - start
+
+    print(f"\n  Output: {output_path} ({output_size / 1024 / 1024:.1f} MB)")
+    print(f"  Tensors: {len(result)}")
+    print(f"  Time: {elapsed:.1f}s")
+
+    return output_size
+
+
+def delta_info(delta_path):
+    """Show detailed info about a .dmxd delta file."""
+    with open(delta_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DELTA_MAGIC:
+            raise ValueError(f"Not a DMX delta file (got {magic!r}, expected {DELTA_MAGIC!r})")
+        version = struct.unpack("<I", f.read(4))[0]
+        manifest_len = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_len))
+
+    delta_size = os.path.getsize(delta_path)
+    precision = manifest.get("precision", "int16")
+    base_size = manifest.get("base_size", 0)
+    target_size = manifest.get("target_size", 0)
+    total_params = manifest.get("total_params", 0)
+    total_zeros = manifest.get("total_zeros", 0)
+    tensor_count = manifest.get("tensor_count", 0)
+    scales = manifest.get("scales", {})
+
+    precision_label = {"int16": "near-lossless", "int32": "practically lossless"}
+    print(f"DMX Delta File: {delta_path}")
+    print(f"  Version:    {version}")
+    print(f"  Precision:  {precision} ({precision_label.get(precision, '')})")
+    print(f"  Base:       {manifest.get('base_file', 'unknown')} ({base_size / 1024 / 1024:.1f} MB)")
+    print(f"  Target:     {manifest.get('target_file', 'unknown')} ({target_size / 1024 / 1024:.1f} MB)")
+    print(f"  Delta size: {delta_size / 1024 / 1024:.1f} MB")
+    if target_size > 0:
+        ratio = delta_size / target_size * 100
+        print(f"  Ratio:      {ratio:.1f}% of target")
+        print(f"  Savings:    {(target_size - delta_size) / 1024 / 1024:.1f} MB ({100 - ratio:.1f}%)")
+    print(f"  Tensors:    {tensor_count}")
+    print(f"  Parameters: {total_params:,}")
+    if total_params > 0:
+        print(f"  Zero deltas: {total_zeros:,} ({100.0 * total_zeros / total_params:.1f}%)")
+    if scales:
+        print(f"  Aligned component groups: {len(scales)}")
+
+    # Per-component breakdown
+    tensors_meta = manifest.get("tensors", {})
+    if tensors_meta:
+        # Group by component type
+        from collections import defaultdict
+        comp_stats = defaultdict(lambda: {"params": 0, "zeros": 0, "raw": 0, "compressed": 0, "count": 0})
+        for key, meta in tensors_meta.items():
+            ct = meta.get("component_type", "unknown")
+            comp_stats[ct]["params"] += meta.get("params", 0)
+            comp_stats[ct]["zeros"] += meta.get("zeros", 0)
+            comp_stats[ct]["raw"] += meta.get("raw_size", 0)
+            comp_stats[ct]["compressed"] += meta.get("compressed_size", 0)
+            comp_stats[ct]["count"] += 1
+
+        print(f"\n  Per-component breakdown:")
+        print(f"    {'Component':<30s} | {'Tensors':>7s} | {'Params':>10s} | {'Zero%':>6s} | {'Ratio':>6s}")
+        print(f"    {'-'*30}-+-{'-'*7}-+-{'-'*10}-+-{'-'*6}-+-{'-'*6}")
+        for ct in sorted(comp_stats.keys()):
+            s = comp_stats[ct]
+            z_pct = 100.0 * s["zeros"] / s["params"] if s["params"] > 0 else 0
+            ratio = 100.0 * s["compressed"] / s["raw"] if s["raw"] > 0 else 0
+            print(f"    {ct:<30s} | {s['count']:>7d} | {s['params']:>10,d} | {z_pct:>5.1f}% | {ratio:>5.1f}%")
+
+    # Top 5 largest deltas (least compressible)
+    if tensors_meta:
+        by_size = sorted(tensors_meta.items(), key=lambda x: x[1].get("compressed_size", 0), reverse=True)
+        print(f"\n  Largest delta tensors:")
+        for key, meta in by_size[:5]:
+            csz = meta.get("compressed_size", 0)
+            z = meta.get("zeros", 0)
+            n = meta.get("params", 1)
+            print(f"    {key}: {csz/1024:.1f} KB ({100.0*z/n:.0f}% zero)")
+
+
+DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.3
+Patent Pending. (c) 2026 William J. Riley. MIT License.
+"""
+
+def main():
+    print(DMX_BANNER)
+    parser = argparse.ArgumentParser(description="DMX - Delta Multiplexed Model Compressor (Patent Pending)")
+    sub = parser.add_subparsers(dest="command")
+
+    p_compress = sub.add_parser("compress", help="Compress safetensors to .dmx")
+    p_compress.add_argument("input", help="Input .safetensors file")
+    p_compress.add_argument("output", help="Output .dmx file")
+    p_compress.add_argument("--mode", choices=["auto", "bfp", "int16", "int32"], default="auto",
+                            help="Compression mode: bfp (FP16/BF16), int16 (FP32, best compression), "
+                                 "int32 (FP32, practically lossless), auto (detect)")
+    p_compress.add_argument("--entropy", choices=["zstd", "lpc", "auto"], default="zstd",
+                            help="Entropy coder: zstd (default), lpc (FLAC, needs ffmpeg), auto (try lpc)")
+    p_compress.add_argument("--gpu", action="store_true",
+                            help="Use GPU-accelerated compression (CUDA required)")
+
+    p_decompress = sub.add_parser("decompress", help="Decompress .dmx to safetensors")
+    p_decompress.add_argument("input", help="Input .dmx file")
+    p_decompress.add_argument("output", help="Output .safetensors file")
+    p_decompress.add_argument("--gpu", action="store_true",
+                              help="Use GPU-accelerated decompression (CUDA required)")
+
+    p_info = sub.add_parser("info", help="Show info about a .dmx file")
+    p_info.add_argument("input", help="Input .dmx file")
+
+    p_compress.add_argument("--report", default=None,
+                            help="Auto-verify after compression and write JSON report to this path")
+
+    p_verify = sub.add_parser("verify", help="Compress, decompress, compare")
+    p_verify.add_argument("source", help="Original .safetensors file")
+    p_verify.add_argument("dmx", help="DMX file path (created if missing)")
+    p_verify.add_argument("--mode", choices=["auto", "bfp", "int16", "int32"], default="auto",
+                            help="Compression mode (if dmx needs to be created)")
+    p_verify.add_argument("--entropy", choices=["zstd", "lpc", "auto"], default="zstd",
+                            help="Entropy coder: zstd (default), lpc (FLAC, needs ffmpeg), auto (try lpc)")
+    p_verify.add_argument("--report", default=None,
+                            help="Write structured JSON verification report to this path")
+    p_verify.add_argument("--gpu", action="store_true",
+                            help="Use GPU-accelerated decompression (CUDA required)")
+
+    p_delta = sub.add_parser("delta-compress",
+                              help="Delta-compress a checkpoint against a base")
+    p_delta.add_argument("base", help="Base .safetensors file (the anchor)")
+    p_delta.add_argument("target", help="Target .safetensors file to delta-compress")
+    p_delta.add_argument("output", help="Output .dmxd delta file")
+    p_delta.add_argument("--precision", choices=["int16", "int32"], default="int16",
+                          help="int16: near-lossless ~87%% savings (default). "
+                               "int32: practically lossless ~87%% savings, error below FP32 noise floor.")
+    p_delta.add_argument("--zstd-level", type=int, default=None,
+                          help="zstd compression level 1-19 (default: 3 for speed. Use 19 for maximum compression).")
+
+    p_recon = sub.add_parser("delta-reconstruct",
+                              help="Reconstruct a checkpoint from base + delta")
+    p_recon.add_argument("base", help="Base .safetensors file (the anchor)")
+    p_recon.add_argument("delta", help="Input .dmxd delta file")
+    p_recon.add_argument("output", help="Output .safetensors file")
+
+    p_dinfo = sub.add_parser("delta-info", help="Show info about a .dmxd delta file")
+    p_dinfo.add_argument("input", help="Input .dmxd delta file")
+
+    args = parser.parse_args()
+
+    if args.command == "compress":
+        compress_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
+                      use_gpu=args.gpu if args.gpu else None)
+        if args.report:
+            print()
+            print("=== Auto-verify after compression ===")
+            verify_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
+                        report_path=args.report)
+    elif args.command == "decompress":
+        decompress_file(args.input, args.output, use_gpu=args.gpu if args.gpu else None)
+    elif args.command == "info":
+        info_file(args.input)
+    elif args.command == "verify":
+        verify_file(args.source, args.dmx, mode=args.mode, entropy=args.entropy,
+                    report_path=args.report, use_gpu=args.gpu if args.gpu else None)
+    elif args.command == "delta-compress":
+        delta_compress(args.base, args.target, args.output, precision=args.precision,
+                      zstd_level=getattr(args, 'zstd_level', None))
+    elif args.command == "delta-reconstruct":
+        delta_reconstruct(args.base, args.delta, args.output)
+    elif args.command == "delta-info":
+        delta_info(args.input)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

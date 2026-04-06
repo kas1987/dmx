@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmx-compress"
+version = "0.3.0"
+description = "Structure-aware neural network weight compression. 87% checkpoint delta encoding, not generic file compression."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "William J. Riley", email = "bill.riley@gmail.com"},
+]
+keywords = ["compression", "neural-network", "model-compression", "checkpoint", "safetensors", "deep-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Archiving :: Compression",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "zstandard",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+gpu = ["torch>=2.0", "ninja"]
+lpc = []  # Requires ffmpeg installed separately
+
+[project.urls]
+Homepage = "https://github.com/willjriley/dmx"
+Repository = "https://github.com/willjriley/dmx"
+Issues = "https://github.com/willjriley/dmx/issues"
+
+[project.scripts]
+dmx = "dmx_cli:main"
+
+[tool.setuptools]
+py-modules = ["dmx_cli"]
