@@ -810,6 +810,16 @@ def decode_tensor(compressed_bytes, meta):
             "int16": np.int16,
             "int32": np.int32,
             "int64": np.int64,
+            # uint and bool dtypes — required for GPT-2 attn.bias (uint8) and
+            # any model with boolean attention masks. Without these the encoder
+            # produces a valid .dmx file (the RAW encoding accepts arbitrary
+            # bytes) but the decoder cannot read it back, which is a silent
+            # data-loss failure mode for affected models.
+            "uint8": np.uint8,
+            "uint16": np.uint16,
+            "uint32": np.uint32,
+            "uint64": np.uint64,
+            "bool": np.bool_,
         }.get(meta["dtype"])
         if np_dtype:
             arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape).copy()
