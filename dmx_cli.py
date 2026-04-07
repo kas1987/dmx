@@ -1495,6 +1495,66 @@ def _get_scale(scales, key):
     return scales[_key_type(key)]
 
 
+def _try_normalize_huggingface_prefixes(base_dict, target_dict):
+    """Auto-detect and strip common HuggingFace transformer prefixes if base/target
+    tensor names use different conventions.
+
+    Some HF model revisions use 'transformer.h.0.attn.c_attn.weight' while others
+    use 'h.0.attn.c_attn.weight' for the same weight. Without normalization,
+    delta_compress would compute an empty intersection and silently produce a
+    near-empty .dmxd file (~249 bytes) with no actual delta data.
+
+    Returns (normalized_base, normalized_target, normalization_note) where
+    normalization_note is None if no normalization was needed or possible.
+    """
+    base_keys = set(base_dict.keys())
+    target_keys = set(target_dict.keys())
+
+    # Already match or have at least some overlap — no normalization needed
+    if base_keys & target_keys:
+        return base_dict, target_dict, None
+
+    # Common HuggingFace transformer model prefixes to try
+    HUGGINGFACE_PREFIXES = [
+        "transformer.",
+        "model.",
+        "bert.",
+        "gpt2.",
+        "roberta.",
+        "distilbert.",
+        "electra.",
+        "albert.",
+        "llama.",
+        "mistral.",
+    ]
+
+    for prefix in HUGGINGFACE_PREFIXES:
+        base_all_have = bool(base_keys) and all(k.startswith(prefix) for k in base_keys)
+        target_all_have = bool(target_keys) and all(k.startswith(prefix) for k in target_keys)
+
+        # Case 1: base has prefix, target doesn't — strip from base
+        if base_all_have and not target_all_have:
+            stripped_base = {k[len(prefix):]: v for k, v in base_dict.items()}
+            if set(stripped_base.keys()) & target_keys:
+                return (
+                    stripped_base,
+                    target_dict,
+                    f"stripped '{prefix}' prefix from base tensor names to match target naming",
+                )
+
+        # Case 2: target has prefix, base doesn't — strip from target
+        if target_all_have and not base_all_have:
+            stripped_target = {k[len(prefix):]: v for k, v in target_dict.items()}
+            if base_keys & set(stripped_target.keys()):
+                return (
+                    base_dict,
+                    stripped_target,
+                    f"stripped '{prefix}' prefix from target tensor names to match base naming",
+                )
+
+    return base_dict, target_dict, None
+
+
 def delta_compress(base_path, target_path, output_path, precision="int16", zstd_level=None):
     """Delta-compress a target checkpoint against a base checkpoint.
 
@@ -1522,6 +1582,18 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
     base_size = os.path.getsize(base_path)
     target_size = os.path.getsize(target_path)
 
+    # Auto-normalize common HF prefix differences before computing the
+    # base/target intersection. Without this step, two safetensors files using
+    # different naming conventions (e.g. 'transformer.h.0.attn.c_attn.weight'
+    # vs 'h.0.attn.c_attn.weight') would produce an empty intersection and
+    # delta_compress would silently write a ~249-byte empty .dmxd file with no
+    # actual delta data — a silent data-loss failure mode.
+    normalized_base, normalized_target, norm_note = _try_normalize_huggingface_prefixes(base, target)
+    if norm_note:
+        print(f"  INFO: tensor name auto-normalization applied -- {norm_note}")
+        base = normalized_base
+        target = normalized_target
+
     # Verify compatible keys
     base_keys = set(base.keys())
     target_keys = set(target.keys())
@@ -1533,6 +1605,35 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
         if extra:
             print(f"  WARNING: {len(extra)} keys in target but not base")
     common_keys = sorted(base_keys & target_keys)
+
+    # Hard abort if no common tensors. Previously this would silently produce
+    # a ~249-byte empty .dmxd file with no actual delta data. The auto-
+    # normalization above handles the common HF prefix mismatch case; if we
+    # still have zero common keys, the user has a non-standard naming scheme
+    # and needs to know about it explicitly.
+    if len(common_keys) == 0:
+        base_sample = sorted(base.keys())[:5]
+        target_sample = sorted(target.keys())[:5]
+        sample_msg = (
+            "  Base sample (first 5 tensor names):\n"
+            + "\n".join(f"    {k}" for k in base_sample)
+            + "\n"
+            + "  Target sample (first 5 tensor names):\n"
+            + "\n".join(f"    {k}" for k in target_sample)
+        )
+        raise ValueError(
+            "No tensor names in common between base and target after attempting "
+            "auto-normalization of common HuggingFace prefixes (transformer., "
+            "model., bert., etc.). The two safetensors files appear to use "
+            "different naming conventions.\n\n"
+            + sample_msg
+            + "\n\n"
+            "If your files use a non-standard prefix or differ in tensor naming "
+            "for some other reason, manually rename tensors before delta-compress, "
+            "or contact the model author about format consistency. Refusing to "
+            "write an empty .dmxd file."
+        )
+
     print(f"  Common tensors: {len(common_keys)}")
 
     # Compute aligned scales from max of BOTH base and target (prevents clamping)
