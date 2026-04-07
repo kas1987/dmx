@@ -1780,6 +1780,229 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
     return output_size
 
 
+def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ratio=0.5,
+                   zstd_level=None, use_gpu=None):
+    """Chain-compress a sequence of related checkpoints with auto-anchor promotion.
+
+    This is the production chain compression entry point. It implements the
+    auto-anchor policy documented in the project's internal design notes
+    auto-anchor promotion policy: each checkpoint is delta-compressed against the *current anchor*,
+    and if the resulting delta exceeds max_delta_ratio of the target's raw size,
+    the target is promoted to a new anchor instead.
+
+    Without this policy, naive chain compression degrades catastrophically when
+    consecutive checkpoints diverge significantly (large step intervals,
+    mid-training, large models). With this policy, chain compression is
+    guaranteed to be no worse than DMX-standalone single-file mode while
+    preserving all chain wins where they exist.
+
+    Args:
+        checkpoint_paths: ordered list of safetensors paths to compress as a chain.
+        output_dir: directory to write anchors (.dmx) and deltas (.dmxd) into.
+        precision: int16 (default) or int32 quantization precision.
+        max_delta_ratio: threshold above which a checkpoint becomes a new anchor.
+            0.5 means: if the delta would be larger than 50% of the target raw
+            size, write a fresh anchor instead. Configurable per experiment.
+        zstd_level: optional zstd compression level for deltas (1-19, default 3).
+        use_gpu: passthrough to compress_file for anchor writes.
+
+    Writes:
+        output_dir/<basename>.dmx for anchor checkpoints
+        output_dir/<basename>.dmxd for delta checkpoints
+        output_dir/chain_manifest.json describing the chain
+
+    Returns:
+        dict with 'manifest' (the chain manifest), 'total_raw_bytes',
+        'total_chain_bytes', 'savings_percent', 'anchor_count', 'delta_count'.
+    """
+    if not checkpoint_paths:
+        raise ValueError("chain_compress requires at least one checkpoint")
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"=" * 70)
+    print(f"DMX chain-compress (auto-anchor policy)")
+    print(f"=" * 70)
+    print(f"  Checkpoints: {len(checkpoint_paths)}")
+    print(f"  Precision: {precision}")
+    print(f"  Max delta ratio (anchor promotion threshold): {max_delta_ratio}")
+    print(f"  Output dir: {output_dir}")
+    print()
+
+    chain_entries = []
+    total_raw = 0
+    total_chain = 0
+    anchor_count = 0
+    delta_count = 0
+    current_anchor_safetensors = None  # path to the raw safetensors of the current anchor
+
+    for idx, ckpt_path in enumerate(checkpoint_paths):
+        raw_size = os.path.getsize(ckpt_path)
+        total_raw += raw_size
+        basename = os.path.splitext(os.path.basename(ckpt_path))[0]
+
+        if current_anchor_safetensors is None:
+            # First checkpoint always becomes an anchor
+            anchor_path = os.path.join(output_dir, f"{basename}.dmx")
+            print(f"[{idx+1}/{len(checkpoint_paths)}] {basename}: writing anchor (first checkpoint)")
+            t0 = time.time()
+            compress_file(ckpt_path, anchor_path, mode=precision, use_gpu=use_gpu)
+            elapsed = time.time() - t0
+            anchor_size = os.path.getsize(anchor_path)
+            total_chain += anchor_size
+            anchor_count += 1
+            chain_entries.append({
+                "index": idx,
+                "type": "anchor",
+                "source": os.path.basename(ckpt_path),
+                "raw_size_bytes": raw_size,
+                "compressed_size_bytes": anchor_size,
+                "compressed_path": os.path.relpath(anchor_path, output_dir),
+                "anchor_index": idx,
+                "time_seconds": elapsed,
+            })
+            current_anchor_safetensors = ckpt_path
+            current_anchor_idx = idx
+            print(f"        anchor {fmt_size(anchor_size)} ({100*anchor_size/raw_size:.1f}% of raw) in {elapsed:.1f}s")
+            continue
+
+        # Subsequent checkpoint: try delta against current anchor
+        delta_path = os.path.join(output_dir, f"{basename}.dmxd")
+        print(f"[{idx+1}/{len(checkpoint_paths)}] {basename}: trying delta vs anchor "
+              f"({os.path.splitext(os.path.basename(current_anchor_safetensors))[0]})")
+        t0 = time.time()
+        try:
+            delta_compress(current_anchor_safetensors, ckpt_path, delta_path,
+                           precision=precision, zstd_level=zstd_level)
+        except Exception as e:
+            print(f"        DELTA FAILED: {e}")
+            print(f"        falling back to fresh anchor")
+            if os.path.exists(delta_path):
+                os.remove(delta_path)
+            anchor_path = os.path.join(output_dir, f"{basename}.dmx")
+            t0 = time.time()
+            compress_file(ckpt_path, anchor_path, mode=precision, use_gpu=use_gpu)
+            elapsed = time.time() - t0
+            anchor_size = os.path.getsize(anchor_path)
+            total_chain += anchor_size
+            anchor_count += 1
+            chain_entries.append({
+                "index": idx,
+                "type": "anchor",
+                "source": os.path.basename(ckpt_path),
+                "raw_size_bytes": raw_size,
+                "compressed_size_bytes": anchor_size,
+                "compressed_path": os.path.relpath(anchor_path, output_dir),
+                "anchor_index": idx,
+                "promoted_due_to": "delta_compress_exception",
+                "time_seconds": elapsed,
+            })
+            current_anchor_safetensors = ckpt_path
+            current_anchor_idx = idx
+            continue
+        delta_elapsed = time.time() - t0
+        delta_size = os.path.getsize(delta_path)
+        ratio = delta_size / raw_size
+
+        if ratio <= max_delta_ratio:
+            # Delta is within budget — keep it
+            total_chain += delta_size
+            delta_count += 1
+            chain_entries.append({
+                "index": idx,
+                "type": "delta",
+                "source": os.path.basename(ckpt_path),
+                "raw_size_bytes": raw_size,
+                "compressed_size_bytes": delta_size,
+                "compressed_path": os.path.relpath(delta_path, output_dir),
+                "anchor_index": current_anchor_idx,
+                "delta_ratio": ratio,
+                "savings_percent": 100 * (1 - ratio),
+                "time_seconds": delta_elapsed,
+            })
+            print(f"        delta KEPT: {fmt_size(delta_size)} "
+                  f"({100*ratio:.1f}% of target, threshold {100*max_delta_ratio:.0f}%) in {delta_elapsed:.1f}s")
+        else:
+            # Delta exceeds threshold — promote to anchor instead
+            print(f"        delta REJECTED: {fmt_size(delta_size)} "
+                  f"({100*ratio:.1f}% > {100*max_delta_ratio:.0f}%), promoting to anchor")
+            os.remove(delta_path)
+            anchor_path = os.path.join(output_dir, f"{basename}.dmx")
+            t0 = time.time()
+            compress_file(ckpt_path, anchor_path, mode=precision, use_gpu=use_gpu)
+            anchor_elapsed = time.time() - t0
+            anchor_size = os.path.getsize(anchor_path)
+            total_chain += anchor_size
+            anchor_count += 1
+            chain_entries.append({
+                "index": idx,
+                "type": "anchor",
+                "source": os.path.basename(ckpt_path),
+                "raw_size_bytes": raw_size,
+                "compressed_size_bytes": anchor_size,
+                "compressed_path": os.path.relpath(anchor_path, output_dir),
+                "anchor_index": idx,
+                "promoted_due_to": "delta_ratio_exceeded",
+                "rejected_delta_ratio": ratio,
+                "delta_attempt_seconds": delta_elapsed,
+                "anchor_write_seconds": anchor_elapsed,
+            })
+            current_anchor_safetensors = ckpt_path
+            current_anchor_idx = idx
+            print(f"        anchor {fmt_size(anchor_size)} ({100*anchor_size/raw_size:.1f}% of raw) in {anchor_elapsed:.1f}s")
+
+    savings_percent = 100 * (1 - total_chain / total_raw) if total_raw > 0 else 0
+
+    manifest = {
+        "format": "dmx_chain_manifest",
+        "version": 1,
+        "precision": precision,
+        "max_delta_ratio": max_delta_ratio,
+        "anchor_policy": "auto_anchor_promotion",
+        "checkpoint_count": len(checkpoint_paths),
+        "anchor_count": anchor_count,
+        "delta_count": delta_count,
+        "total_raw_bytes": total_raw,
+        "total_chain_bytes": total_chain,
+        "savings_percent": savings_percent,
+        "entries": chain_entries,
+    }
+
+    manifest_path = os.path.join(output_dir, "chain_manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print()
+    print(f"=" * 70)
+    print(f"Chain compression complete")
+    print(f"=" * 70)
+    print(f"  Anchors: {anchor_count}, Deltas: {delta_count}")
+    print(f"  Total raw:    {fmt_size(total_raw)}")
+    print(f"  Total chain:  {fmt_size(total_chain)}")
+    print(f"  Savings:      {savings_percent:.2f}%")
+    print(f"  Manifest:     {manifest_path}")
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "total_raw_bytes": total_raw,
+        "total_chain_bytes": total_chain,
+        "savings_percent": savings_percent,
+        "anchor_count": anchor_count,
+        "delta_count": delta_count,
+    }
+
+
+def fmt_size(n):
+    """Format byte count as human-readable string."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n/1024/1024:.1f} MB"
+    return f"{n/1024/1024/1024:.2f} GB"
+
+
 def delta_reconstruct(base_path, delta_path, output_path):
     """Reconstruct a checkpoint from base + delta.
 
@@ -2040,6 +2263,19 @@ def main():
     p_dinfo = sub.add_parser("delta-info", help="Show info about a .dmxd delta file")
     p_dinfo.add_argument("input", help="Input .dmxd delta file")
 
+    p_chain = sub.add_parser("chain-compress",
+                              help="Chain-compress a sequence of related checkpoints with auto-anchor promotion")
+    p_chain.add_argument("checkpoints", nargs="+", help="Ordered list of safetensors paths")
+    p_chain.add_argument("--output-dir", required=True, help="Directory for anchors / deltas / manifest")
+    p_chain.add_argument("--precision", choices=["int16", "int32"], default="int16",
+                          help="int16 (default) or int32 quantization precision")
+    p_chain.add_argument("--max-delta-ratio", type=float, default=0.5,
+                          help="Anchor promotion threshold (default 0.5). If a delta would exceed "
+                               "this fraction of the target raw size, the target becomes a new anchor.")
+    p_chain.add_argument("--zstd-level", type=int, default=None,
+                          help="zstd compression level for deltas (1-19, default 3)")
+    p_chain.add_argument("--gpu", action="store_true", help="Use GPU-accelerated compression for anchor writes")
+
     args = parser.parse_args()
 
     if args.command == "compress":
@@ -2064,6 +2300,12 @@ def main():
         delta_reconstruct(args.base, args.delta, args.output)
     elif args.command == "delta-info":
         delta_info(args.input)
+    elif args.command == "chain-compress":
+        chain_compress(args.checkpoints, args.output_dir,
+                       precision=args.precision,
+                       max_delta_ratio=args.max_delta_ratio,
+                       zstd_level=getattr(args, 'zstd_level', None),
+                       use_gpu=args.gpu if args.gpu else None)
     else:
         parser.print_help()
         sys.exit(1)
