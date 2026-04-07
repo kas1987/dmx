@@ -1876,7 +1876,13 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             anchor_path = os.path.join(output_dir, f"{basename}.dmx")
             print(f"[{idx+1}/{len(checkpoint_paths)}] {basename}: writing anchor (first checkpoint)")
             t0 = time.time()
-            compress_file(ckpt_path, anchor_path, mode=precision, use_gpu=use_gpu)
+            # Use mode='auto' so the anchor encoding is picked from source dtype:
+            # FP16/BF16 source → BFP (GPU-accelerated via bfp_compress_gpu)
+            # FP32 source → int16 quant (GPU-accelerated via the encode_tensor GPU path)
+            # The 'precision' arg only governs DELTA encoding (int16 vs int32),
+            # not anchor encoding. Forcing the anchor to mode=precision was a bug
+            # that defeated GPU acceleration on FP16 source models.
+            compress_file(ckpt_path, anchor_path, mode="auto", use_gpu=use_gpu)
             elapsed = time.time() - t0
             anchor_size = os.path.getsize(anchor_path)
             total_chain += anchor_size
@@ -1911,7 +1917,13 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
                 os.remove(delta_path)
             anchor_path = os.path.join(output_dir, f"{basename}.dmx")
             t0 = time.time()
-            compress_file(ckpt_path, anchor_path, mode=precision, use_gpu=use_gpu)
+            # Use mode='auto' so the anchor encoding is picked from source dtype:
+            # FP16/BF16 source → BFP (GPU-accelerated via bfp_compress_gpu)
+            # FP32 source → int16 quant (GPU-accelerated via the encode_tensor GPU path)
+            # The 'precision' arg only governs DELTA encoding (int16 vs int32),
+            # not anchor encoding. Forcing the anchor to mode=precision was a bug
+            # that defeated GPU acceleration on FP16 source models.
+            compress_file(ckpt_path, anchor_path, mode="auto", use_gpu=use_gpu)
             elapsed = time.time() - t0
             anchor_size = os.path.getsize(anchor_path)
             total_chain += anchor_size
@@ -1959,7 +1971,13 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             os.remove(delta_path)
             anchor_path = os.path.join(output_dir, f"{basename}.dmx")
             t0 = time.time()
-            compress_file(ckpt_path, anchor_path, mode=precision, use_gpu=use_gpu)
+            # Use mode='auto' so the anchor encoding is picked from source dtype:
+            # FP16/BF16 source → BFP (GPU-accelerated via bfp_compress_gpu)
+            # FP32 source → int16 quant (GPU-accelerated via the encode_tensor GPU path)
+            # The 'precision' arg only governs DELTA encoding (int16 vs int32),
+            # not anchor encoding. Forcing the anchor to mode=precision was a bug
+            # that defeated GPU acceleration on FP16 source models.
+            compress_file(ckpt_path, anchor_path, mode="auto", use_gpu=use_gpu)
             anchor_elapsed = time.time() - t0
             anchor_size = os.path.getsize(anchor_path)
             total_chain += anchor_size
