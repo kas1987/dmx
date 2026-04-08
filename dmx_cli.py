@@ -1862,19 +1862,36 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
     return output_size
 
 
-def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ratio=0.5,
-                   zstd_level=None, use_gpu=None):
+def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ratio=None,
+                   zstd_level=None, use_gpu=None, anchor_safety_margin=0.95):
     """Chain-compress a sequence of related checkpoints with auto-anchor promotion.
 
     This is the production chain compression entry point. It implements the
     auto-anchor policy documented in the project's internal design notes
-    auto-anchor promotion policy: each checkpoint is delta-compressed against the *current anchor*,
-    and if the resulting delta exceeds max_delta_ratio of the target's raw size,
-    the target is promoted to a new anchor instead.
+    auto-anchor promotion policy.
 
-    Without this policy, naive chain compression degrades catastrophically when
-    consecutive checkpoints diverge significantly (large step intervals,
-    mid-training, large models). With this policy, chain compression is
+    Two anchor-promotion policies are supported:
+
+    1. **Dynamic (default, optimal)** — `max_delta_ratio=None`. The threshold
+       is the *current anchor's actual compressed size* (× anchor_safety_margin).
+       A delta is kept if and only if `delta_compressed_size <
+       current_anchor_compressed_size * 0.95`. This is provably storage-optimal
+       given the anchor and delta primitives — keeping a delta that's larger
+       than what a fresh anchor would cost is strictly worse for total storage.
+       Self-calibrating across source dtypes (FP16 BFP anchor ~40% of raw,
+       FP32 int16 anchor ~50% of raw) without manual tuning. Decision rule
+       documented as a refinement to the auto-anchor promotion policy.
+
+    2. **Static (legacy)** — pass a float in [0, 1]. The delta is kept if its
+       size is <= max_delta_ratio of the target's *raw* size. Legacy behavior
+       preserved for back-compat and ablation experiments. Discovered April 7
+       2026 to be suboptimal for FP16 source: a 0.5 threshold can keep deltas
+       that are larger than fresh anchors when the standalone anchor is ~40%
+       of raw.
+
+    Without an anchor policy, naive chain compression degrades catastrophically
+    when consecutive checkpoints diverge significantly (large step intervals,
+    mid-training, large models). With auto-anchor, chain compression is
     guaranteed to be no worse than DMX-standalone single-file mode while
     preserving all chain wins where they exist.
 
@@ -1882,11 +1899,18 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
         checkpoint_paths: ordered list of safetensors paths to compress as a chain.
         output_dir: directory to write anchors (.dmx) and deltas (.dmxd) into.
         precision: int16 (default) or int32 quantization precision.
-        max_delta_ratio: threshold above which a checkpoint becomes a new anchor.
-            0.5 means: if the delta would be larger than 50% of the target raw
-            size, write a fresh anchor instead. Configurable per experiment.
+        max_delta_ratio: anchor promotion threshold. None (default) selects the
+            dynamic policy: keep a delta only if its compressed size is smaller
+            than the current anchor's compressed size × anchor_safety_margin.
+            A float in [0, 1] activates the static policy: keep a delta only
+            if its size is at most that fraction of the target's RAW size.
+            The dynamic policy is storage-optimal; the static one is legacy.
         zstd_level: optional zstd compression level for deltas (1-19, default 3).
         use_gpu: passthrough to compress_file for anchor writes.
+        anchor_safety_margin: in dynamic mode, multiply current anchor size by
+            this factor before comparing to delta size. Default 0.95 prevents
+            kept/promoted oscillation when delta size is exactly at the anchor
+            size boundary. Ignored in static mode.
 
     Writes:
         output_dir/<basename>.dmx for anchor checkpoints
@@ -1901,12 +1925,16 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
         raise ValueError("chain_compress requires at least one checkpoint")
     os.makedirs(output_dir, exist_ok=True)
 
+    policy_mode = "static" if max_delta_ratio is not None else "dynamic"
     print(f"=" * 70)
-    print(f"DMX chain-compress (auto-anchor policy)")
+    print(f"DMX chain-compress (auto-anchor policy: {policy_mode})")
     print(f"=" * 70)
     print(f"  Checkpoints: {len(checkpoint_paths)}")
     print(f"  Precision: {precision}")
-    print(f"  Max delta ratio (anchor promotion threshold): {max_delta_ratio}")
+    if policy_mode == "dynamic":
+        print(f"  Anchor promotion: dynamic (delta > current_anchor_compressed_size * {anchor_safety_margin})")
+    else:
+        print(f"  Anchor promotion: static (delta > {max_delta_ratio} * raw target size)")
     print(f"  Output dir: {output_dir}")
     print()
 
@@ -1916,6 +1944,7 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
     anchor_count = 0
     delta_count = 0
     current_anchor_safetensors = None  # path to the raw safetensors of the current anchor
+    current_anchor_compressed_size = None  # compressed size of the current anchor (for dynamic policy)
 
     for idx, ckpt_path in enumerate(checkpoint_paths):
         raw_size = os.path.getsize(ckpt_path)
@@ -1950,6 +1979,7 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             })
             current_anchor_safetensors = ckpt_path
             current_anchor_idx = idx
+            current_anchor_compressed_size = anchor_size
             print(f"        anchor {fmt_size(anchor_size)} ({100*anchor_size/raw_size:.1f}% of raw) in {elapsed:.1f}s")
             continue
 
@@ -1992,12 +2022,32 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             })
             current_anchor_safetensors = ckpt_path
             current_anchor_idx = idx
+            current_anchor_compressed_size = anchor_size
             continue
         delta_elapsed = time.time() - t0
         delta_size = os.path.getsize(delta_path)
         ratio = delta_size / raw_size
 
-        if ratio <= max_delta_ratio:
+        # Decide whether to keep the delta or promote to a new anchor.
+        # Dynamic policy (default): compare delta size to the current anchor's
+        # actual compressed size. Optimal regardless of source dtype because
+        # it directly minimizes total chain bytes — keeping a delta that's
+        # larger than what a fresh anchor would cost is strictly worse.
+        # Static policy (legacy): compare delta size to a fixed fraction of
+        # raw target size. Preserved for back-compat and ablation experiments.
+        if policy_mode == "dynamic":
+            anchor_threshold_bytes = int(current_anchor_compressed_size * anchor_safety_margin)
+            keep_delta = delta_size <= anchor_threshold_bytes
+            decision_label = (
+                f"delta {fmt_size(delta_size)} vs anchor*{anchor_safety_margin} {fmt_size(anchor_threshold_bytes)}"
+            )
+        else:
+            keep_delta = ratio <= max_delta_ratio
+            decision_label = (
+                f"{100*ratio:.1f}% of raw target, threshold {100*max_delta_ratio:.0f}%"
+            )
+
+        if keep_delta:
             # Delta is within budget — keep it
             total_chain += delta_size
             delta_count += 1
@@ -2010,15 +2060,14 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
                 "compressed_path": os.path.relpath(delta_path, output_dir),
                 "anchor_index": current_anchor_idx,
                 "delta_ratio": ratio,
+                "delta_vs_anchor_ratio": delta_size / current_anchor_compressed_size,
                 "savings_percent": 100 * (1 - ratio),
                 "time_seconds": delta_elapsed,
             })
-            print(f"        delta KEPT: {fmt_size(delta_size)} "
-                  f"({100*ratio:.1f}% of target, threshold {100*max_delta_ratio:.0f}%) in {delta_elapsed:.1f}s")
+            print(f"        delta KEPT: {decision_label} in {delta_elapsed:.1f}s")
         else:
             # Delta exceeds threshold — promote to anchor instead
-            print(f"        delta REJECTED: {fmt_size(delta_size)} "
-                  f"({100*ratio:.1f}% > {100*max_delta_ratio:.0f}%), promoting to anchor")
+            print(f"        delta REJECTED: {decision_label}, promoting to anchor")
             os.remove(delta_path)
             anchor_path = os.path.join(output_dir, f"{basename}.dmx")
             t0 = time.time()
@@ -2048,16 +2097,19 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             })
             current_anchor_safetensors = ckpt_path
             current_anchor_idx = idx
+            current_anchor_compressed_size = anchor_size
             print(f"        anchor {fmt_size(anchor_size)} ({100*anchor_size/raw_size:.1f}% of raw) in {anchor_elapsed:.1f}s")
 
     savings_percent = 100 * (1 - total_chain / total_raw) if total_raw > 0 else 0
 
     manifest = {
         "format": "dmx_chain_manifest",
-        "version": 1,
+        "version": 2,
         "precision": precision,
-        "max_delta_ratio": max_delta_ratio,
         "anchor_policy": "auto_anchor_promotion",
+        "anchor_policy_mode": policy_mode,  # "dynamic" or "static"
+        "max_delta_ratio": max_delta_ratio,  # null in dynamic mode
+        "anchor_safety_margin": anchor_safety_margin if policy_mode == "dynamic" else None,
         "checkpoint_count": len(checkpoint_paths),
         "anchor_count": anchor_count,
         "delta_count": delta_count,
@@ -2369,9 +2421,16 @@ def main():
     p_chain.add_argument("--output-dir", required=True, help="Directory for anchors / deltas / manifest")
     p_chain.add_argument("--precision", choices=["int16", "int32"], default="int16",
                           help="int16 (default) or int32 quantization precision")
-    p_chain.add_argument("--max-delta-ratio", type=float, default=0.5,
-                          help="Anchor promotion threshold (default 0.5). If a delta would exceed "
-                               "this fraction of the target raw size, the target becomes a new anchor.")
+    p_chain.add_argument("--max-delta-ratio", type=float, default=None,
+                          help="Static anchor promotion threshold (legacy). If set, a delta is "
+                               "kept only when its compressed size is <= this fraction of the "
+                               "target's RAW size. Default unset → dynamic policy: keep delta only "
+                               "when its size is < current_anchor_compressed_size * 0.95. The "
+                               "dynamic policy is storage-optimal and self-calibrates per source dtype.")
+    p_chain.add_argument("--anchor-safety-margin", type=float, default=0.95,
+                          help="Dynamic policy safety margin (default 0.95). Multiplied by the "
+                               "current anchor's compressed size to set the keep/promote boundary. "
+                               "Ignored when --max-delta-ratio is set.")
     p_chain.add_argument("--zstd-level", type=int, default=None,
                           help="zstd compression level for deltas (1-19, default 3)")
     p_chain.add_argument("--gpu", action="store_true", help="Use GPU-accelerated compression for anchor writes")
@@ -2404,6 +2463,7 @@ def main():
         chain_compress(args.checkpoints, args.output_dir,
                        precision=args.precision,
                        max_delta_ratio=args.max_delta_ratio,
+                       anchor_safety_margin=args.anchor_safety_margin,
                        zstd_level=getattr(args, 'zstd_level', None),
                        use_gpu=args.gpu if args.gpu else None)
     else:
