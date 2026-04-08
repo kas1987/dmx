@@ -1734,7 +1734,56 @@ def _try_normalize_huggingface_prefixes(base_dict, target_dict):
     return base_dict, target_dict, None
 
 
-def delta_compress(base_path, target_path, output_path, precision="int16", zstd_level=None):
+def _detect_legacy_aux_buffers(state_dict):
+    """Detect legacy auxiliary buffer tensors that should be excluded from
+    chain compression because they (a) don't change between checkpoints,
+    (b) are dropped by modern HF loaders anyway, and (c) corrupt the
+    aligned scale calculation when included in scale groups with learned
+    weights.
+
+    Returns a sorted list of tensor names to exclude.
+
+    Three signatures (any one is sufficient to mark as exclusion):
+      1. uint8 dtype + name ending in 'attention.bias' or 'attn.bias'
+         → causal mask buffers (4 MB each on GPT-NeoX-2048-context)
+      2. Tensor name contains 'inv_freq' or 'rotary_emb'
+         → rotary positional encoding precomputed buffers
+      3. Single-element tensor named 'masked_bias' or matching that pattern
+         → mask fill value scalar
+
+    Modern transformers (5.x) registers all of these with persistent=False
+    so they don't appear in the state_dict on disk. But legacy checkpoints
+    saved with older transformers versions DO have them, and they leak into
+    DMX chain compression as constant-but-still-encoded data plus per-tensor
+    manifest overhead. Stripping them is what every modern HF loader does
+    anyway via `_keys_to_ignore_on_load_unexpected`.
+    """
+    excluded = []
+    for key, tensor in state_dict.items():
+        is_legacy_buffer = False
+
+        # Signature 1: uint8 attention causal mask
+        if tensor.dtype == torch.uint8 and (
+            key.endswith("attention.bias") or key.endswith("attn.bias")
+        ):
+            is_legacy_buffer = True
+
+        # Signature 2: rotary positional encoding precomputed buffer
+        elif "inv_freq" in key or "rotary_emb" in key:
+            is_legacy_buffer = True
+
+        # Signature 3: masked_bias scalar fill value
+        elif key.endswith("masked_bias") or key.endswith("attention.masked_bias"):
+            is_legacy_buffer = True
+
+        if is_legacy_buffer:
+            excluded.append(key)
+
+    return sorted(excluded)
+
+
+def delta_compress(base_path, target_path, output_path, precision="int16",
+                   zstd_level=None, strip_legacy_buffers=True):
     """Delta-compress a target checkpoint against a base checkpoint.
 
     Precision modes:
@@ -1784,6 +1833,26 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
         if extra:
             print(f"  WARNING: {len(extra)} keys in target but not base")
     common_keys = sorted(base_keys & target_keys)
+
+    # Strip legacy auxiliary buffer tensors (causal masks, rotary inv_freq,
+    # masked_bias). These are present in checkpoints saved with older HF
+    # transformers versions where buffers were persistent=True. Modern
+    # loaders ignore them via _keys_to_ignore_on_load_unexpected, so
+    # excluding them on the DMX side matches what every consumer does
+    # downstream. See _detect_legacy_aux_buffers() docstring for the
+    # exact signatures.
+    if strip_legacy_buffers and common_keys:
+        excluded_in_base = set(_detect_legacy_aux_buffers(base))
+        excluded_in_target = set(_detect_legacy_aux_buffers(target))
+        excluded = excluded_in_base | excluded_in_target
+        if excluded:
+            n_before = len(common_keys)
+            common_keys = [k for k in common_keys if k not in excluded]
+            n_excluded = n_before - len(common_keys)
+            print(f"  Stripped {n_excluded} legacy auxiliary buffer tensor(s) "
+                  f"(causal masks / inv_freq / masked_bias) from chain compression. "
+                  f"Modern HF loaders ignore these on load anyway. Pass "
+                  f"strip_legacy_buffers=False to keep them.")
 
     # Hard abort if no common tensors. Previously this would silently produce
     # a ~249-byte empty .dmxd file with no actual delta data. The auto-
@@ -2030,7 +2099,8 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
 
 
 def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ratio=None,
-                   zstd_level=None, use_gpu=None, anchor_safety_margin=0.95):
+                   zstd_level=None, use_gpu=None, anchor_safety_margin=0.95,
+                   strip_legacy_buffers=True):
     """Chain-compress a sequence of related checkpoints with auto-anchor promotion.
 
     This is the production chain compression entry point. It implements the
@@ -2157,7 +2227,8 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
         t0 = time.time()
         try:
             delta_compress(current_anchor_safetensors, ckpt_path, delta_path,
-                           precision=precision, zstd_level=zstd_level)
+                           precision=precision, zstd_level=zstd_level,
+                           strip_legacy_buffers=strip_legacy_buffers)
         except Exception as e:
             print(f"        DELTA FAILED: {e}")
             print(f"        falling back to fresh anchor")
@@ -2572,6 +2643,12 @@ def main():
                                "int32: practically lossless ~87%% savings, error below FP32 noise floor.")
     p_delta.add_argument("--zstd-level", type=int, default=None,
                           help="zstd compression level 1-19 (default: 3 for speed. Use 19 for maximum compression).")
+    p_delta.add_argument("--keep-legacy-buffers", action="store_true",
+                          help="Include legacy auxiliary buffer tensors (causal masks, "
+                               "inv_freq, masked_bias) in the delta. Default is to strip them "
+                               "because modern HF loaders ignore them anyway and they corrupt "
+                               "aligned scale calculations. Only set this if you need bit-exact "
+                               "round-trip of a legacy-format checkpoint.")
 
     p_recon = sub.add_parser("delta-reconstruct",
                               help="Reconstruct a checkpoint from base + delta")
@@ -2601,6 +2678,9 @@ def main():
     p_chain.add_argument("--zstd-level", type=int, default=None,
                           help="zstd compression level for deltas (1-19, default 3)")
     p_chain.add_argument("--gpu", action="store_true", help="Use GPU-accelerated compression for anchor writes")
+    p_chain.add_argument("--keep-legacy-buffers", action="store_true",
+                          help="Include legacy auxiliary buffers (causal masks, inv_freq, "
+                               "masked_bias) in chain deltas. Default is to strip them.")
 
     args = parser.parse_args()
 
@@ -2621,7 +2701,8 @@ def main():
                     report_path=args.report, use_gpu=args.gpu if args.gpu else None)
     elif args.command == "delta-compress":
         delta_compress(args.base, args.target, args.output, precision=args.precision,
-                      zstd_level=getattr(args, 'zstd_level', None))
+                      zstd_level=getattr(args, 'zstd_level', None),
+                      strip_legacy_buffers=not args.keep_legacy_buffers)
     elif args.command == "delta-reconstruct":
         delta_reconstruct(args.base, args.delta, args.output)
     elif args.command == "delta-info":
@@ -2632,7 +2713,8 @@ def main():
                        max_delta_ratio=args.max_delta_ratio,
                        anchor_safety_margin=args.anchor_safety_margin,
                        zstd_level=getattr(args, 'zstd_level', None),
-                       use_gpu=args.gpu if args.gpu else None)
+                       use_gpu=args.gpu if args.gpu else None,
+                       strip_legacy_buffers=not args.keep_legacy_buffers)
     else:
         parser.print_help()
         sys.exit(1)
