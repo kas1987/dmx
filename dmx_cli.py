@@ -1519,6 +1519,154 @@ def _key_type(key):
     return ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
 
 
+def _compute_decomposition_diagnostics(state_dict, scales, precision="int16"):
+    """Compute per-component-group diagnostics for chain compression analysis.
+
+    Returns a dict that can be embedded in a manifest, capturing how the
+    aligned per-component quantization grouped tensors and what the resulting
+    scales are. This lets future analysis detectscale groups
+    (e.g., a learned weight matrix sharing a scale with an auxiliary buffer
+    that has very different magnitude statistics, causing the int16 step
+    size to be wasted on the buffer instead of tuned to the weights).
+
+    The "composition check" pattern: a scale group whose max-abs is dominated by
+    a single outlier member, OR a scale group whose computed scale is
+    suspiciously round (e.g., near 1.0 / 32767 ≈ 3e-5, suggesting a value
+    of 1.0 like an attention causal mask or rotary inv_freq buffer).
+
+    Output structure:
+        {
+          'tensor_count': int,
+          'scale_group_count': int,
+          'per_group': {
+            <component_type>: {
+              'members': [tensor_name, ...],
+              'member_count': int,
+              'per_tensor_max_abs': {tensor_name: float},
+              'group_max_abs': float,
+              'aligned_scale': float,
+              'is_singleton': bool,
+              'max_abs_dominant_tensor': str,
+              'max_abs_to_median_ratio': float,
+              'composition_flag': bool,
+              'composition_reason': str | null,
+            }
+          },
+          'flagged_groups': [component_type, ...],
+        }
+    """
+    from collections import defaultdict
+    import statistics
+
+    groups = defaultdict(list)
+    for key in state_dict:
+        ctype = _key_type(key)
+        groups[ctype].append(key)
+
+    per_group = {}
+    flagged_groups = []
+    for ctype, keys in groups.items():
+        per_max = {}
+        for k in keys:
+            try:
+                per_max[k] = float(state_dict[k].float().abs().max().item())
+            except Exception:
+                per_max[k] = 0.0
+
+        max_vals = list(per_max.values())
+        if not max_vals:
+            continue
+
+        group_max = max(max_vals)
+        # Find the tensor that's "responsible" for the group max
+        dominant = max(per_max.items(), key=lambda kv: kv[1])[0]
+
+        # Median for ratio analysis (robust to single outlier)
+        median = statistics.median(max_vals) if max_vals else 0.0
+        ratio = (group_max / median) if median > 0 else 1.0
+
+        # Get the scale that was actually used for this group (from the
+        # _compute_aligned_scales output). May be at scales[ctype] for the
+        # group entry, or at scales[k] for a per-tensor override on a small
+        # tensor.
+        aligned_scale = scales.get(ctype)
+        if aligned_scale is None:
+            # Maybe everyone in this group got per-tensor scales — pick the first
+            for k in keys:
+                if k in scales:
+                    aligned_scale = scales[k]
+                    break
+
+        # Composition check heuristics — three orthogonal signals that a scale group
+        # isby auxiliary tensors that should be in their own group
+        # or stripped entirely:
+        #
+        # 1. INTRA-GROUP DOMINANCE: max-abs dominated by a single member that's
+        #    >10x the group median. Catches "one auxiliary mask mixed with N
+        #    learned weight matrices."
+        #
+        # 2. SCALE-NEAR-LIM: aligned scale ≈ 1.0 / max_val ≈ 3e-5 for int16,
+        #    which means group max-abs ≈ 1.0. That's the signature of attention
+        #    masks (max-abs = 1.0) or normalized buffers being included in the
+        #    scale calculation. Catches "the WHOLE group is one type of auxiliary
+        #    tensor with a numerically suspicious value range."
+        #
+        # 3. ABSURD MAGNITUDE: max-abs >> 1.0 (e.g., 10+, 1e9+) is essentially
+        #    impossible for trained weights of any modern architecture (typical
+        #    learned weights are bounded around ±0.5 by initialization +
+        #    weight decay). Catches "this group contains attention causal masks
+        #    with -1e9 fill values" or similar auxiliary state.
+        composition_flag = False
+        composition_reason = None
+        if len(keys) > 1 and ratio > 10.0:
+            composition_flag = True
+            composition_reason = (
+                f"INTRA-GROUP DOMINANCE: max-abs dominated by '{dominant}' "
+                f"({group_max:.4g}) — {ratio:.1f}x the group median ({median:.4g}). "
+                f"Likely an auxiliary buffer polluting a weight scale group; "
+                f"chain compression on this group will be suboptimal."
+            )
+        elif group_max > 10.0:
+            composition_flag = True
+            composition_reason = (
+                f"ABSURD MAGNITUDE: group max-abs is {group_max:.4g}, far above "
+                f"the typical learned weight range (±0.5). This group probably "
+                f"contains attention causal masks, position embeddings, or other "
+                f"auxiliary tensors that should be excluded from chain compression "
+                f"(they don't change between checkpoints anyway, and they corrupt "
+                f"the int16 quantization scale)."
+            )
+        elif aligned_scale is not None and 0.99 / 32767 < aligned_scale < 1.01 / 32767:
+            composition_flag = True
+            composition_reason = (
+                f"SCALE-NEAR-LIM: aligned scale ≈ {aligned_scale:.6g} suggests "
+                f"max-abs ≈ 1.0, the signature value of an attention mask or "
+                f"normalized buffer. Investigate whether this group should be split."
+            )
+
+        per_group[ctype] = {
+            "members": sorted(keys),
+            "member_count": len(keys),
+            "per_tensor_max_abs": per_max,
+            "group_max_abs": group_max,
+            "aligned_scale": aligned_scale,
+            "is_singleton": len(keys) == 1,
+            "max_abs_dominant_tensor": dominant,
+            "max_abs_to_median_ratio": ratio,
+            "composition_flag": composition_flag,
+            "composition_reason": composition_reason,
+        }
+        if composition_flag:
+            flagged_groups.append(ctype)
+
+    return {
+        "tensor_count": len(state_dict),
+        "scale_group_count": len(per_group),
+        "per_group": per_group,
+        "flagged_groups": flagged_groups,
+    }
+
+
 def _get_scale(scales, key):
     """Get scale for a tensor — per-tensor override if exists, else group scale."""
     if key in scales:
@@ -1676,6 +1824,21 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
     scales = _compute_aligned_scales(combined_max, precision=precision)
     print(f"  Aligned component groups: {len(scales)}")
 
+    # Compute decomposition diagnostics — captures per-component-group structure,
+    # max-abs values, and "composition check" detection for scale groups with suboptimal composition.
+    # See per-component-group composition check (tensor partitioning is a
+    # significant variable). Diagnostics get embedded in the manifest so
+    # downstream analysis can detect suboptimal decompositions automatically.
+    decomp_diagnostics = _compute_decomposition_diagnostics(combined_max, scales, precision=precision)
+    if decomp_diagnostics["flagged_groups"]:
+        print(f"  WARNING: {len(decomp_diagnostics['flagged_groups'])} scale group(s) flagged "
+              f"as flagged with suboptimal composition — chain compression on these may be suboptimal:")
+        for ctype in decomp_diagnostics["flagged_groups"]:
+            g = decomp_diagnostics["per_group"][ctype]
+            print(f"    [{ctype}]: {g['composition_reason']}")
+        print(f"  → (detected suboptimal scale group composition) (when available, ) "
+              f"to repack into a chain-compression-optimal layout.")
+
     max_val = 32767 if precision == "int16" else 2147483647
 
     # Quantize and compute deltas, encode per-tensor
@@ -1821,6 +1984,10 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
         "total_zeros": total_zero,
         "scales": {ct: s for ct, s in scales.items()} if scales else {},
         "tensors": tensor_meta,
+        # Decomposition diagnostics — see per-component-group composition check.
+        # Captures per-scale-group max-abs and composition-check pollution flags so
+        # downstream analysis can detect suboptimal tensor partitionings.
+        "decomposition_diagnostics": decomp_diagnostics,
     }
 
     # Write .dmxd file: [MAGIC 4B][VERSION 4B][MANIFEST_LEN 4B][MANIFEST][CHUNKS...]
