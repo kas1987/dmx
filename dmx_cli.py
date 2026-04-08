@@ -1688,19 +1688,31 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
     total_zero = 0
     total_compressed = 0
 
-    # Try native CUDA kernels for GPU acceleration
+    # Three GPU acceleration tiers, in priority order:
+    # 1. Native CUDA kernels (fastest, requires compiled C++ extension via nvcc)
+    # 2. torch-on-GPU fallback (when CUDA available but kernels not built — A100
+    #    pods typically hit this path because the extension build needs nvcc)
+    # 3. CPU torch fallback
+    #
+    # Without tier 2, A100 pods that don't have the native kernels built fall
+    # all the way through to CPU, which is ~50-100x slower than necessary for
+    # the int16 quant + subtract step. Tier 2 was added  evening
+    # after Pythia 1.4B chain experiments showed delta_compress as the long pole
+    # at ~280s/delta on A100 (CPU-bound).
     cuda_kernels = _get_cuda_kernels() if torch.cuda.is_available() else None
+    use_torch_gpu = cuda_kernels is None and torch.cuda.is_available()
     if cuda_kernels:
         print("  GPU-accelerated delta compression (native CUDA kernels)")
+    elif use_torch_gpu:
+        print(f"  GPU-accelerated delta compression (torch fallback on {torch.cuda.get_device_name(0)})")
 
     for i, key in enumerate(common_keys):
         scale = _get_scale(scales, key)
 
         if cuda_kernels and base[key].numel() > 1024:
-            # Native CUDA path: fused quantize + subtract in one kernel call
+            # Tier 1: native CUDA fused quantize + subtract
             b_gpu = base[key].float().cuda()
             t_gpu = target[key].float().cuda()
-            # Kernel expects max_abs, not scale (scale = max_abs / max_val)
             max_abs = scale * max_val
             if precision == "int32":
                 delta = cuda_kernels.delta_compute_i32(b_gpu, t_gpu, max_abs).cpu()
@@ -1708,9 +1720,48 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
                 delta = cuda_kernels.delta_compute_i16(b_gpu, t_gpu, max_abs).cpu()
             delta_bytes = delta.numpy().tobytes()
             del b_gpu, t_gpu
+        elif use_torch_gpu and base[key].numel() > 1024:
+            # Tier 2: torch-on-GPU fallback. Same math as the CPU branches
+            # below, but the heavy operations (round, clamp, cast, subtract)
+            # run on the GPU. The int16 / int32 result is moved back to CPU
+            # for entropy coding. Skip the GPU path for tiny tensors (<=1024
+            # params) where the H2D transfer cost dominates.
+            if precision == "int32":
+                # int32 uses float32 on GPU instead of float64 (A100 fp64 is
+                # 1/32 throughput). Headroom is ~31 bits so float32 round is
+                # exact for typical NN weight ranges. Falls through to CPU
+                # double() if a future precision concern requires it.
+                b_gpu = base[key].contiguous().cuda(non_blocking=True).float()
+                t_gpu = target[key].contiguous().cuda(non_blocking=True).float()
+                base_int_g = torch.clamp(
+                    torch.round(b_gpu / scale), -max_val, max_val
+                ).to(torch.int32)
+                target_int_g = torch.clamp(
+                    torch.round(t_gpu / scale), -max_val, max_val
+                ).to(torch.int32)
+                delta_g = (
+                    target_int_g.to(torch.int64) - base_int_g.to(torch.int64)
+                ).to(torch.int32)
+                delta = delta_g.cpu()
+                delta_bytes = delta.numpy().tobytes()
+                del b_gpu, t_gpu, base_int_g, target_int_g, delta_g
+            else:
+                b_gpu = base[key].contiguous().cuda(non_blocking=True).float()
+                t_gpu = target[key].contiguous().cuda(non_blocking=True).float()
+                base_int_g = torch.clamp(
+                    torch.round(b_gpu / scale), -max_val, max_val
+                ).to(torch.int16)
+                target_int_g = torch.clamp(
+                    torch.round(t_gpu / scale), -max_val, max_val
+                ).to(torch.int16)
+                delta_g = (
+                    target_int_g.to(torch.int32) - base_int_g.to(torch.int32)
+                ).to(torch.int16)
+                delta = delta_g.cpu()
+                delta_bytes = delta.numpy().tobytes()
+                del b_gpu, t_gpu, base_int_g, target_int_g, delta_g
         elif precision == "int32":
-            # CPU fallback: practically lossless aligned quantization to int32
-            # Use float64 for int32 quantization to avoid precision loss
+            # Tier 3: CPU fallback (int32, float64 for max precision)
             base_int = torch.clamp(
                 torch.round(base[key].double() / scale), -max_val, max_val
             ).to(torch.int32)
@@ -1720,7 +1771,7 @@ def delta_compress(base_path, target_path, output_path, precision="int16", zstd_
             delta = (target_int.to(torch.int64) - base_int.to(torch.int64)).to(torch.int32)
             delta_bytes = delta.numpy().tobytes()
         else:
-            # CPU fallback: near-lossless aligned quantization to int16
+            # Tier 3: CPU fallback (int16)
             base_int = torch.clamp(
                 torch.round(base[key].float() / scale), -max_val, max_val
             ).to(torch.int16)
