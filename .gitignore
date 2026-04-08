@@ -6,20 +6,9 @@
 # Claude
 .claude/
 
-
 .githooks/
 
-
-
-
-
 experiments/
-
-
-
-
-
-
 
 internal_tests/
 tests/
