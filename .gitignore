@@ -15,6 +15,15 @@
 
 experiments/
 
+
+
+
+
+
+
+internal_tests/
+tests/
+
 # Local working directory
 .archived/
 

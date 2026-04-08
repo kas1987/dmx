@@ -1470,7 +1470,7 @@ DELTA_VERSION = 1
 SMALL_TENSOR_THRESHOLD = 4096  # Tensors below this size get per-tensor scales
 
 def _compute_aligned_scales(state_dict, precision="int16"):
-    """Compute aligned scales per component type .
+    """Compute aligned scales per component type.
 
     Groups tensors by their component name (e.g., all 'self_attn.q_proj.weight'
     across layers share one scale). This enables exact integer subtraction
@@ -1524,15 +1524,16 @@ def _compute_decomposition_diagnostics(state_dict, scales, precision="int16"):
 
     Returns a dict that can be embedded in a manifest, capturing how the
     aligned per-component quantization grouped tensors and what the resulting
-    scales are. This lets future analysis detectscale groups
-    (e.g., a learned weight matrix sharing a scale with an auxiliary buffer
-    that has very different magnitude statistics, causing the int16 step
-    size to be wasted on the buffer instead of tuned to the weights).
+    scales are. This lets downstream analysis detect scale groups whose
+    composition is suboptimal — for example, when a learned weight matrix
+    shares a scale group with an auxiliary buffer (like a constant attention
+    mask) that has a very different magnitude range. In that case the int16
+    step size gets sized to fit the auxiliary buffer instead of tuned to
+    the actual learned weights, which hurts compression efficiency.
 
-    The "composition check" pattern: a scale group whose max-abs is dominated by
-    a single outlier member, OR a scale group whose computed scale is
-    suspiciously round (e.g., near 1.0 / 32767 ≈ 3e-5, suggesting a value
-    of 1.0 like an attention causal mask or rotary inv_freq buffer).
+    Detection signals: scale groups dominated by a single outlier member,
+    groups with magnitudes far above the typical learned-weight range, or
+    groups with a computed scale matching the signature of a constant value.
 
     Output structure:
         {
@@ -1597,24 +1598,24 @@ def _compute_decomposition_diagnostics(state_dict, scales, precision="int16"):
                     aligned_scale = scales[k]
                     break
 
-        # Composition check heuristics — three orthogonal signals that a scale group
-        # isby auxiliary tensors that should be in their own group
-        # or stripped entirely:
+        # Three orthogonal heuristics for detecting scale groups whose
+        # composition is suboptimal (auxiliary tensors mixed with learned
+        # weights):
         #
         # 1. INTRA-GROUP DOMINANCE: max-abs dominated by a single member that's
-        #    >10x the group median. Catches "one auxiliary mask mixed with N
-        #    learned weight matrices."
+        #    >10x the group median. Catches "one auxiliary tensor mixed with
+        #    N learned weight matrices in the same scale group."
         #
         # 2. SCALE-NEAR-LIM: aligned scale ≈ 1.0 / max_val ≈ 3e-5 for int16,
-        #    which means group max-abs ≈ 1.0. That's the signature of attention
-        #    masks (max-abs = 1.0) or normalized buffers being included in the
-        #    scale calculation. Catches "the WHOLE group is one type of auxiliary
-        #    tensor with a numerically suspicious value range."
+        #    which means group max-abs ≈ 1.0. That's the signature of constant
+        #    masks or normalized buffers being included in the scale
+        #    calculation. Catches "the entire group is a single auxiliary
+        #    tensor type with a numerically suspicious value range."
         #
         # 3. ABSURD MAGNITUDE: max-abs >> 1.0 (e.g., 10+, 1e9+) is essentially
         #    impossible for trained weights of any modern architecture (typical
         #    learned weights are bounded around ±0.5 by initialization +
-        #    weight decay). Catches "this group contains attention causal masks
+        #    weight decay). Catches "this group contains constant mask buffers
         #    with -1e9 fill values" or similar auxiliary state.
         composition_flag = False
         composition_reason = None
@@ -1793,7 +1794,7 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
 
     Algorithm:
     1. Load base and target safetensors
-    2. Compute aligned scales per component type 
+    2. Compute aligned scales per component type
     3. Quantize both to int16 or int32, integer subtract to produce delta
     4. Entropy-code the sparse delta with zstd
     5. Save as .dmxd file with metadata
@@ -1893,20 +1894,18 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
     scales = _compute_aligned_scales(combined_max, precision=precision)
     print(f"  Aligned component groups: {len(scales)}")
 
-    # Compute decomposition diagnostics — captures per-component-group structure,
-    # max-abs values, and "composition check" detection for scale groups with suboptimal composition.
-    # See per-component-group composition check (tensor partitioning is a
-    # significant variable). Diagnostics get embedded in the manifest so
-    # downstream analysis can detect suboptimal decompositions automatically.
+    # Compute per-component-group diagnostics — captures structure, max-abs
+    # values, and detection of scale groups whose composition may be suboptimal.
+    # Diagnostics are embedded in the manifest so downstream analysis can
+    # identify suboptimal scale group compositions automatically.
     decomp_diagnostics = _compute_decomposition_diagnostics(combined_max, scales, precision=precision)
     if decomp_diagnostics["flagged_groups"]:
-        print(f"  WARNING: {len(decomp_diagnostics['flagged_groups'])} scale group(s) flagged "
-              f"as flagged with suboptimal composition — chain compression on these may be suboptimal:")
+        print(f"  WARNING: {len(decomp_diagnostics['flagged_groups'])} scale group(s) "
+              f"flagged with suboptimal composition — chain compression on these may "
+              f"be reduced:")
         for ctype in decomp_diagnostics["flagged_groups"]:
             g = decomp_diagnostics["per_group"][ctype]
             print(f"    [{ctype}]: {g['composition_reason']}")
-        print(f"  → (detected suboptimal scale group composition) (when available, ) "
-              f"to repack into a chain-compression-optimal layout.")
 
     max_val = 32767 if precision == "int16" else 2147483647
 
@@ -2053,9 +2052,9 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
         "total_zeros": total_zero,
         "scales": {ct: s for ct, s in scales.items()} if scales else {},
         "tensors": tensor_meta,
-        # Decomposition diagnostics — see per-component-group composition check.
-        # Captures per-scale-group max-abs and composition-check pollution flags so
-        # downstream analysis can detect suboptimal tensor partitionings.
+        # Per-component-group diagnostics — captures per-scale-group max-abs
+        # and detection flags so downstream analysis can identify suboptimal
+        # scale group compositions automatically.
         "decomposition_diagnostics": decomp_diagnostics,
     }
 
@@ -2104,8 +2103,11 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
     """Chain-compress a sequence of related checkpoints with auto-anchor promotion.
 
     This is the production chain compression entry point. It implements the
-    auto-anchor policy documented in the project's internal design notes
-    auto-anchor promotion policy.
+    auto-anchor promotion policy: each checkpoint is delta-compressed against
+    the current anchor, and if the resulting delta exceeds a configured
+    threshold (either a fixed fraction of the target raw size or, in dynamic
+    mode, the current anchor's actual compressed size), the target is promoted
+    to a new anchor instead.
 
     Two anchor-promotion policies are supported:
 
@@ -2115,16 +2117,14 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
        current_anchor_compressed_size * 0.95`. This is provably storage-optimal
        given the anchor and delta primitives — keeping a delta that's larger
        than what a fresh anchor would cost is strictly worse for total storage.
-       Self-calibrating across source dtypes (FP16 BFP anchor ~40% of raw,
-       FP32 int16 anchor ~50% of raw) without manual tuning. Decision rule
-       documented as a refinement to the auto-anchor promotion policy.
+       Self-calibrating across source dtypes without manual tuning, because
+       the threshold scales with the anchor itself.
 
     2. **Static (legacy)** — pass a float in [0, 1]. The delta is kept if its
-       size is <= max_delta_ratio of the target's *raw* size. Legacy behavior
-       preserved for back-compat and ablation experiments. Discovered April 7
-       2026 to be suboptimal for FP16 source: a 0.5 threshold can keep deltas
-       that are larger than fresh anchors when the standalone anchor is ~40%
-       of raw.
+       size is <= max_delta_ratio of the target's *raw* size. Preserved for
+       back-compatibility and ablation experiments where a fixed threshold is
+       required. The dynamic policy is generally preferred because it adapts
+       to per-model anchor compressibility automatically.
 
     Without an anchor policy, naive chain compression degrades catastrophically
     when consecutive checkpoints diverge significantly (large step intervals,
