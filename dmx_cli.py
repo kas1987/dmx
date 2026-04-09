@@ -37,7 +37,7 @@ from safetensors.torch import load_file, save_file
 
 # --- Constants ---
 DMX_MAGIC = b"DMX1"
-DMX_VERSION = 2
+DMX_VERSION = 3
 ZSTD_LEVEL = 19          # Single-file compression (archival, best ratio)
 ZSTD_LEVEL_DELTA = 3     # Delta compression (speed matters for training callbacks)
 
@@ -290,6 +290,75 @@ def _decompress_int16_dispatch(compressed_bytes, codec_id):
         raise ValueError(
             f"Unknown entropy codec_id {codec_id!r} in tensor metadata. "
             f"Known: zstd-19, flac, brotli-11 (plus legacy aliases zstd, lpc, brotli)."
+        )
+
+
+def _competitive_encode_uint8(raw_bytes, zstd_level=19):
+    """Encode arbitrary uint8 (or odd-length) bytes with every available
+    candidate coder and return the smallest output.
+
+    This is the byte-stream sibling of `_competitive_encode_int16`. It is
+    used for paths where the input is a uint8 stream with no inherent int16
+    structure — e.g. the BFP mantissa stream, or the RAW encoding for
+    non-int16 dtypes. FLAC is supported via the `_compress_bytes_uint8_lpc`
+    helper, which packs uint8 pairs into int16 samples before encoding and
+    records the original length so the decoder can unpack correctly.
+
+    Args:
+        raw_bytes: raw byte stream of any length
+        zstd_level: zstd compression level (default 19, production strength)
+
+    Returns:
+        (codec_id, compressed_bytes, codec_meta)
+
+        `codec_meta` is a dict that the decoder needs to dispatch correctly:
+            - For FLAC, it carries the uint8 original length so the unpack
+              step can trim padding.
+            - For zstd / brotli, it is empty.
+    """
+    candidates = []
+    cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
+    candidates.append(("zstd-19", cctx.compress(raw_bytes), {}))
+
+    if _lpc_backend_available():
+        try:
+            flac_bytes, orig_len = _compress_bytes_uint8_lpc(raw_bytes)
+            candidates.append(("flac", flac_bytes, {"uint8_orig_len": orig_len}))
+        except Exception:
+            pass
+
+    if BROTLI_AVAILABLE:
+        try:
+            br_bytes = _compress_bytes_brotli(raw_bytes)
+            candidates.append(("brotli-11", br_bytes, {}))
+        except Exception:
+            pass
+
+    codec_id, compressed, codec_meta = min(candidates, key=lambda c: len(c[1]))
+    return codec_id, compressed, codec_meta
+
+
+def _decompress_uint8_dispatch(compressed_bytes, codec_id, codec_meta=None):
+    """Dispatch decode for the uint8 byte-stream selector.
+
+    Returns the original raw uint8 bytes. The codec_id is read from per-tensor
+    metadata; codec_meta carries any additional fields the chosen coder needs
+    (e.g. the uint8 original length for the FLAC unpacking step).
+    """
+    if codec_id == "zstd-19" or codec_id == "zstd" or codec_id is None:
+        dctx = zstd.ZstdDecompressor()
+        return dctx.decompress(compressed_bytes)
+    elif codec_id == "flac" or codec_id == "lpc":
+        if not codec_meta or "uint8_orig_len" not in codec_meta:
+            raise ValueError(
+                "FLAC dispatch on uint8 stream requires codec_meta['uint8_orig_len']"
+            )
+        return _decompress_bytes_uint8_lpc(compressed_bytes, codec_meta["uint8_orig_len"])
+    elif codec_id == "brotli-11" or codec_id == "brotli":
+        return _decompress_bytes_brotli(compressed_bytes)
+    else:
+        raise ValueError(
+            f"Unknown entropy codec_id {codec_id!r} for uint8 dispatch."
         )
 
 
@@ -813,8 +882,25 @@ def _base_encoding(encoding):
     return encoding
 
 
-def encode_tensor(tensor, encoding):
-    """Encode a single tensor. Returns (encoded_bytes, metadata_dict)."""
+def encode_tensor(tensor, encoding, entropy_mode=None):
+    """Encode a single tensor. Returns (encoded_bytes, metadata_dict).
+
+    entropy_mode:
+      - "auto": per-tensor competitive selection across the available
+        candidate coders (`[zstd-19, FLAC, brotli-11]`). The winning coder is
+        recorded in `meta["entropy_codec"]` and the decoder dispatches on it.
+        For BFP the selector applies to the mantissa stream only; the
+        exponent stream is always zstd because it's tiny and the selector
+        overhead would dominate.
+      - "zstd-19" / "zstd": pin to zstd-19 for the whole tensor
+      - "flac" / "lpc": pin to FLAC where applicable (falls back to zstd
+        for non-int16-native paths like INT32_QUANT)
+      - "brotli-11" / "brotli": pin to brotli-11
+      - None (default for backward compatibility): use the legacy
+        `_is_lpc_encoding(encoding)` heuristic from the encoding constant.
+        Files written under this mode have no `entropy_codec` field and
+        the decoder falls back to the same legacy heuristic.
+    """
     meta = {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype).replace("torch.", ""),
@@ -919,52 +1005,151 @@ def encode_tensor(tensor, encoding):
         meta["bfp_mant_size"] = len(sign_mant_stream)
         meta["raw_size"] = len(exp_stream) + len(sign_mant_stream)
 
-        if use_lpc:
-            # LPC for mantissa stream (the big one), zstd for exponents (tiny)
-            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-            exp_compressed = cctx.compress(exp_stream.tobytes())
+        # Exponent stream is always zstd. It's tiny (sub-3% of total bytes
+        # for typical group sizes) and the selector overhead would dominate
+        # any savings from a different coder.
+        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        exp_compressed = cctx.compress(exp_stream.tobytes())
 
-            # Pack mantissa uint8 stream into int16 for FLAC
-            mant_flac, mant_orig_len = _compress_bytes_uint8_lpc(sign_mant_stream.tobytes())
-            meta["bfp_mant_orig_len"] = mant_orig_len
-
-            meta["bfp_exp_compressed"] = len(exp_compressed)
-            meta["bfp_mant_compressed"] = len(mant_flac)
+        # Mantissa stream gets the per-tensor entropy step. The candidate set
+        # depends on entropy_mode. In "auto" the selector tries every
+        # available coder and records the winner; in pinned modes it uses
+        # the requested coder (with FLAC requiring the uint8->int16 packing
+        # helper); in legacy mode it follows the encoding constant's
+        # use_lpc decision.
+        mant_bytes = sign_mant_stream.tobytes()
+        mant_data = None
+        if entropy_mode == "auto":
+            mant_codec, mant_data, mant_codec_meta = _competitive_encode_uint8(mant_bytes)
+            meta["bfp_mant_codec"] = mant_codec
+            if "uint8_orig_len" in mant_codec_meta:
+                meta["bfp_mant_orig_len"] = mant_codec_meta["uint8_orig_len"]
+        elif entropy_mode in ("flac", "lpc"):
+            if _lpc_backend_available():
+                mant_data, mant_orig_len = _compress_bytes_uint8_lpc(mant_bytes)
+                meta["bfp_mant_codec"] = "flac"
+                meta["bfp_mant_orig_len"] = mant_orig_len
+            else:
+                mant_data = cctx.compress(mant_bytes)
+                meta["bfp_mant_codec"] = "zstd-19"
+        elif entropy_mode in ("brotli-11", "brotli"):
+            if BROTLI_AVAILABLE:
+                mant_data = _compress_bytes_brotli(mant_bytes)
+                meta["bfp_mant_codec"] = "brotli-11"
+            else:
+                mant_data = cctx.compress(mant_bytes)
+                meta["bfp_mant_codec"] = "zstd-19"
+        elif entropy_mode in ("zstd-19", "zstd"):
+            mant_data = cctx.compress(mant_bytes)
+            meta["bfp_mant_codec"] = "zstd-19"
         else:
-            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-            exp_compressed = cctx.compress(exp_stream.tobytes())
-            mant_compressed = cctx.compress(sign_mant_stream.tobytes())
+            # Legacy mode: follow the encoding constant's use_lpc decision.
+            # Files written under this branch have no bfp_mant_codec field;
+            # the decoder falls back to the same legacy heuristic.
+            if use_lpc:
+                mant_data, mant_orig_len = _compress_bytes_uint8_lpc(mant_bytes)
+                meta["bfp_mant_orig_len"] = mant_orig_len
+            else:
+                mant_data = cctx.compress(mant_bytes)
 
-            meta["bfp_exp_compressed"] = len(exp_compressed)
-            meta["bfp_mant_compressed"] = len(mant_compressed)
+        meta["bfp_exp_compressed"] = len(exp_compressed)
+        meta["bfp_mant_compressed"] = len(mant_data)
 
         # Pack: [4B exp_compressed_len][exp_data][mant_data]
-        mant_data = mant_flac if use_lpc else mant_compressed
         packed = struct.pack("<I", len(exp_compressed)) + exp_compressed + mant_data
         meta["compressed_size"] = len(packed)
         return packed, meta
 
-    # Entropy coding for non-BFP paths
-    if use_lpc:
-        # For RAW_LPC with non-int16 data, we need to handle the byte stream
+    # Entropy coding for non-BFP paths.
+    #
+    # The branching here is the entropy_mode contract from the docstring:
+    # "auto" runs the per-tensor competitive selector and records the winner;
+    # pinned modes use a single coder; legacy mode (entropy_mode=None)
+    # follows the encoding constant's use_lpc decision so old call sites
+    # behave exactly as before.
+    #
+    # The competitive selector for non-BFP int16-shaped paths uses
+    # _competitive_encode_int16. FLAC inside the selector handles the
+    # odd-byte-count edge case for RAW by padding internally and recording
+    # the original length on FLAC wins; for other coders, odd byte counts
+    # are passed through unchanged.
+    if entropy_mode == "auto":
+        # For odd-byte-count RAW, FLAC needs the int16 byte view to be
+        # even-aligned. The selector handles this by trying FLAC inside a
+        # try/except and dropping it if the byte stream isn't compatible.
+        # On wins by FLAC for an odd-length stream we still need to know
+        # the original length so the decoder can trim — handled below.
+        odd_raw = (base_enc == ENC_RAW_ZSTD and len(raw) % 2 != 0)
+        if odd_raw:
+            meta["lpc_raw_orig_len"] = len(raw)
+            padded_raw = raw + b'\x00'
+            padded_n = len(padded_raw) // 2
+            codec_id, compressed = _competitive_encode_int16(padded_raw, padded_n)
+        else:
+            codec_id, compressed = _competitive_encode_int16(raw, num_samples)
+        meta["entropy_codec"] = codec_id
+        if codec_id == "flac":
+            meta["lpc_num_samples"] = num_samples if not odd_raw else padded_n
+    elif entropy_mode in ("flac", "lpc"):
+        # Pinned FLAC: requires int16-native byte stream. Pad if needed.
         if base_enc == ENC_RAW_ZSTD and len(raw) % 2 != 0:
-            # Odd byte count: pad with a zero byte so int16 view works
             meta["lpc_raw_orig_len"] = len(raw)
             raw = raw + b'\x00'
             num_samples = len(raw) // 2
-
-        compressed = _int16_to_flac(raw, num_samples)
-        meta["lpc_num_samples"] = num_samples
-    else:
+        if _lpc_backend_available():
+            compressed = _int16_to_flac(raw, num_samples)
+            meta["entropy_codec"] = "flac"
+            meta["lpc_num_samples"] = num_samples
+        else:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            compressed = cctx.compress(raw)
+            meta["entropy_codec"] = "zstd-19"
+    elif entropy_mode in ("brotli-11", "brotli"):
+        if BROTLI_AVAILABLE:
+            compressed = _compress_bytes_brotli(raw)
+            meta["entropy_codec"] = "brotli-11"
+        else:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            compressed = cctx.compress(raw)
+            meta["entropy_codec"] = "zstd-19"
+    elif entropy_mode in ("zstd-19", "zstd"):
         cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
         compressed = cctx.compress(raw)
+        meta["entropy_codec"] = "zstd-19"
+    else:
+        # Legacy mode (entropy_mode=None): exact pre-refactor behavior.
+        # No entropy_codec field is written; the decoder falls back to
+        # the use_lpc heuristic from the encoding constant.
+        if use_lpc:
+            if base_enc == ENC_RAW_ZSTD and len(raw) % 2 != 0:
+                meta["lpc_raw_orig_len"] = len(raw)
+                raw = raw + b'\x00'
+                num_samples = len(raw) // 2
+            compressed = _int16_to_flac(raw, num_samples)
+            meta["lpc_num_samples"] = num_samples
+        else:
+            cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            compressed = cctx.compress(raw)
 
     meta["compressed_size"] = len(compressed)
     return compressed, meta
 
 
 def decode_tensor(compressed_bytes, meta):
-    """Decode a tensor from compressed bytes + metadata."""
+    """Decode a tensor from compressed bytes + metadata.
+
+    Decode dispatch:
+
+    1. If `meta["entropy_codec"]` (or `meta["bfp_mant_codec"]` for BFP) is
+       set, dispatch on that identifier — this is the new standalone-auto
+       format.
+    2. Else fall back to `_is_lpc_encoding(encoding)` from the encoding
+       constant — backward-compatible decode of files written before the
+       refactor.
+
+    Both paths produce bit-identical output for files they were respectively
+    designed to read.
+    """
     encoding = meta["encoding"]
     shape = meta["shape"]
     dtype_str = meta.get("original_dtype", meta["dtype"])
@@ -984,8 +1169,20 @@ def decode_tensor(compressed_bytes, meta):
             dtype=np.uint8
         ).copy()
 
-        if use_lpc:
-            # Mantissa stream was FLAC-encoded
+        # Mantissa decode dispatch:
+        # - New format: bfp_mant_codec is set, dispatch on it
+        # - Legacy format: no bfp_mant_codec, fall back to use_lpc heuristic
+        bfp_mant_codec = meta.get("bfp_mant_codec")
+        if bfp_mant_codec is not None:
+            bfp_mant_codec_meta = {}
+            if "bfp_mant_orig_len" in meta:
+                bfp_mant_codec_meta["uint8_orig_len"] = meta["bfp_mant_orig_len"]
+            mant_raw = _decompress_uint8_dispatch(
+                mant_data, bfp_mant_codec, bfp_mant_codec_meta
+            )
+            sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
+        elif use_lpc:
+            # Legacy: mantissa stream was FLAC-encoded
             mant_orig_len = meta["bfp_mant_orig_len"]
             mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
             sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
@@ -1004,8 +1201,22 @@ def decode_tensor(compressed_bytes, meta):
             meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
         )
 
-    # Decompress the main payload
-    if use_lpc:
+    # Decompress the main payload (non-BFP paths)
+    #
+    # Dispatch:
+    # - New format: meta["entropy_codec"] is set, use _decompress_int16_dispatch
+    #   (which also accepts legacy short identifiers like "zstd"/"lpc"/"brotli").
+    #   For RAW with odd byte counts written under "auto", trim to the
+    #   recorded original length.
+    # - Legacy format: no entropy_codec, fall back to the use_lpc heuristic
+    #   from the encoding constant — exactly the same code path as before
+    #   the refactor.
+    entropy_codec = meta.get("entropy_codec")
+    if entropy_codec is not None:
+        decoded_bytes = _decompress_int16_dispatch(compressed_bytes, entropy_codec)
+        raw_size = meta.get("lpc_raw_orig_len", meta["raw_size"])
+        raw = decoded_bytes[:raw_size]
+    elif use_lpc:
         arr_int16 = _flac_to_int16(compressed_bytes)
         raw_size = meta.get("lpc_raw_orig_len", meta["raw_size"])
         raw = arr_int16.tobytes()[:raw_size]
@@ -1107,8 +1318,19 @@ def decode_tensor_gpu(compressed_bytes, meta):
             dtype=np.uint8
         ).copy()
 
-        # Mantissa: zstd or FLAC decompress on CPU
-        if use_lpc:
+        # Mantissa decode dispatch (same logic as decode_tensor):
+        # - New format: bfp_mant_codec is set, dispatch on it
+        # - Legacy format: no bfp_mant_codec, fall back to use_lpc heuristic
+        bfp_mant_codec = meta.get("bfp_mant_codec")
+        if bfp_mant_codec is not None:
+            bfp_mant_codec_meta = {}
+            if "bfp_mant_orig_len" in meta:
+                bfp_mant_codec_meta["uint8_orig_len"] = meta["bfp_mant_orig_len"]
+            mant_raw = _decompress_uint8_dispatch(
+                mant_data, bfp_mant_codec, bfp_mant_codec_meta
+            )
+            sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
+        elif use_lpc:
             mant_orig_len = meta["bfp_mant_orig_len"]
             mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
             sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
@@ -1157,15 +1379,23 @@ def auto_detect_mode(tensors):
     return "int16"
 
 
-def compress_file(input_path, output_path, mode="auto", entropy="lpc", use_gpu=False,
+def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=False,
                   parallel_workers=None):
     """Compress a safetensors file to .dmx format.
 
-    Default entropy is 'lpc' (FLAC via libsndfile). Use 'zstd' explicitly for
-    backward compatibility with environments that don't have soundfile
-    installed.
-    mode: 'auto', 'bfp', or 'int16'
-    entropy: 'zstd', 'lpc', or 'auto'
+    mode: 'auto', 'bfp', 'int16', or 'int32'
+    entropy: 'auto' (default) | 'zstd-19' | 'zstd' | 'flac' | 'lpc' | 'brotli-11' | 'brotli'
+
+      - 'auto' (default): per-tensor competitive selection across the
+        available candidate coders ([zstd-19, FLAC, brotli-11]). For each
+        tensor the smallest output is kept and the winning coder's
+        identifier is recorded in per-tensor metadata so the decoder
+        dispatches correctly.
+      - 'zstd-19' / 'zstd': pin to zstd-19 for every tensor.
+      - 'flac' / 'lpc': pin to FLAC where applicable (falls back to zstd
+        for non-int16-native paths). 'lpc' is a legacy alias.
+      - 'brotli-11' / 'brotli': pin to brotli-11.
+
     use_gpu: use GPU-accelerated BFP compression (CUDA required)
     parallel_workers: number of threads for per-tensor encoding. None (default)
         auto-selects: 1 when use_gpu (avoid CUDA contention), otherwise
@@ -1187,22 +1417,30 @@ def compress_file(input_path, output_path, mode="auto", entropy="lpc", use_gpu=F
             _use_gpu_compress = False
     else:
         _use_gpu_compress = False
-    # Resolve entropy=auto: prefer LPC/FLAC if any backend is available
-    # (soundfile is the preferred backend; ffmpeg is the legacy fallback).
-    if entropy == "auto":
-        if SOUNDFILE_AVAILABLE:
-            entropy = "lpc"
-            print("  Entropy auto: soundfile (libsndfile) available, using LPC/FLAC")
-        elif FFMPEG_PATH:
-            entropy = "lpc"
-            print("  Entropy auto: soundfile not available but ffmpeg is, using LPC/FLAC via ffmpeg fallback")
+
+    # Resolve entropy mode. Normalize legacy aliases to the canonical names
+    # used by the selector and dispatch helpers.
+    if entropy in (None, "auto"):
+        entropy_mode = "auto"
+    elif entropy in ("flac", "lpc"):
+        if _lpc_backend_available():
+            entropy_mode = "flac"
         else:
-            entropy = "zstd"
-            print("  WARNING: no FLAC backend (soundfile or ffmpeg) found, falling back to zstd entropy")
-    elif entropy == "lpc":
-        if not _lpc_backend_available():
-            print("  WARNING: --entropy lpc requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd.")
-            entropy = "zstd"
+            print("  WARNING: --entropy flac requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd-19.")
+            entropy_mode = "zstd-19"
+    elif entropy in ("brotli-11", "brotli"):
+        if BROTLI_AVAILABLE:
+            entropy_mode = "brotli-11"
+        else:
+            print("  WARNING: --entropy brotli-11 requires brotli (pip install brotli). Falling back to zstd-19.")
+            entropy_mode = "zstd-19"
+    elif entropy in ("zstd-19", "zstd"):
+        entropy_mode = "zstd-19"
+    else:
+        raise ValueError(
+            f"Unknown entropy value {entropy!r}. "
+            f"Use 'auto', 'zstd-19', 'flac', or 'brotli-11'."
+        )
 
     print(f"Loading {input_path}...")
     start = time.time()
@@ -1220,13 +1458,13 @@ def compress_file(input_path, output_path, mode="auto", entropy="lpc", use_gpu=F
     else:
         print(f"  Mode: {mode}")
 
-    print(f"  Entropy coding: {entropy}")
+    print(f"  Entropy coding: {entropy_mode}")
 
     # Build manifest and compressed chunks
     manifest = {
         "version": DMX_VERSION,
         "mode": mode,
-        "entropy": entropy,
+        "entropy": entropy_mode,
         "source_file": os.path.basename(input_path),
         "source_size": original_size,
         "tensor_count": len(tensors),
@@ -1262,8 +1500,11 @@ def compress_file(input_path, output_path, mode="auto", entropy="lpc", use_gpu=F
 
         def _encode_one(key):
             tensor = tensors[key]
-            encoding = detect_encoding(tensor, mode=mode, entropy=entropy)
-            compressed, meta = encode_tensor(tensor, encoding)
+            # detect_encoding always returns the data-shape (*_ZSTD form);
+            # the entropy coder is decided per tensor inside encode_tensor
+            # via entropy_mode, and recorded in meta["entropy_codec"].
+            encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
+            compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
             return key, encoding, compressed, meta
 
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
@@ -1279,10 +1520,10 @@ def compress_file(input_path, output_path, mode="auto", entropy="lpc", use_gpu=F
     else:
         for i, key in enumerate(keys):
             tensor = tensors[key]
-            encoding = detect_encoding(tensor, mode=mode, entropy=entropy)
+            encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
             enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
 
-            compressed, meta = encode_tensor(tensor, encoding)
+            compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
             manifest["tensors"][key] = meta
             compressed_chunks[key] = compressed
 
@@ -1680,7 +1921,7 @@ def verify_file(source_path, dmx_path, mode="auto", entropy="zstd", report_path=
         worst_max_diff = round(max(all_max_diffs), 8) if all_max_diffs else 0.0
 
         report = {
-            "dmx_version": "0.4.0",
+            "dmx_version": "0.5.0",
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "original_file": os.path.basename(source_path),
             "original_sha256": _sha256_file(source_path),
@@ -3079,7 +3320,7 @@ def delta_info(delta_path):
             print(f"    {key}: {csz/1024:.1f} KB ({100.0*z/n:.0f}% zero)")
 
 
-DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.4.0
+DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.5.0
 Patent Pending. (c) 2026 William J. Riley. MIT License.
 """
 
@@ -3094,8 +3335,14 @@ def main():
     p_compress.add_argument("--mode", choices=["auto", "bfp", "int16", "int32"], default="auto",
                             help="Compression mode: bfp (FP16/BF16), int16 (FP32, best compression), "
                                  "int32 (FP32, practically lossless), auto (detect)")
-    p_compress.add_argument("--entropy", choices=["zstd", "lpc", "auto"], default="zstd",
-                            help="Entropy coder: zstd (default), lpc (FLAC, needs ffmpeg), auto (try lpc)")
+    p_compress.add_argument("--entropy",
+                            choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11", "brotli"],
+                            default="auto",
+                            help="Entropy coder. Default 'auto' = per-tensor competitive selection "
+                                 "across [zstd-19, FLAC, brotli-11] with the smallest output kept. "
+                                 "Pinned values force a single coder for every tensor. Legacy "
+                                 "aliases accepted: 'zstd' -> 'zstd-19', 'lpc' -> 'flac', "
+                                 "'brotli' -> 'brotli-11'.")
     p_compress.add_argument("--gpu", action="store_true",
                             help="Use GPU-accelerated compression (CUDA required)")
     p_compress.add_argument("--parallel-workers", type=int, default=None,
@@ -3119,8 +3366,13 @@ def main():
     p_verify.add_argument("dmx", help="DMX file path (created if missing)")
     p_verify.add_argument("--mode", choices=["auto", "bfp", "int16", "int32"], default="auto",
                             help="Compression mode (if dmx needs to be created)")
-    p_verify.add_argument("--entropy", choices=["zstd", "lpc", "auto"], default="zstd",
-                            help="Entropy coder: zstd (default), lpc (FLAC, needs ffmpeg), auto (try lpc)")
+    p_verify.add_argument("--entropy",
+                            choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11", "brotli"],
+                            default="auto",
+                            help="Entropy coder. Default 'auto' = per-tensor competitive selection "
+                                 "across [zstd-19, FLAC, brotli-11]. Pinned values force a single "
+                                 "coder. Legacy aliases accepted: 'zstd' -> 'zstd-19', 'lpc' -> "
+                                 "'flac', 'brotli' -> 'brotli-11'.")
     p_verify.add_argument("--report", default=None,
                             help="Write structured JSON verification report to this path")
     p_verify.add_argument("--gpu", action="store_true",
