@@ -1680,7 +1680,7 @@ def verify_file(source_path, dmx_path, mode="auto", entropy="zstd", report_path=
         worst_max_diff = round(max(all_max_diffs), 8) if all_max_diffs else 0.0
 
         report = {
-            "dmx_version": "0.3",
+            "dmx_version": "0.4.0",
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "original_file": os.path.basename(source_path),
             "original_sha256": _sha256_file(source_path),
@@ -3079,7 +3079,7 @@ def delta_info(delta_path):
             print(f"    {key}: {csz/1024:.1f} KB ({100.0*z/n:.0f}% zero)")
 
 
-DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.3
+DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.4.0
 Patent Pending. (c) 2026 William J. Riley. MIT License.
 """
 
