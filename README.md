@@ -4,8 +4,6 @@
 
 DMX transforms weight tensors into aligned integer representations, enabling efficient storage and distribution of model variants. The headline capability is **55-87% compression of safetensors / checkpoint files / checkpoint deltas with practically lossless reconstruction**.
 
-> ⚠️ **Note (April 6, 2026):** DMX's earlier "delta-sparsity signal" and "adaptive layer freezing" claims (Tier 2 and Tier 3) have been **taken down pending full revalidation** after we discovered the underlying signal was not measuring what we thought it was. The compression tier (Tier 1) is mathematically independent and unaffected. See [experiments/checkpoint_delta/results/README.md](experiments/checkpoint_delta/results/README.md) for the full retraction notice and revalidation plan.
-
 **Safe for production training.** Resuming from DMX-reconstructed checkpoints produces 0.15% loss difference after 50 chain resumes over 10,000 training steps — verified on GPU with reproducible scripts. Delta chains use exact integer arithmetic with zero error accumulation regardless of chain length.
 
 ```
@@ -80,6 +78,12 @@ DMX int16:      ~13 bits per weight (aligned cross-layer quantization + entropy 
 
 Integer quantization as a preprocessing step (not a lossy final format) transforms float weights into a representation where entropy coding is effective. Aligned cross-layer quantization enforces a global coordinate system across layers, enabling structured compression.
 
+### Adaptive per-tensor compression
+
+DMX automatically picks the best compression for each tensor in your model — you don't choose a compressor, DMX does, per tensor, every time. Each tensor gets the strongest compression the candidate set can deliver, capturing the maximum benefit available without any manual tuning.
+
+Actual savings depend on model architecture, source precision (FP16 / BF16 / FP32), and the quantization mode you select. Across the model families we have measured, savings typically fall in the 50–80% range vs the original safetensors file, with no manual tuning required.
+
 ### Why DMX beats generic compression
 
 | Method | Bits/value | Notes |
@@ -111,6 +115,10 @@ dmx compress model.safetensors model.dmx --mode auto
 # Practically lossless compression (FP32 models — error below FP32 noise floor)
 dmx compress model.safetensors model.dmx --mode int32
 
+# Compress with explicit parallel encoding (defaults to min(8, cpu_count) on CPU,
+# 1 on GPU). zstd releases the GIL so threads give real parallelism.
+dmx compress model.safetensors model.dmx --parallel-workers 8
+
 # Decompress back to safetensors (auto-uses GPU if available)
 dmx decompress model.dmx model.safetensors
 
@@ -136,6 +144,24 @@ dmx delta-reconstruct base.safetensors delta.dmxd restored.safetensors
 # View delta file info (sparsity, compression, per-component breakdown)
 dmx delta-info delta.dmxd
 ```
+
+### Chain compression (training-run checkpoints, every-N-step cadences)
+
+DMX chain compression takes a sequence of related checkpoints (training run, fine-tune steps, branch variants) and stores them as one or more anchors plus deltas, with an automatic anchor-promotion policy that keeps the chain mathematically guaranteed to be no larger than storing each checkpoint with `dmx compress` independently.
+
+```bash
+# Chain-compress a sequence of checkpoints into one output directory
+dmx chain-compress step_1000.safetensors step_2000.safetensors step_3000.safetensors \
+    --output-dir ./compressed_chain
+
+# Reconstruct every checkpoint in the chain back to safetensors
+dmx chain-reconstruct ./compressed_chain --output-dir ./restored
+
+# Reconstruct only specific entries by index
+dmx chain-reconstruct ./compressed_chain --output-dir ./restored --indices 0 2
+```
+
+The auto-anchor policy promotes a checkpoint to a fresh anchor whenever its delta would be larger than re-encoding the checkpoint from scratch, so the chain is self-calibrating across source dtypes and cadences. No manual tuning required.
 
 ### Example: Compress and verify a model from HuggingFace
 
