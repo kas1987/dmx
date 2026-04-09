@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmx-compress"
-version = "0.3.0"
+version = "0.4.0"
 description = "Structure-aware neural network weight compression. 87% checkpoint delta encoding, not generic file compression."
 readme = "README.md"
 license = {text = "MIT"}
@@ -29,11 +29,17 @@ dependencies = [
     "numpy",
     "zstandard",
     "safetensors",
+    # Adaptive per-tensor entropy coder selection picks the smallest output
+    # from a candidate set per tensor. zstd is always available; soundfile and
+    # brotli expand the candidate set. They are listed as required (not extras)
+    # so a fresh `pip install dmx-compress` ships the full feature, not a
+    # silently-degraded selector.
+    "soundfile",
+    "brotli",
 ]
 
 [project.optional-dependencies]
 gpu = ["torch>=2.0", "ninja"]
-lpc = []  # Requires ffmpeg installed separately
 
 [project.urls]
 Homepage = "https://github.com/willjriley/dmx"

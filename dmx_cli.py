@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -104,7 +105,13 @@ _LPC_ENCODINGS = set(_ZSTD_TO_LPC.values())
 
 
 def _find_ffmpeg():
-    """Find ffmpeg binary. Returns path or None."""
+    """Find ffmpeg binary. Returns path or None.
+
+    Legacy fallback: the FLAC code path now uses soundfile (libsndfile)
+    instead of an ffmpeg subprocess. This function is kept as a fallback
+    for environments where soundfile is unavailable but ffmpeg is on PATH.
+    New installations should use the soundfile path.
+    """
     path = shutil.which("ffmpeg")
     if path:
         return path
@@ -121,8 +128,176 @@ def _find_ffmpeg():
 FFMPEG_PATH = _find_ffmpeg()
 
 
+# soundfile (libsndfile) is the preferred FLAC backend — pure Python install,
+# no subprocess, fast and reliable. The legacy ffmpeg subprocess path below is
+# kept as a fallback for environments where soundfile is unavailable.
+try:
+    import soundfile as _sf
+    SOUNDFILE_AVAILABLE = True
+except ImportError:
+    _sf = None
+    SOUNDFILE_AVAILABLE = False
+
+
+# Brotli is one of the candidate coders for the per-tensor entropy selection
+# layer. On many neural network weight tensors brotli at quality 11 produces
+# the smallest output of the candidate set; on others FLAC or zstd wins. The
+# selector tries each available coder per tensor and keeps the smallest. If
+# brotli is unavailable at runtime, the selector falls back to whichever
+# candidate coders are present.
+try:
+    import brotli as _brotli
+    BROTLI_AVAILABLE = True
+except ImportError:
+    _brotli = None
+    BROTLI_AVAILABLE = False
+
+
+def _lpc_backend_available():
+    """Return True if any FLAC backend is available (soundfile or ffmpeg)."""
+    return SOUNDFILE_AVAILABLE or (FFMPEG_PATH is not None)
+
+
+# Brotli quality and window settings for the per-tensor selector. Quality 11
+# is the brotli library's maximum and lgwin=24 is the largest practical
+# window for weight-tensor sized payloads. These settings let brotli compete
+# at its best — the selector compares each candidate at its strongest.
+BROTLI_QUALITY = 11
+BROTLI_LGWIN = 24
+
+
+def _compress_bytes_brotli(raw_bytes):
+    """Compress raw bytes with brotli at the candidate-selector quality.
+
+    Returns the brotli-compressed bytes. Caller is responsible for checking
+    BROTLI_AVAILABLE before invoking — we raise rather than silently fall back
+    so a misconfigured candidate set surfaces immediately during testing.
+    """
+    if not BROTLI_AVAILABLE:
+        raise RuntimeError(
+            "brotli is not installed (pip install brotli). It is a required "
+            "candidate coder for the per-tensor entropy selection layer."
+        )
+    return _brotli.compress(raw_bytes, quality=BROTLI_QUALITY, lgwin=BROTLI_LGWIN)
+
+
+def _decompress_bytes_brotli(brotli_bytes):
+    """Decompress brotli-compressed bytes back to raw bytes."""
+    if not BROTLI_AVAILABLE:
+        raise RuntimeError(
+            "brotli is not installed (pip install brotli). It is required to "
+            "decode tensors whose entropy field is 'brotli-11'."
+        )
+    return _brotli.decompress(brotli_bytes)
+
+
+# Competitive entropy coder candidate set. Order is informational only — the
+# selector tries every candidate that's available and returns the smallest.
+# Each entry is a (codec_id, encode_callable, requires_int16) tuple.
+#   codec_id          — short string stored in per-tensor metadata
+#   encode_callable   — bytes -> compressed_bytes
+#   requires_int16    — True if the coder requires the input length to be a
+#                       multiple of 2 bytes (FLAC is int16-native)
+#
+# When adding a candidate, also extend _decompress_int16_dispatch().
+COMPETITIVE_CODECS = [
+    ("zstd-19", "zstd-level-19", False),
+    ("flac",    "flac-libsndfile", True),
+    ("brotli-11", "brotli-q11-lgwin24", False),
+]
+
+
+def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=19):
+    """Encode raw int16 bytes with every available candidate coder.
+
+    Returns (codec_id, compressed_bytes) for the smallest output. The codec_id
+    is stored in per-tensor metadata so the decoder can dispatch correctly.
+
+    This is the encode side of the per-tensor entropy selection layer. The
+    selector evaluates each available candidate at compress time and keeps
+    the smallest output, so the result is, by construction, no larger than
+    any fixed-codec strategy. The cost is encode-time multiplication by the
+    number of available candidates; decode time is unchanged.
+
+    Args:
+        raw_bytes: raw int16 PCM data (little-endian)
+        num_int16_samples: number of int16 samples (= len(raw_bytes) // 2)
+        zstd_level: zstd compression level. Default 19 (production strength).
+
+    Returns:
+        (codec_id, compressed_bytes)
+    """
+    candidates = []
+
+    # zstd-19 is always available (zstandard is a hard dep)
+    cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
+    candidates.append(("zstd-19", cctx.compress(raw_bytes)))
+
+    # FLAC via soundfile if available. Skip if backend missing rather than
+    # crash the whole compress — the selector is allowed to be a subset on
+    # systems with partial dependencies, and the per-tensor recorded codec_id
+    # tells the decoder exactly what to invoke.
+    if _lpc_backend_available():
+        try:
+            flac_bytes = _int16_to_flac(raw_bytes, num_int16_samples)
+            candidates.append(("flac", flac_bytes))
+        except Exception:
+            # If a particular tensor breaks the FLAC encoder (extreme values,
+            # odd byte count edge cases), drop FLAC from this tensor's
+            # candidate set rather than failing the whole compress.
+            pass
+
+    # brotli quality 11 if available
+    if BROTLI_AVAILABLE:
+        try:
+            br_bytes = _compress_bytes_brotli(raw_bytes)
+            candidates.append(("brotli-11", br_bytes))
+        except Exception:
+            pass
+
+    # Pick the smallest. Tie-break by candidate order (zstd first, FLAC
+    # second, brotli third) since the order in COMPETITIVE_CODECS reflects
+    # decode-cost ordering — we prefer the cheaper decoder on ties.
+    codec_id, compressed = min(candidates, key=lambda c: len(c[1]))
+    return codec_id, compressed
+
+
+def _decompress_int16_dispatch(compressed_bytes, codec_id):
+    """Dispatch decode for the per-tensor entropy selection layer.
+
+    Returns raw int16 bytes. The codec_id is read from per-tensor metadata.
+    Backward compatibility: missing codec_id and earlier short identifiers
+    ('zstd', 'lpc', 'brotli') are accepted as aliases of the current names.
+
+    Args:
+        compressed_bytes: payload bytes from the .dmxd file
+        codec_id: short identifier stored in per-tensor metadata
+
+    Returns:
+        raw int16 PCM bytes
+    """
+    if codec_id == "zstd-19" or codec_id == "zstd" or codec_id is None:
+        # "zstd" alias accepted for files written by earlier DMX versions.
+        dctx = zstd.ZstdDecompressor()
+        return dctx.decompress(compressed_bytes)
+    elif codec_id == "flac" or codec_id == "lpc":
+        # "lpc" alias accepted for files written by earlier DMX versions —
+        # same FLAC payload either way.
+        return _flac_to_int16(compressed_bytes).tobytes()
+    elif codec_id == "brotli-11" or codec_id == "brotli":
+        return _decompress_bytes_brotli(compressed_bytes)
+    else:
+        raise ValueError(
+            f"Unknown entropy codec_id {codec_id!r} in tensor metadata. "
+            f"Known: zstd-19, flac, brotli-11 (plus legacy aliases zstd, lpc, brotli)."
+        )
+
+
 def _int16_to_flac(int16_bytes, num_samples):
-    """Encode int16 PCM data to FLAC bytes via ffmpeg.
+    """Encode int16 PCM data to FLAC bytes.
+
+    Default backend: soundfile (libsndfile, pip-installable, no subprocess).
+    Fallback: ffmpeg subprocess if soundfile is unavailable but ffmpeg is.
 
     Args:
         int16_bytes: raw int16 PCM data (little-endian)
@@ -130,6 +305,50 @@ def _int16_to_flac(int16_bytes, num_samples):
 
     Returns:
         FLAC file bytes
+    """
+    if SOUNDFILE_AVAILABLE:
+        # Soundfile path: in-memory via BytesIO, no subprocess, no temp files
+        import io
+        arr = np.frombuffer(int16_bytes, dtype=np.int16)
+        bio = io.BytesIO()
+        _sf.write(bio, arr, 44100, format='FLAC', subtype='PCM_16')
+        return bio.getvalue()
+    elif FFMPEG_PATH:
+        # Fallback to ffmpeg subprocess for environments without soundfile
+        return _int16_to_flac_ffmpeg(int16_bytes, num_samples)
+    else:
+        raise RuntimeError(
+            "No FLAC backend available. Install 'soundfile' (pip install soundfile) "
+            "or ensure ffmpeg is on PATH."
+        )
+
+
+def _flac_to_int16(flac_bytes):
+    """Decode FLAC bytes back to int16 PCM data.
+
+    Default backend: soundfile. Fallback: ffmpeg subprocess.
+
+    Returns:
+        numpy array of int16 values
+    """
+    if SOUNDFILE_AVAILABLE:
+        import io
+        bio = io.BytesIO(flac_bytes)
+        data, _ = _sf.read(bio, dtype='int16')
+        return np.asarray(data, dtype=np.int16).copy()
+    elif FFMPEG_PATH:
+        return _flac_to_int16_ffmpeg(flac_bytes)
+    else:
+        raise RuntimeError(
+            "No FLAC backend available. Install 'soundfile' (pip install soundfile) "
+            "or ensure ffmpeg is on PATH."
+        )
+
+
+def _int16_to_flac_ffmpeg(int16_bytes, num_samples):
+    """Encode int16 PCM data to FLAC bytes via ffmpeg subprocess.
+
+    Legacy fallback path. Use _int16_to_flac() which prefers soundfile.
     """
     tmpdir = tempfile.mkdtemp(prefix="dmx_")
     wav_path = os.path.join(tmpdir, "input.wav")
@@ -167,11 +386,10 @@ def _int16_to_flac(int16_bytes, num_samples):
             pass
 
 
-def _flac_to_int16(flac_bytes):
-    """Decode FLAC bytes back to int16 PCM data via ffmpeg.
+def _flac_to_int16_ffmpeg(flac_bytes):
+    """Decode FLAC bytes back to int16 PCM data via ffmpeg subprocess.
 
-    Returns:
-        numpy array of int16 values
+    Legacy fallback path. Use _flac_to_int16() which prefers soundfile.
     """
     tmpdir = tempfile.mkdtemp(prefix="dmx_")
     flac_path = os.path.join(tmpdir, "input.flac")
@@ -939,11 +1157,21 @@ def auto_detect_mode(tensors):
     return "int16"
 
 
-def compress_file(input_path, output_path, mode="auto", entropy="zstd", use_gpu=False):
+def compress_file(input_path, output_path, mode="auto", entropy="lpc", use_gpu=False,
+                  parallel_workers=None):
     """Compress a safetensors file to .dmx format.
+
+    Default entropy is 'lpc' (FLAC via libsndfile). Use 'zstd' explicitly for
+    backward compatibility with environments that don't have soundfile
+    installed.
     mode: 'auto', 'bfp', or 'int16'
     entropy: 'zstd', 'lpc', or 'auto'
     use_gpu: use GPU-accelerated BFP compression (CUDA required)
+    parallel_workers: number of threads for per-tensor encoding. None (default)
+        auto-selects: 1 when use_gpu (avoid CUDA contention), otherwise
+        min(8, os.cpu_count()). Pass an explicit int to override. zstd releases
+        the GIL during compression so threads give real parallelism on multi-
+        core CPUs even with the GIL active.
     """
     global _use_gpu_compress
     # Auto-detect GPU: use CUDA if available unless explicitly disabled
@@ -959,17 +1187,21 @@ def compress_file(input_path, output_path, mode="auto", entropy="zstd", use_gpu=
             _use_gpu_compress = False
     else:
         _use_gpu_compress = False
-    # Resolve entropy=auto: try LPC, fall back to zstd
+    # Resolve entropy=auto: prefer LPC/FLAC if any backend is available
+    # (soundfile is the preferred backend; ffmpeg is the legacy fallback).
     if entropy == "auto":
-        if FFMPEG_PATH:
+        if SOUNDFILE_AVAILABLE:
             entropy = "lpc"
-            print("  Entropy auto: ffmpeg found, using LPC/FLAC")
+            print("  Entropy auto: soundfile (libsndfile) available, using LPC/FLAC")
+        elif FFMPEG_PATH:
+            entropy = "lpc"
+            print("  Entropy auto: soundfile not available but ffmpeg is, using LPC/FLAC via ffmpeg fallback")
         else:
             entropy = "zstd"
-            print("  WARNING: ffmpeg not found, falling back to zstd entropy")
+            print("  WARNING: no FLAC backend (soundfile or ffmpeg) found, falling back to zstd entropy")
     elif entropy == "lpc":
-        if not FFMPEG_PATH:
-            print("  WARNING: ffmpeg not found, --entropy lpc requires ffmpeg. Falling back to zstd.")
+        if not _lpc_backend_available():
+            print("  WARNING: --entropy lpc requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd.")
             entropy = "zstd"
 
     print(f"Loading {input_path}...")
@@ -1015,20 +1247,50 @@ def compress_file(input_path, output_path, mode="auto", entropy="zstd", use_gpu=
     }
 
     keys = sorted(tensors.keys())
-    for i, key in enumerate(keys):
-        tensor = tensors[key]
-        encoding = detect_encoding(tensor, mode=mode, entropy=entropy)
-        enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
 
-        compressed, meta = encode_tensor(tensor, encoding)
-        manifest["tensors"][key] = meta
-        compressed_chunks[key] = compressed
+    # Resolve parallel worker count.
+    # GPU mode forces serial because the CUDA context is single-threaded and
+    # parallel submission causes contention rather than speedup.
+    if parallel_workers is None:
+        parallel_workers = 1 if _use_gpu_compress else min(8, os.cpu_count() or 1)
+    elif _use_gpu_compress and parallel_workers > 1:
+        print(f"  WARNING: parallel_workers={parallel_workers} ignored in GPU mode (forcing 1)")
+        parallel_workers = 1
 
-        total_raw += meta["raw_size"]
-        total_compressed += meta["compressed_size"]
+    if parallel_workers > 1:
+        print(f"  Parallel encoding: {parallel_workers} workers")
 
-        if (i + 1) % 100 == 0 or (i + 1) == len(keys):
-            print(f"  Compressed {i+1}/{len(keys)} tensors...")
+        def _encode_one(key):
+            tensor = tensors[key]
+            encoding = detect_encoding(tensor, mode=mode, entropy=entropy)
+            compressed, meta = encode_tensor(tensor, encoding)
+            return key, encoding, compressed, meta
+
+        with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
+            # map preserves submission order, so manifest stays deterministic
+            for i, (key, encoding, compressed, meta) in enumerate(pool.map(_encode_one, keys)):
+                enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
+                manifest["tensors"][key] = meta
+                compressed_chunks[key] = compressed
+                total_raw += meta["raw_size"]
+                total_compressed += meta["compressed_size"]
+                if (i + 1) % 100 == 0 or (i + 1) == len(keys):
+                    print(f"  Compressed {i+1}/{len(keys)} tensors...")
+    else:
+        for i, key in enumerate(keys):
+            tensor = tensors[key]
+            encoding = detect_encoding(tensor, mode=mode, entropy=entropy)
+            enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
+
+            compressed, meta = encode_tensor(tensor, encoding)
+            manifest["tensors"][key] = meta
+            compressed_chunks[key] = compressed
+
+            total_raw += meta["raw_size"]
+            total_compressed += meta["compressed_size"]
+
+            if (i + 1) % 100 == 0 or (i + 1) == len(keys):
+                print(f"  Compressed {i+1}/{len(keys)} tensors...")
 
     # Write .dmx file
     # Format: [MAGIC 4B][VERSION 4B][MANIFEST_SIZE 4B][MANIFEST JSON][CHUNK DATA...]
@@ -1784,13 +2046,25 @@ def _detect_legacy_aux_buffers(state_dict):
 
 
 def delta_compress(base_path, target_path, output_path, precision="int16",
-                   zstd_level=None, strip_legacy_buffers=True):
+                   zstd_level=None, strip_legacy_buffers=True, entropy="auto"):
     """Delta-compress a target checkpoint against a base checkpoint.
 
     Precision modes:
-    - int16: Aligned quantization to int16, delta, zstd. ~87% savings, +0.06% RelL2.
+    - int16: Aligned quantization to int16, delta, entropy code. ~87% savings, +0.06% RelL2.
     - int32: Aligned quantization to int32, delta, zstd. ~87% savings, error below FP32 noise floor.
              (Replaced raw XOR in April 2026 after validation showed XOR produces 0% sparsity.)
+
+    Entropy modes:
+    - auto (default): per-tensor competitive selection across the available
+      candidate coders ([zstd-19, FLAC, brotli-11]). For each tensor the
+      smallest output is kept and the winning coder's identifier is recorded
+      in per-tensor metadata. Decompression dispatches on that identifier.
+      Note: int32 precision falls back to zstd because FLAC and brotli
+      operate on the int16-native byte stream.
+    - zstd-19 / flac / brotli-11: pin a single coder for the whole delta.
+      Useful for testing and for measuring per-coder baselines.
+    - Legacy aliases ('zstd', 'lpc') from earlier DMX versions are accepted
+      and map to 'zstd-19' and 'flac' respectively.
 
     Algorithm:
     1. Load base and target safetensors
@@ -1909,9 +2183,40 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
 
     max_val = 32767 if precision == "int16" else 2147483647
 
+    # Resolve entropy mode. The default is 'auto' which means per-tensor
+    # competitive selection across the available candidate coders
+    # ([zstd-19, FLAC, brotli-11]). Explicit values pin to a single coder for
+    # the whole compress, useful for testing and for environments missing
+    # optional dependencies. Legacy aliases ('zstd' -> 'zstd-19', 'lpc' ->
+    # 'flac') are accepted for backward compatibility with earlier DMX versions.
+    if entropy == "lpc":
+        entropy = "flac"
+    if entropy == "auto":
+        # Competitive selection. Always available because zstd is a hard dep,
+        # and the selector subsets to whatever optional coders are installed.
+        effective_entropy = "auto"
+    elif entropy == "flac" and not _lpc_backend_available():
+        print("  WARNING: entropy=flac but no FLAC backend available, falling back to zstd-19")
+        effective_entropy = "zstd-19"
+    elif entropy == "brotli-11" and not BROTLI_AVAILABLE:
+        print("  WARNING: entropy=brotli-11 but brotli is not installed, falling back to zstd-19")
+        effective_entropy = "zstd-19"
+    elif entropy in ("zstd", "zstd-19"):
+        effective_entropy = "zstd-19"
+    else:
+        effective_entropy = entropy
+    if effective_entropy != "zstd-19" and precision == "int32":
+        # FLAC/brotli paths only meaningful for the int16 native stream.
+        # int32 deltas fall back to zstd-19 for this delta.
+        print(f"  NOTE: entropy={effective_entropy} + precision=int32 not supported, "
+              f"falling back to zstd-19 for this delta")
+        effective_entropy = "zstd-19"
+    print(f"  entropy: {effective_entropy}")
+
     # Quantize and compute deltas, encode per-tensor
     level = zstd_level if zstd_level is not None else ZSTD_LEVEL_DELTA
-    print(f"  zstd level: {level}")
+    if effective_entropy == "zstd-19":
+        print(f"  zstd level: {level}")
     cctx = zstd.ZstdCompressor(level=level, write_content_size=True)
     tensor_meta = {}
     compressed_chunks = {}
@@ -2018,8 +2323,45 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
         total_params += n
         total_zero += nz
 
-        # Compress delta with zstd
-        compressed = cctx.compress(delta_bytes)
+        # Compress delta with the resolved entropy coder.
+        # In 'auto' mode the per-tensor selector tries every available
+        # candidate coder and keeps the smallest output. Each tensor records
+        # the winning coder's identifier in tensor_meta so the decoder
+        # dispatches correctly even on mixed-coder deltas. Pinned entropy
+        # modes (zstd-19, flac, brotli-11) bypass the selector and apply the
+        # same coder to every tensor; useful for testing and per-coder
+        # baselines.
+        if effective_entropy == "auto" and precision == "int16":
+            try:
+                tensor_entropy, compressed = _competitive_encode_int16(
+                    delta_bytes, n, zstd_level=level
+                )
+            except Exception as e:
+                print(f"  WARNING: competitive encode failed for {key} ({e}), "
+                      f"falling back to zstd-19 for this tensor")
+                compressed = cctx.compress(delta_bytes)
+                tensor_entropy = "zstd-19"
+        elif effective_entropy == "flac" and precision == "int16":
+            try:
+                compressed = _int16_to_flac(delta_bytes, n)
+                tensor_entropy = "flac"
+            except Exception as e:
+                print(f"  WARNING: FLAC encode failed for {key} ({e}), "
+                      f"falling back to zstd-19 for this tensor")
+                compressed = cctx.compress(delta_bytes)
+                tensor_entropy = "zstd-19"
+        elif effective_entropy == "brotli-11" and precision == "int16":
+            try:
+                compressed = _compress_bytes_brotli(delta_bytes)
+                tensor_entropy = "brotli-11"
+            except Exception as e:
+                print(f"  WARNING: brotli encode failed for {key} ({e}), "
+                      f"falling back to zstd-19 for this tensor")
+                compressed = cctx.compress(delta_bytes)
+                tensor_entropy = "zstd-19"
+        else:
+            compressed = cctx.compress(delta_bytes)
+            tensor_entropy = "zstd-19"
         total_compressed += len(compressed)
 
         tensor_meta[key] = {
@@ -2028,6 +2370,7 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
             "scale": scale,
             "component_type": _key_type(key),
             "precision": precision,
+            "entropy": tensor_entropy,
             "params": n,
             "zeros": nz,
             "raw_size": len(delta_bytes),
@@ -2099,8 +2442,16 @@ def delta_compress(base_path, target_path, output_path, precision="int16",
 
 def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ratio=None,
                    zstd_level=None, use_gpu=None, anchor_safety_margin=0.95,
-                   strip_legacy_buffers=True):
+                   strip_legacy_buffers=True, entropy="auto"):
     """Chain-compress a sequence of related checkpoints with auto-anchor promotion.
+
+    Entropy default is 'auto' which means per-tensor competitive coder
+    selection across the available candidate set ([zstd-19, FLAC, brotli-11]).
+    For each tensor the smallest output is kept and the winning coder's
+    identifier is recorded in per-tensor metadata. By construction this
+    matches or beats any fixed-codec strategy. Pinned values force a single
+    coder for the whole chain — useful for testing and for measuring
+    per-coder baselines.
 
     This is the production chain compression entry point. It implements the
     auto-anchor promotion policy: each checkpoint is delta-compressed against
@@ -2199,7 +2550,7 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             # The 'precision' arg only governs DELTA encoding (int16 vs int32),
             # not anchor encoding. Forcing the anchor to mode=precision was a bug
             # that defeated GPU acceleration on FP16 source models.
-            compress_file(ckpt_path, anchor_path, mode="auto", use_gpu=use_gpu)
+            compress_file(ckpt_path, anchor_path, mode="auto", entropy=entropy, use_gpu=use_gpu)
             elapsed = time.time() - t0
             anchor_size = os.path.getsize(anchor_path)
             total_chain += anchor_size
@@ -2228,7 +2579,8 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
         try:
             delta_compress(current_anchor_safetensors, ckpt_path, delta_path,
                            precision=precision, zstd_level=zstd_level,
-                           strip_legacy_buffers=strip_legacy_buffers)
+                           strip_legacy_buffers=strip_legacy_buffers,
+                           entropy=entropy)
         except Exception as e:
             print(f"        DELTA FAILED: {e}")
             print(f"        falling back to fresh anchor")
@@ -2242,7 +2594,7 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             # The 'precision' arg only governs DELTA encoding (int16 vs int32),
             # not anchor encoding. Forcing the anchor to mode=precision was a bug
             # that defeated GPU acceleration on FP16 source models.
-            compress_file(ckpt_path, anchor_path, mode="auto", use_gpu=use_gpu)
+            compress_file(ckpt_path, anchor_path, mode="auto", entropy=entropy, use_gpu=use_gpu)
             elapsed = time.time() - t0
             anchor_size = os.path.getsize(anchor_path)
             total_chain += anchor_size
@@ -2315,7 +2667,7 @@ def chain_compress(checkpoint_paths, output_dir, precision="int16", max_delta_ra
             # The 'precision' arg only governs DELTA encoding (int16 vs int32),
             # not anchor encoding. Forcing the anchor to mode=precision was a bug
             # that defeated GPU acceleration on FP16 source models.
-            compress_file(ckpt_path, anchor_path, mode="auto", use_gpu=use_gpu)
+            compress_file(ckpt_path, anchor_path, mode="auto", entropy=entropy, use_gpu=use_gpu)
             anchor_elapsed = time.time() - t0
             anchor_size = os.path.getsize(anchor_path)
             total_chain += anchor_size
@@ -2442,9 +2794,19 @@ def delta_reconstruct(base_path, delta_path, output_path):
         offset = meta["offset"] - header_size  # offset into delta_data
         comp_size = meta["compressed_size"]
 
-        # Decompress delta
+        # Decompress delta. Each tensor records the entropy coder it was
+        # written with in its per-tensor metadata; the decoder dispatches on
+        # that identifier. Legacy short identifiers ('zstd', 'lpc') from
+        # earlier DMX versions are accepted as aliases of the current names.
+        # Files with no entropy field at all (oldest .dmxd format) are
+        # treated as zstd by default.
         chunk = delta_data[offset:offset + comp_size]
-        delta_bytes = zstd.ZstdDecompressor().decompress(chunk)
+        tensor_entropy = meta.get("entropy", "zstd-19")
+        if tensor_precision == "int32":
+            # int32 path always uses zstd (FLAC/brotli paths are int16-native)
+            delta_bytes = dctx.decompress(chunk)
+        else:
+            delta_bytes = _decompress_int16_dispatch(chunk, tensor_entropy)
 
         if tensor_precision == "int32":
             if scale == 0.0:
@@ -2516,6 +2878,134 @@ def delta_reconstruct(base_path, delta_path, output_path):
     print(f"  Time: {elapsed:.1f}s")
 
     return output_size
+
+
+def chain_reconstruct(manifest_path, output_dir, indices=None, use_gpu=None):
+    """Reconstruct safetensors checkpoints from a DMX chain manifest.
+
+    Walks the chain_manifest.json produced by chain_compress and recreates the
+    original safetensors files into output_dir. Anchors are decompressed via
+    decompress_file; deltas are reconstructed via delta_reconstruct against
+    their anchor (which is decompressed first if not already cached).
+
+    Args:
+        manifest_path: path to chain_manifest.json (or a directory containing one).
+        output_dir: directory to write reconstructed .safetensors files into.
+        indices: optional iterable of integer entry indices to reconstruct. If
+            None (default), reconstruct every entry. Anchors required by any
+            requested delta are always reconstructed even if not listed.
+        use_gpu: passthrough to decompress_file for anchor decompression.
+
+    Returns:
+        dict with 'reconstructed_count', 'output_paths', 'total_output_bytes',
+        'time_seconds'.
+    """
+    if os.path.isdir(manifest_path):
+        manifest_path = os.path.join(manifest_path, "chain_manifest.json")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"chain manifest not found: {manifest_path}")
+
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+
+    if manifest.get("format") != "dmx_chain_manifest":
+        raise ValueError(f"not a DMX chain manifest: {manifest_path}")
+
+    entries = manifest["entries"]
+    manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Build index → entry lookup
+    by_index = {e["index"]: e for e in entries}
+
+    # Determine which entries to actually reconstruct
+    if indices is None:
+        target_indices = sorted(by_index.keys())
+    else:
+        target_indices = sorted(set(indices))
+        for idx in target_indices:
+            if idx not in by_index:
+                raise ValueError(f"requested index {idx} not in manifest")
+        # Pull in any anchor required by a requested delta
+        required_anchors = set()
+        for idx in target_indices:
+            e = by_index[idx]
+            if e["type"] == "delta":
+                required_anchors.add(e["anchor_index"])
+        for a_idx in required_anchors:
+            if a_idx not in target_indices:
+                target_indices.append(a_idx)
+        target_indices = sorted(set(target_indices))
+
+    print(f"=" * 70)
+    print(f"DMX chain-reconstruct")
+    print(f"=" * 70)
+    print(f"  Manifest:    {manifest_path}")
+    print(f"  Output dir:  {output_dir}")
+    print(f"  Entries:     {len(target_indices)} of {len(entries)} total")
+    print()
+
+    start = time.time()
+    output_paths = []
+    total_output_bytes = 0
+    # Cache anchor_index → reconstructed safetensors path so consecutive
+    # deltas referring to the same anchor don't pay decompression twice.
+    anchor_cache = {}
+
+    def _output_basename(entry):
+        src = entry["source"]
+        base = os.path.splitext(os.path.basename(src))[0]
+        return base + ".safetensors"
+
+    def _ensure_anchor_reconstructed(anchor_idx):
+        if anchor_idx in anchor_cache:
+            return anchor_cache[anchor_idx]
+        anchor_entry = by_index[anchor_idx]
+        if anchor_entry["type"] != "anchor":
+            raise ValueError(
+                f"entry {anchor_idx} referenced as anchor but type={anchor_entry['type']}"
+            )
+        compressed_path = os.path.join(manifest_dir, anchor_entry["compressed_path"])
+        out_path = os.path.join(output_dir, _output_basename(anchor_entry))
+        print(f"  decompress anchor [{anchor_idx}]: {os.path.basename(compressed_path)}")
+        decompress_file(compressed_path, out_path, use_gpu=use_gpu)
+        anchor_cache[anchor_idx] = out_path
+        return out_path
+
+    for idx in target_indices:
+        entry = by_index[idx]
+        if entry["type"] == "anchor":
+            out_path = _ensure_anchor_reconstructed(idx)
+            if out_path not in output_paths:
+                output_paths.append(out_path)
+                total_output_bytes += os.path.getsize(out_path)
+        elif entry["type"] == "delta":
+            anchor_idx = entry["anchor_index"]
+            base_path = _ensure_anchor_reconstructed(anchor_idx)
+            delta_path = os.path.join(manifest_dir, entry["compressed_path"])
+            out_path = os.path.join(output_dir, _output_basename(entry))
+            print(f"  reconstruct delta [{idx}]: {os.path.basename(delta_path)} ← anchor [{anchor_idx}]")
+            delta_reconstruct(base_path, delta_path, out_path)
+            output_paths.append(out_path)
+            total_output_bytes += os.path.getsize(out_path)
+        else:
+            raise ValueError(f"unknown entry type {entry['type']!r} at index {idx}")
+
+    elapsed = time.time() - start
+    print()
+    print(f"=" * 70)
+    print(f"Chain reconstruction complete")
+    print(f"=" * 70)
+    print(f"  Files written: {len(output_paths)}")
+    print(f"  Total output:  {fmt_size(total_output_bytes)}")
+    print(f"  Time:          {elapsed:.1f}s")
+
+    return {
+        "reconstructed_count": len(output_paths),
+        "output_paths": output_paths,
+        "total_output_bytes": total_output_bytes,
+        "time_seconds": elapsed,
+    }
 
 
 def delta_info(delta_path):
@@ -2608,6 +3098,9 @@ def main():
                             help="Entropy coder: zstd (default), lpc (FLAC, needs ffmpeg), auto (try lpc)")
     p_compress.add_argument("--gpu", action="store_true",
                             help="Use GPU-accelerated compression (CUDA required)")
+    p_compress.add_argument("--parallel-workers", type=int, default=None,
+                            help="Number of threads for per-tensor encoding (default: auto, "
+                                 "uses min(8, cpu_count) on CPU and 1 on GPU)")
 
     p_decompress = sub.add_parser("decompress", help="Decompress .dmx to safetensors")
     p_decompress.add_argument("input", help="Input .dmx file")
@@ -2643,6 +3136,14 @@ def main():
                                "int32: practically lossless ~87%% savings, error below FP32 noise floor.")
     p_delta.add_argument("--zstd-level", type=int, default=None,
                           help="zstd compression level 1-19 (default: 3 for speed. Use 19 for maximum compression).")
+    p_delta.add_argument("--entropy",
+                          choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11"],
+                          default="auto",
+                          help="Entropy coder. Default 'auto' = per-tensor competitive selection "
+                               "across [zstd-19, FLAC, brotli-11] with the smallest output kept. "
+                               "Pinned values force a single coder for the whole delta — useful "
+                               "for testing and per-coder baselines. Legacy aliases accepted: "
+                               "'zstd' -> 'zstd-19', 'lpc' -> 'flac'.")
     p_delta.add_argument("--keep-legacy-buffers", action="store_true",
                           help="Include legacy auxiliary buffer tensors (causal masks, "
                                "inv_freq, masked_bias) in the delta. Default is to strip them "
@@ -2677,16 +3178,33 @@ def main():
                                "Ignored when --max-delta-ratio is set.")
     p_chain.add_argument("--zstd-level", type=int, default=None,
                           help="zstd compression level for deltas (1-19, default 3)")
+    p_chain.add_argument("--entropy",
+                          choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11"],
+                          default="auto",
+                          help="Entropy coder. Default 'auto' = per-tensor competitive selection "
+                               "across [zstd-19, FLAC, brotli-11]. Pinned values force a single "
+                               "coder. Legacy aliases accepted: 'zstd' -> 'zstd-19', 'lpc' -> "
+                               "'flac'.")
     p_chain.add_argument("--gpu", action="store_true", help="Use GPU-accelerated compression for anchor writes")
     p_chain.add_argument("--keep-legacy-buffers", action="store_true",
                           help="Include legacy auxiliary buffers (causal masks, inv_freq, "
                                "masked_bias) in chain deltas. Default is to strip them.")
 
+    p_chain_recon = sub.add_parser("chain-reconstruct",
+                                    help="Reconstruct safetensors checkpoints from a chain manifest")
+    p_chain_recon.add_argument("manifest", help="Path to chain_manifest.json (or directory containing one)")
+    p_chain_recon.add_argument("--output-dir", required=True, help="Directory to write reconstructed .safetensors files")
+    p_chain_recon.add_argument("--indices", type=int, nargs="+", default=None,
+                                help="Optional subset of entry indices to reconstruct (default: all)")
+    p_chain_recon.add_argument("--gpu", action="store_true",
+                                help="Use GPU-accelerated decompression for anchors")
+
     args = parser.parse_args()
 
     if args.command == "compress":
         compress_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
-                      use_gpu=args.gpu if args.gpu else None)
+                      use_gpu=args.gpu if args.gpu else None,
+                      parallel_workers=args.parallel_workers)
         if args.report:
             print()
             print("=== Auto-verify after compression ===")
@@ -2702,7 +3220,8 @@ def main():
     elif args.command == "delta-compress":
         delta_compress(args.base, args.target, args.output, precision=args.precision,
                       zstd_level=getattr(args, 'zstd_level', None),
-                      strip_legacy_buffers=not args.keep_legacy_buffers)
+                      strip_legacy_buffers=not args.keep_legacy_buffers,
+                      entropy=getattr(args, 'entropy', 'auto'))
     elif args.command == "delta-reconstruct":
         delta_reconstruct(args.base, args.delta, args.output)
     elif args.command == "delta-info":
@@ -2714,7 +3233,12 @@ def main():
                        anchor_safety_margin=args.anchor_safety_margin,
                        zstd_level=getattr(args, 'zstd_level', None),
                        use_gpu=args.gpu if args.gpu else None,
-                       strip_legacy_buffers=not args.keep_legacy_buffers)
+                       strip_legacy_buffers=not args.keep_legacy_buffers,
+                       entropy=getattr(args, 'entropy', 'auto'))
+    elif args.command == "chain-reconstruct":
+        chain_reconstruct(args.manifest, args.output_dir,
+                          indices=args.indices,
+                          use_gpu=args.gpu if args.gpu else None)
     else:
         parser.print_help()
         sys.exit(1)
