@@ -6,6 +6,12 @@ DMX transforms weight tensors into aligned integer representations, enabling eff
 
 **Safe for production training.** Resuming from DMX-reconstructed checkpoints produces 0.15% loss difference after 50 chain resumes over 10,000 training steps — verified on GPU with reproducible scripts. Delta chains use exact integer arithmetic with zero error accumulation regardless of chain length.
 
+---
+
+**Contents:** [What is DMX?](#what-is-dmx) · [How It Works](#how-it-works) · [Installation](#installation) · [Quick Start](#quick-start) · [Delta Compression](#delta-compression-checkpoint--model-versioning) · [Chain Compression](#chain-compression-training-run-checkpoints-every-n-step-cadences) · [Quantized Export](#quantized-export-derive-int8--nf4--fp8-on-demand) · [Benchmarks](#benchmarks) · [Why DMX Matters](#why-dmx-matters-for-training) · [Validated Results](#validated-results-checkpoint-delta-compression) · [Research](#research-directions) · [License & Patent](#license--patent)
+
+---
+
 ```
 Original:  9.1 GB  (SVD-XT, FP32 — 80% includes FP32→FP16 conversion)
 DMX:       1.8 GB
