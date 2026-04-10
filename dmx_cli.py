@@ -1657,6 +1657,137 @@ def decompress_file(input_path, output_path, use_gpu=None):
     return output_size
 
 
+def export_quant(input_path, output_path, target="int8", use_gpu=None):
+    """Derive a quantized model from a DMX file without keeping the full-precision intermediate.
+
+    Decompresses the DMX file to full precision, applies the target quantization,
+    and saves the quantized result as a safetensors file. The full-precision
+    tensors are never written to disk — only the quantized output is saved.
+
+    Supported targets (RTN-family only — calibration-dependent formats like
+    GPTQ and AWQ are not derivable because they require activation data that
+    DMX does not store):
+
+      int8   — per-channel symmetric INT8 (scale per output row, [-127, 127])
+      nf4    — NF4 QLoRA codebook (16 fixed values, group_size=64)
+      fp8    — FP8 E4M3 (PyTorch 2.1+ native, requires int32 DMX for clean derivation)
+
+    Args:
+        input_path: path to .dmx file
+        output_path: path to write the quantized .safetensors output
+        target: one of 'int8', 'nf4', 'fp8'
+        use_gpu: passthrough to decompress (None = auto-detect)
+    """
+    print(f"=" * 70)
+    print(f"DMX export — derive {target.upper()} from {os.path.basename(input_path)}")
+    print(f"=" * 70)
+
+    # Step 1: Decompress DMX to full-precision tensors (in memory, not to disk)
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    if use_gpu and torch.cuda.is_available():
+        print(f"  GPU accelerated mode: {torch.cuda.get_device_name(0)}")
+    decode_fn = decode_tensor_gpu if (use_gpu and torch.cuda.is_available()) else decode_tensor
+
+    print(f"  Loading {input_path}...")
+    start = time.time()
+
+    with open(input_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            raise ValueError(f"Not a DMX file (magic: {magic})")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version > DMX_VERSION:
+            raise ValueError(f"Unsupported DMX version: {version}")
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_size))
+
+        tensors = {}
+        keys = sorted(manifest["tensors"].keys())
+        for i, key in enumerate(keys):
+            meta = manifest["tensors"][key]
+            f.seek(meta["offset"])
+            compressed = f.read(meta["compressed_size"])
+            tensors[key] = decode_fn(compressed, meta)
+            if (i + 1) % 500 == 0 or (i + 1) == len(keys):
+                print(f"  Decompressed {i+1}/{len(keys)} tensors...")
+
+    decompress_time = time.time() - start
+    print(f"  Decompressed {len(tensors)} tensors in {decompress_time:.1f}s")
+
+    # Step 2: Apply target quantization
+    print(f"  Deriving {target.upper()}...")
+    quant_start = time.time()
+    quantized = {}
+
+    if target == "int8":
+        for key, t in tensors.items():
+            t_flat = t.float()
+            if t_flat.dim() >= 2:
+                t_2d = t_flat.reshape(t_flat.shape[0], -1)
+                max_abs = t_2d.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-12)
+                scale = max_abs / 127
+                q = torch.clamp(torch.round(t_2d / scale), -127, 127).to(torch.int8)
+                quantized[key] = q.reshape(t.shape)
+            else:
+                max_abs = t_flat.abs().max().clamp(min=1e-12)
+                scale = max_abs / 127
+                q = torch.clamp(torch.round(t_flat / scale), -127, 127).to(torch.int8)
+                quantized[key] = q
+
+    elif target == "nf4":
+        nf4_codebook = torch.tensor([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+        ], dtype=torch.float32)
+        group_size = 64
+        for key, t in tensors.items():
+            flat = t.float().flatten()
+            n = flat.numel()
+            pad = (group_size - n % group_size) % group_size
+            if pad:
+                flat = torch.cat([flat, torch.zeros(pad, dtype=torch.float32)])
+            groups = flat.reshape(-1, group_size)
+            absmax = groups.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-12)
+            normalized = groups / absmax
+            diffs = (normalized.unsqueeze(-1) - nf4_codebook.unsqueeze(0).unsqueeze(0)).abs()
+            codes = diffs.argmin(dim=-1).to(torch.uint8)
+            quantized[key] = codes.flatten()[:n].reshape(t.shape)
+
+    elif target == "fp8":
+        if not hasattr(torch, 'float8_e4m3fn'):
+            raise RuntimeError(
+                "FP8 E4M3 requires PyTorch 2.1+ with native float8_e4m3fn support. "
+                "Your PyTorch version does not have it."
+            )
+        for key, t in tensors.items():
+            quantized[key] = t.float().to(torch.float8_e4m3fn)
+    else:
+        raise ValueError(
+            f"Unknown target format '{target}'. "
+            f"Supported: int8, nf4, fp8"
+        )
+
+    quant_time = time.time() - quant_start
+    print(f"  Quantized {len(quantized)} tensors to {target.upper()} in {quant_time:.1f}s")
+
+    # Step 3: Save
+    print(f"  Saving to {output_path}...")
+    save_file(quantized, output_path)
+    output_size = os.path.getsize(output_path)
+    input_size = os.path.getsize(input_path)
+    elapsed = time.time() - start
+
+    print(f"\n  Results:")
+    print(f"    DMX input:     {input_size / 1024 / 1024:.1f} MB")
+    print(f"    {target.upper()} output:   {output_size / 1024 / 1024:.1f} MB")
+    print(f"    Time:          {elapsed:.1f}s (decompress {decompress_time:.1f}s + quantize {quant_time:.1f}s)")
+
+    return output_size
+
+
 def info_file(input_path):
     """Display info about a .dmx file."""
     with open(input_path, "rb") as f:
@@ -1921,7 +2052,7 @@ def verify_file(source_path, dmx_path, mode="auto", entropy="zstd", report_path=
         worst_max_diff = round(max(all_max_diffs), 8) if all_max_diffs else 0.0
 
         report = {
-            "dmx_version": "0.5.0",
+            "dmx_version": "0.6.0",
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "original_file": os.path.basename(source_path),
             "original_sha256": _sha256_file(source_path),
@@ -3320,7 +3451,7 @@ def delta_info(delta_path):
             print(f"    {key}: {csz/1024:.1f} KB ({100.0*z/n:.0f}% zero)")
 
 
-DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.5.0
+DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.6.0
 Patent Pending. (c) 2026 William J. Riley. MIT License.
 """
 
@@ -3442,6 +3573,18 @@ def main():
                           help="Include legacy auxiliary buffers (causal masks, inv_freq, "
                                "masked_bias) in chain deltas. Default is to strip them.")
 
+    p_export = sub.add_parser("export",
+                               help="Derive a quantized model from a DMX file (INT8, NF4, FP8)")
+    p_export.add_argument("input", help="Input .dmx file")
+    p_export.add_argument("output", help="Output .safetensors file (quantized)")
+    p_export.add_argument("--target", choices=["int8", "nf4", "fp8"], required=True,
+                           help="Target quantization format. int8 = per-channel symmetric INT8. "
+                                "nf4 = QLoRA NF4 codebook (group_size=64). "
+                                "fp8 = FP8 E4M3 (requires PyTorch 2.1+, best results from "
+                                "int32-mode DMX files).")
+    p_export.add_argument("--gpu", action="store_true",
+                           help="Use GPU-accelerated decompression")
+
     p_chain_recon = sub.add_parser("chain-reconstruct",
                                     help="Reconstruct safetensors checkpoints from a chain manifest")
     p_chain_recon.add_argument("manifest", help="Path to chain_manifest.json (or directory containing one)")
@@ -3487,6 +3630,9 @@ def main():
                        use_gpu=args.gpu if args.gpu else None,
                        strip_legacy_buffers=not args.keep_legacy_buffers,
                        entropy=getattr(args, 'entropy', 'auto'))
+    elif args.command == "export":
+        export_quant(args.input, args.output, target=args.target,
+                     use_gpu=args.gpu if args.gpu else None)
     elif args.command == "chain-reconstruct":
         chain_reconstruct(args.manifest, args.output_dir,
                           indices=args.indices,
