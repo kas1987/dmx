@@ -163,6 +163,23 @@ dmx chain-reconstruct ./compressed_chain --output-dir ./restored --indices 0 2
 
 The auto-anchor policy promotes a checkpoint to a fresh anchor whenever its delta would be larger than re-encoding the checkpoint from scratch, so the chain is self-calibrating across source dtypes and cadences. No manual tuning required.
 
+### Quantized export (derive INT8 / NF4 / FP8 on demand)
+
+One DMX file can serve as the source of truth for multiple quantized formats. Instead of storing separate INT8, NF4, and FP8 files alongside the original, derive them on demand:
+
+```bash
+# Derive INT8 per-channel from a DMX file
+dmx export model.dmx --target int8 model_int8.safetensors
+
+# Derive NF4 (QLoRA codebook, group_size=64)
+dmx export model.dmx --target nf4 model_nf4.safetensors
+
+# Derive FP8 E4M3 (best results from int32-mode DMX files)
+dmx export model.dmx --target fp8 model_fp8.safetensors
+```
+
+The derived codes are bounded to ±1 LSB of what you'd get by quantizing the original full-precision weights directly. Only RTN-family formats are derivable — calibration-dependent formats like GPTQ and AWQ are not supported because they require activation data that DMX does not store.
+
 ### Example: Compress and verify a model from HuggingFace
 
 ```bash
