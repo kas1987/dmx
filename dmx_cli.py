@@ -35,6 +35,25 @@ import torch
 import zstandard as zstd
 from safetensors.torch import load_file, save_file
 
+
+def _read_package_version():
+    """Read the installed dmx-compress package version, with fallback.
+
+    Single source of truth is pyproject.toml. Everything else (banner, report,
+    __version__) reads via importlib.metadata so there's only one place to
+    update on release. Falls back to "dev" when running from a source checkout
+    that isn't pip-installed.
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+        return _pkg_version("dmx-compress")
+    except Exception:
+        return "dev"
+
+
+__version__ = _read_package_version()
+
+
 # --- Constants ---
 DMX_MAGIC = b"DMX1"
 DMX_VERSION = 3
@@ -2289,7 +2308,7 @@ def verify_file(source_path, dmx_path, mode="auto", entropy="zstd", report_path=
         worst_max_diff = round(max(all_max_diffs), 8) if all_max_diffs else 0.0
 
         report = {
-            "dmx_version": "0.6.0",
+            "dmx_version": __version__,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "original_file": os.path.basename(source_path),
             "original_sha256": _sha256_file(source_path),
@@ -3688,7 +3707,7 @@ def delta_info(delta_path):
             print(f"    {key}: {csz/1024:.1f} KB ({100.0*z/n:.0f}% zero)")
 
 
-DMX_BANNER = """DMX - Delta Multiplexed Model Compressor v0.6.0
+DMX_BANNER = f"""DMX - Delta Multiplexed Model Compressor v{__version__}
 Patent Pending. (c) 2026 William J. Riley. MIT License.
 """
 
@@ -3716,6 +3735,13 @@ def main():
     p_compress.add_argument("--parallel-workers", type=int, default=None,
                             help="Number of threads for per-tensor encoding (default: auto, "
                                  "uses min(8, cpu_count) on CPU and 1 on GPU)")
+    p_compress.add_argument("--mantissa-bits", type=int, default=None,
+                            help="Override BFP mantissa bit width (int in [1, 10]). Only affects "
+                                 "BFP mode. Common values: 4 (aggressive, smaller files), "
+                                 "6 (default, balanced), 7 (balanced, better fidelity), "
+                                 "8 (conservative, highest fidelity). Default uses the shipping "
+                                 "constant (6). The chosen value is stored per-tensor in the "
+                                 "manifest so decoders always reconstruct correctly.")
 
     p_decompress = sub.add_parser("decompress", help="Decompress .dmx to safetensors")
     p_decompress.add_argument("input", help="Input .dmx file")
@@ -3761,7 +3787,7 @@ def main():
                           default="auto",
                           help="Entropy coder. Default 'auto' = per-tensor competitive selection "
                                "across [zstd-19, FLAC, brotli-11] with the smallest output kept. "
-                               "Pinned values force a single coder for the whole delta — useful "
+                               "Pinned values force a single coder for the whole delta -- useful "
                                "for testing and per-coder baselines. Legacy aliases accepted: "
                                "'zstd' -> 'zstd-19', 'lpc' -> 'flac'.")
     p_delta.add_argument("--keep-legacy-buffers", action="store_true",
@@ -3789,7 +3815,7 @@ def main():
     p_chain.add_argument("--max-delta-ratio", type=float, default=None,
                           help="Static anchor promotion threshold (legacy). If set, a delta is "
                                "kept only when its compressed size is <= this fraction of the "
-                               "target's RAW size. Default unset → dynamic policy: keep delta only "
+                               "target's RAW size. Default unset -> dynamic policy: keep delta only "
                                "when its size is < current_anchor_compressed_size * 0.95. The "
                                "dynamic policy is storage-optimal and self-calibrates per source dtype.")
     p_chain.add_argument("--anchor-safety-margin", type=float, default=0.95,
@@ -3813,12 +3839,23 @@ def main():
     p_export = sub.add_parser("export",
                                help="Derive a quantized model from a DMX file (INT8, NF4, FP8)")
     p_export.add_argument("input", help="Input .dmx file")
-    p_export.add_argument("output", help="Output .safetensors file (quantized)")
-    p_export.add_argument("--target", choices=["int8", "nf4", "fp8"], required=True,
-                           help="Target quantization format. int8 = per-channel symmetric INT8. "
-                                "nf4 = QLoRA NF4 codebook (group_size=64). "
-                                "fp8 = FP8 E4M3 (requires PyTorch 2.1+, best results from "
-                                "int32-mode DMX files).")
+    p_export.add_argument("output",
+                           help="Output path. For --target: .safetensors file path. "
+                                "For --targets: output directory where {target}.safetensors "
+                                "files will be written.")
+    p_export.add_argument("--target", choices=["int8", "nf4", "fp8"], default=None,
+                           help="Single target quantization format. int8 = per-channel symmetric "
+                                "INT8. nf4 = QLoRA NF4 codebook (group_size=64). fp8 = FP8 E4M3 "
+                                "(requires PyTorch 2.1+, best results from int32-mode DMX files). "
+                                "Exactly one of --target or --targets is required.")
+    p_export.add_argument("--targets", type=str, default=None,
+                           help="Multiple target formats as a comma-separated list "
+                                "(e.g. 'int8,nf4,fp8'). The DMX file is decoded ONCE and all "
+                                "targets are derived from the shared in-memory tensor dict, "
+                                "amortizing decode cost across targets. Saves roughly 27%% wall "
+                                "time on T=2 and 48%% on T=3 vs separate --target calls. The "
+                                "'output' positional must be a DIRECTORY in this mode; each "
+                                "target is written as {target}.safetensors inside that directory.")
     p_export.add_argument("--gpu", action="store_true",
                            help="Use GPU-accelerated decompression")
 
@@ -3836,7 +3873,8 @@ def main():
     if args.command == "compress":
         compress_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
                       use_gpu=args.gpu if args.gpu else None,
-                      parallel_workers=args.parallel_workers)
+                      parallel_workers=args.parallel_workers,
+                      mantissa_bits=args.mantissa_bits)
         if args.report:
             print()
             print("=== Auto-verify after compression ===")
@@ -3868,8 +3906,22 @@ def main():
                        strip_legacy_buffers=not args.keep_legacy_buffers,
                        entropy=getattr(args, 'entropy', 'auto'))
     elif args.command == "export":
-        export_quant(args.input, args.output, target=args.target,
-                     use_gpu=args.gpu if args.gpu else None)
+        # Mutex: exactly one of --target or --targets must be given
+        if args.target is None and args.targets is None:
+            parser.error("dmx export: exactly one of --target or --targets is required")
+        if args.target is not None and args.targets is not None:
+            parser.error("dmx export: --target and --targets are mutually exclusive; "
+                         "use --target for single target output file or --targets for "
+                         "multi-target output directory")
+        if args.targets is not None:
+            targets_list = [t.strip() for t in args.targets.split(",") if t.strip()]
+            if not targets_list:
+                parser.error("dmx export: --targets must contain at least one target")
+            export_quant_multi(args.input, args.output, targets=targets_list,
+                               use_gpu=args.gpu if args.gpu else None)
+        else:
+            export_quant(args.input, args.output, target=args.target,
+                         use_gpu=args.gpu if args.gpu else None)
     elif args.command == "chain-reconstruct":
         chain_reconstruct(args.manifest, args.output_dir,
                           indices=args.indices,

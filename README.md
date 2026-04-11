@@ -125,6 +125,12 @@ dmx compress model.safetensors model.dmx --mode int32
 # 1 on GPU). zstd releases the GIL so threads give real parallelism.
 dmx compress model.safetensors model.dmx --parallel-workers 8
 
+# Tune BFP fidelity with the mantissa-bits slider (4-8, default 6)
+# M=4: aggressive compression, lower fidelity
+# M=6: default, balanced
+# M=8: conservative, highest fidelity
+dmx compress model.safetensors model.dmx --mode bfp --mantissa-bits 7
+
 # Decompress back to safetensors (auto-uses GPU if available)
 dmx decompress model.dmx model.safetensors
 
@@ -134,6 +140,19 @@ dmx verify model.safetensors model.dmx --report verify.json
 # View compression info
 dmx info model.dmx
 ```
+
+Compression output now reports savings against **two baselines** so you can see
+both the source-file ratio and the dtype-independent FP32 baseline side by side:
+
+```text
+Output size: 129.95 MB
+  vs source file (375 MB): 65.3% of source, +34.7% savings
+  vs FP32 equivalent (750 MB): 17.3% of FP32, +82.7% savings
+```
+
+Same compressed bytes, different baselines. The FP32-equivalent column is the
+canonical baseline (`total_params × 4 bytes`) and stays constant regardless of
+whether the input was FP16 or FP32 source.
 
 ### Delta compression (checkpoint / model versioning)
 
@@ -175,14 +194,28 @@ One DMX file can serve as the source of truth for multiple quantized formats. In
 
 ```bash
 # Derive INT8 per-channel from a DMX file
-dmx export model.dmx --target int8 model_int8.safetensors
+dmx export model.dmx model_int8.safetensors --target int8
 
 # Derive NF4 (QLoRA codebook, group_size=64)
-dmx export model.dmx --target nf4 model_nf4.safetensors
+dmx export model.dmx model_nf4.safetensors --target nf4
 
 # Derive FP8 E4M3 (best results from int32-mode DMX files)
-dmx export model.dmx --target fp8 model_fp8.safetensors
+dmx export model.dmx model_fp8.safetensors --target fp8
 ```
+
+**Multi-target export** — derive several formats in a single DMX load:
+
+```bash
+# Write int8.safetensors, nf4.safetensors, and fp8.safetensors to an output dir,
+# decoding the DMX file exactly once and deriving all three from the shared
+# in-memory tensors. Saves ~27% wall time on T=2 and ~48% on T=3 vs
+# running --target three times.
+dmx export model.dmx ./quant_out/ --targets int8,nf4,fp8
+```
+
+When `--targets` is used, the positional `output` must be a directory (created
+if missing) rather than a single file path. Each target is written as
+`{target}.safetensors` inside that directory.
 
 The derived codes are bounded to ±1 LSB of what you'd get by quantizing the original full-precision weights directly. Only RTN-family formats are derivable — calibration-dependent formats like GPTQ and AWQ are not supported because they require activation data that DMX does not store.
 
