@@ -208,14 +208,28 @@ dmx export model.dmx model_fp8.safetensors --target fp8
 ```bash
 # Write int8.safetensors, nf4.safetensors, and fp8.safetensors to an output dir,
 # decoding the DMX file exactly once and deriving all three from the shared
-# in-memory tensors. Saves ~27% wall time on T=2 and ~48% on T=3 vs
-# running --target three times.
+# in-memory tensors.
 dmx export model.dmx ./quant_out/ --targets int8,nf4,fp8
 ```
 
 When `--targets` is used, the positional `output` must be a directory (created
 if missing) rather than a single file path. Each target is written as
 `{target}.safetensors` inside that directory.
+
+**Performance notes**
+
+Speed improvements depend on your model and workload.
+
+- On decode-dominated models (measured on Pythia 160M), exports can be
+  **~27% faster with 2 targets and ~48% faster with 3 targets** thanks to
+  shared decoding.
+- On models where the derive step dominates (measured on Qwen 2.5 0.5B,
+  where FP8 derivation is heavier), results may vary — **~22% faster with
+  2 targets, but up to ~33% slower with 3 targets** because the per-target
+  work outweighs what decoding-once saves.
+
+Output is byte-equivalent either way — only wall-time varies. If wall-time
+is critical for your use case, benchmark on your target model.
 
 The derived codes are bounded to ±1 LSB of what you'd get by quantizing the original full-precision weights directly. Only RTN-family formats are derivable — calibration-dependent formats like GPTQ and AWQ are not supported because they require activation data that DMX does not store.
 
