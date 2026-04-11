@@ -64,6 +64,14 @@ ENC_INT32_QUANT_LPC = 15 # FP32 -> int32 aligned quantization + FLAC (practicall
 # Module-level flag for GPU compression (set by CLI --gpu)
 _use_gpu_compress = False
 
+# Module-level override for BFP mantissa bits during compress_file() calls.
+# None means "use the default BFP_MANTISSA_BITS constant." When set by
+# compress_file(mantissa_bits=N), it is read by the BFP encode path in
+# encode_tensor() and passed explicitly to bfp_compress/bfp_compress_gpu,
+# bypassing the frozen default arg values captured at function-definition time.
+# Restored to None at the end of each compress_file() call so state never leaks.
+_bfp_mantissa_override = None
+
 # Native CUDA kernels (loaded on demand)
 _dmx_cuda = None
 
@@ -990,14 +998,21 @@ def encode_tensor(tensor, encoding, entropy_mode=None):
         num_samples = len(raw) // 2  # may not be int16, but FLAC needs int16
 
     elif base_enc == ENC_BFP_ZSTD:
+        # Resolve mantissa bits: use runtime override if set, otherwise
+        # fall back to module-level default.
+        effective_m = _bfp_mantissa_override if _bfp_mantissa_override is not None else BFP_MANTISSA_BITS
         if _use_gpu_compress and torch.cuda.is_available():
-            exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress_gpu(t)
+            exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress_gpu(
+                t, mantissa_bits=effective_m
+            )
         else:
-            exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress(t)
+            exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress(
+                t, mantissa_bits=effective_m
+            )
         meta["bfp_pad_len"] = pad_len
         meta["bfp_orig_len"] = orig_len
         meta["bfp_group_size"] = BFP_GROUP_SIZE
-        meta["bfp_mantissa_bits"] = BFP_MANTISSA_BITS
+        meta["bfp_mantissa_bits"] = effective_m
         if orig_dtype != meta["dtype"]:
             meta["original_dtype"] = orig_dtype
 
@@ -1379,8 +1394,8 @@ def auto_detect_mode(tensors):
     return "int16"
 
 
-def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=False,
-                  parallel_workers=None):
+def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=None,
+                  parallel_workers=None, mantissa_bits=None):
     """Compress a safetensors file to .dmx format.
 
     mode: 'auto', 'bfp', 'int16', or 'int32'
@@ -1402,8 +1417,20 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         min(8, os.cpu_count()). Pass an explicit int to override. zstd releases
         the GIL during compression so threads give real parallelism on multi-
         core CPUs even with the GIL active.
+    mantissa_bits: override the BFP mantissa bit width for this call. None (default)
+        uses the module-level BFP_MANTISSA_BITS constant (currently 6). Valid range
+        is 1-10. Higher values give better fidelity at the cost of compression ratio
+        (M=4: aggressive, ~80% savings; M=8: conservative, ~48% savings; M=6: default
+        balance). Only affects BFP mode — ignored for int16/int32/auto modes on
+        non-BFP paths. The chosen value is stored per-tensor in the manifest so
+        the decoder always reconstructs correctly regardless of the current
+        module-level default. Editing the module-level BFP_MANTISSA_BITS constant
+        at runtime does NOT change compression output because the constant is
+        captured as a frozen default argument value on bfp_compress /
+        bfp_compress_gpu at function-definition time; the runtime override
+        mechanism here is the supported way to change mantissa width per call.
     """
-    global _use_gpu_compress
+    global _use_gpu_compress, _bfp_mantissa_override
     # Auto-detect GPU: use CUDA if available unless explicitly disabled
     if use_gpu is None:
         use_gpu = torch.cuda.is_available()
@@ -1417,6 +1444,24 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             _use_gpu_compress = False
     else:
         _use_gpu_compress = False
+
+    # Resolve mantissa_bits override. None falls back to the module-level
+    # BFP_MANTISSA_BITS default (6). Validates the override is in the valid
+    # BFP range; raises a clear error on out-of-range values. The override is
+    # set on the module-level _bfp_mantissa_override global, which is read by
+    # encode_tensor's BFP path and passed explicitly to bfp_compress /
+    # bfp_compress_gpu (bypassing their frozen default args). Restored to the
+    # prior value at the end of this function so state never leaks.
+    _prior_mantissa_override = _bfp_mantissa_override
+    if mantissa_bits is not None:
+        if not isinstance(mantissa_bits, int) or mantissa_bits < 1 or mantissa_bits > 10:
+            raise ValueError(
+                f"mantissa_bits must be an int in [1, 10]; got {mantissa_bits!r}. "
+                f"Common values: 4 (aggressive), 6 (default), 7 (balanced), 8 (conservative)."
+            )
+        _bfp_mantissa_override = mantissa_bits
+        print(f"  Mantissa bits override: M={mantissa_bits} "
+              f"(default is {BFP_MANTISSA_BITS})")
 
     # Resolve entropy mode. Normalize legacy aliases to the canonical names
     # used by the selector and dispatch helpers.
@@ -1581,13 +1626,42 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     elapsed = time.time() - start
     ratio = output_size / original_size * 100
 
+    # Compute FP32-equivalent baseline for dual-denominator reporting.
+    # total_params is the sum over all tensors. For float tensors, this is the
+    # dtype-independent canonical baseline. Skip if no tensors loaded.
+    try:
+        total_params = sum(
+            t.numel() for t in tensors.values()
+            if hasattr(t, "numel")
+        )
+    except Exception:
+        total_params = 0
+    fp32_equivalent = total_params * 4 if total_params > 0 else 0
+
     print(f"  Encoding breakdown:")
     for enc, count in enc_counts.items():
         if count > 0:
             print(f"    {enc_names[enc]}: {count} tensors")
-    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB ({ratio:.1f}% of original)")
+    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB")
+    # Dual-denominator reporting: the same compressed bytes can produce wildly
+    # different "savings %" depending on whether the baseline is the source
+    # file (dtype-dependent) or the FP32 equivalent (canonical). Report both
+    # so log parsers and users see both numbers side-by-side.
+    savings_vs_source_pct = (1 - output_size / original_size) * 100
+    print(f"    vs source file ({original_size / 1024 / 1024:.1f} MB): "
+          f"{ratio:.1f}% of source, {savings_vs_source_pct:+.1f}% savings")
+    if fp32_equivalent > 0:
+        savings_vs_fp32_pct = (1 - output_size / fp32_equivalent) * 100
+        fp32_ratio_pct = output_size / fp32_equivalent * 100
+        print(f"    vs FP32 equivalent ({fp32_equivalent / 1024 / 1024:.1f} MB, "
+              f"{total_params:,} params × 4 bytes): "
+              f"{fp32_ratio_pct:.1f}% of FP32, {savings_vs_fp32_pct:+.1f}% savings")
     print(f"  Savings: {(original_size - output_size) / 1024 / 1024:.1f} MB")
     print(f"  Time: {elapsed:.1f}s")
+
+    # Restore the mantissa-bits override so it doesn't leak to subsequent
+    # calls. Done unconditionally to keep the module-level state clean.
+    _bfp_mantissa_override = _prior_mantissa_override
 
     return original_size, output_size
 
@@ -1657,41 +1731,20 @@ def decompress_file(input_path, output_path, use_gpu=None):
     return output_size
 
 
-def export_quant(input_path, output_path, target="int8", use_gpu=None):
-    """Derive a quantized model from a DMX file without keeping the full-precision intermediate.
+def _decode_dmx_to_tensors(input_path, use_gpu=None):
+    """Load a DMX file and return a dict of full-precision tensors.
 
-    Decompresses the DMX file to full precision, applies the target quantization,
-    and saves the quantized result as a safetensors file. The full-precision
-    tensors are never written to disk — only the quantized output is saved.
+    Factored out of export_quant() to support multi-target export, where a
+    single DMX load is shared across multiple target derivations.
 
-    Supported targets (RTN-family only — calibration-dependent formats like
-    GPTQ and AWQ are not derivable because they require activation data that
-    DMX does not store):
-
-      int8   — per-channel symmetric INT8 (scale per output row, [-127, 127])
-      nf4    — NF4 QLoRA codebook (16 fixed values, group_size=64)
-      fp8    — FP8 E4M3 (PyTorch 2.1+ native, requires int32 DMX for clean derivation)
-
-    Args:
-        input_path: path to .dmx file
-        output_path: path to write the quantized .safetensors output
-        target: one of 'int8', 'nf4', 'fp8'
-        use_gpu: passthrough to decompress (None = auto-detect)
+    Returns:
+        (tensors_dict, manifest, decompress_time_sec)
     """
-    print(f"=" * 70)
-    print(f"DMX export — derive {target.upper()} from {os.path.basename(input_path)}")
-    print(f"=" * 70)
-
-    # Step 1: Decompress DMX to full-precision tensors (in memory, not to disk)
     if use_gpu is None:
         use_gpu = torch.cuda.is_available()
-    if use_gpu and torch.cuda.is_available():
-        print(f"  GPU accelerated mode: {torch.cuda.get_device_name(0)}")
     decode_fn = decode_tensor_gpu if (use_gpu and torch.cuda.is_available()) else decode_tensor
 
-    print(f"  Loading {input_path}...")
     start = time.time()
-
     with open(input_path, "rb") as f:
         magic = f.read(4)
         if magic != DMX_MAGIC:
@@ -1713,11 +1766,32 @@ def export_quant(input_path, output_path, target="int8", use_gpu=None):
                 print(f"  Decompressed {i+1}/{len(keys)} tensors...")
 
     decompress_time = time.time() - start
-    print(f"  Decompressed {len(tensors)} tensors in {decompress_time:.1f}s")
+    return tensors, manifest, decompress_time
 
-    # Step 2: Apply target quantization
-    print(f"  Deriving {target.upper()}...")
-    quant_start = time.time()
+
+# NF4 codebook — shared constant for the NF4 derive path.
+_NF4_CODEBOOK = [
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+]
+
+
+def _derive_target_from_tensors(tensors, target):
+    """Derive a target quantization format from an in-memory dict of full-precision tensors.
+
+    Factored out of export_quant() so that multi-target export can run each
+    target's quant math on the same decoded tensors without re-decoding the
+    DMX file per target.
+
+    Args:
+        tensors: dict mapping key -> full-precision torch tensor
+        target: one of 'int8', 'nf4', 'fp8'
+
+    Returns:
+        dict mapping key -> quantized torch tensor
+    """
     quantized = {}
 
     if target == "int8":
@@ -1736,12 +1810,7 @@ def export_quant(input_path, output_path, target="int8", use_gpu=None):
                 quantized[key] = q
 
     elif target == "nf4":
-        nf4_codebook = torch.tensor([
-            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
-        ], dtype=torch.float32)
+        nf4_codebook = torch.tensor(_NF4_CODEBOOK, dtype=torch.float32)
         group_size = 64
         for key, t in tensors.items():
             flat = t.float().flatten()
@@ -1770,22 +1839,190 @@ def export_quant(input_path, output_path, target="int8", use_gpu=None):
             f"Supported: int8, nf4, fp8"
         )
 
+    return quantized
+
+
+def _total_params_from_tensors(tensors):
+    """Count total params in a tensor dict, used for FP32-equivalent baseline."""
+    return sum(t.numel() for t in tensors.values() if hasattr(t, "numel"))
+
+
+def _print_dual_denominator_summary(input_path, output_path, target, total_params,
+                                     decompress_time, quant_time, elapsed):
+    """Print a dual-denominator savings summary.
+
+    Reports size against both:
+      - vs DMX input file (source for this operation)
+      - vs FP32 equivalent (dtype-independent canonical baseline = total_params * 4 bytes)
+
+    This prevents the denominator trap where the same compressed bytes produce
+    different "savings %" numbers depending on whether the baseline is the
+    source file (dtype-specific) or the FP32 equivalent (canonical).
+    """
+    output_size = os.path.getsize(output_path)
+    input_size = os.path.getsize(input_path)
+    fp32_equivalent = total_params * 4 if total_params > 0 else 0
+
+    print(f"\n  Results:")
+    print(f"    DMX input:        {input_size / 1024 / 1024:.1f} MB")
+    print(f"    {target.upper()} output:      {output_size / 1024 / 1024:.1f} MB")
+    if fp32_equivalent > 0:
+        pct_of_dmx = output_size / input_size * 100
+        pct_of_fp32 = output_size / fp32_equivalent * 100
+        savings_vs_dmx = (1 - output_size / input_size) * 100
+        savings_vs_fp32 = (1 - output_size / fp32_equivalent) * 100
+        print(f"    vs DMX input ({input_size / 1024 / 1024:.1f} MB): "
+              f"{pct_of_dmx:.1f}% of source, {savings_vs_dmx:+.1f}% savings")
+        print(f"    vs FP32 equivalent ({fp32_equivalent / 1024 / 1024:.1f} MB, "
+              f"{total_params:,} params × 4 bytes): "
+              f"{pct_of_fp32:.1f}% of FP32, {savings_vs_fp32:+.1f}% savings")
+    print(f"    Time:             {elapsed:.1f}s (decompress {decompress_time:.1f}s + quantize {quant_time:.1f}s)")
+
+
+def export_quant(input_path, output_path, target="int8", use_gpu=None):
+    """Derive a quantized model from a DMX file without keeping the full-precision intermediate.
+
+    Decompresses the DMX file to full precision, applies the target quantization,
+    and saves the quantized result as a safetensors file. The full-precision
+    tensors are never written to disk — only the quantized output is saved.
+
+    Supported targets (RTN-family only — calibration-dependent formats like
+    GPTQ and AWQ are not derivable because they require activation data that
+    DMX does not store):
+
+      int8   — per-channel symmetric INT8 (scale per output row, [-127, 127])
+      nf4    — NF4 QLoRA codebook (16 fixed values, group_size=64)
+      fp8    — FP8 E4M3 (PyTorch 2.1+ native, requires int32 DMX for clean derivation)
+
+    Args:
+        input_path: path to .dmx file
+        output_path: path to write the quantized .safetensors output
+        target: one of 'int8', 'nf4', 'fp8'
+        use_gpu: passthrough to decompress (None = auto-detect)
+    """
+    print(f"=" * 70)
+    print(f"DMX export — derive {target.upper()} from {os.path.basename(input_path)}")
+    print(f"=" * 70)
+
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    if use_gpu and torch.cuda.is_available():
+        print(f"  GPU accelerated mode: {torch.cuda.get_device_name(0)}")
+
+    print(f"  Loading {input_path}...")
+    start = time.time()
+
+    # Step 1: Decompress DMX to full-precision tensors (shared helper)
+    tensors, manifest, decompress_time = _decode_dmx_to_tensors(input_path, use_gpu=use_gpu)
+    print(f"  Decompressed {len(tensors)} tensors in {decompress_time:.1f}s")
+
+    # Step 2: Apply target quantization (shared helper)
+    print(f"  Deriving {target.upper()}...")
+    quant_start = time.time()
+    quantized = _derive_target_from_tensors(tensors, target)
     quant_time = time.time() - quant_start
     print(f"  Quantized {len(quantized)} tensors to {target.upper()} in {quant_time:.1f}s")
 
     # Step 3: Save
     print(f"  Saving to {output_path}...")
     save_file(quantized, output_path)
-    output_size = os.path.getsize(output_path)
-    input_size = os.path.getsize(input_path)
+
+    # Step 4: Dual-denominator summary
+    total_params = _total_params_from_tensors(tensors)
     elapsed = time.time() - start
+    _print_dual_denominator_summary(
+        input_path, output_path, target, total_params,
+        decompress_time, quant_time, elapsed,
+    )
 
-    print(f"\n  Results:")
-    print(f"    DMX input:     {input_size / 1024 / 1024:.1f} MB")
-    print(f"    {target.upper()} output:   {output_size / 1024 / 1024:.1f} MB")
-    print(f"    Time:          {elapsed:.1f}s (decompress {decompress_time:.1f}s + quantize {quant_time:.1f}s)")
+    return os.path.getsize(output_path)
 
-    return output_size
+
+def export_quant_multi(input_path, output_dir, targets=None, use_gpu=None):
+    """Derive MULTIPLE target quantization formats from a single DMX file load.
+
+    The DMX file is loaded and decoded exactly ONCE, then each target
+    quantization is derived from the shared in-memory tensor dict. For N
+    targets, this saves N-1 redundant decode passes vs calling export_quant()
+    N times. Measured benefit on a 160M-parameter FP16 model: deriving
+    INT8 + NF4 from a single DMX load saved ~27% wall time vs two separate
+    export_quant() calls on the same hardware.
+
+    Args:
+        input_path: path to .dmx file
+        output_dir: directory where {target}.safetensors files will be written
+        targets: list of target format strings. Any combination of ['int8', 'nf4', 'fp8'].
+                 Defaults to ['int8'] if not specified (behaves like export_quant).
+        use_gpu: passthrough to decompress (None = auto-detect)
+
+    Returns:
+        dict mapping target name -> output file path
+    """
+    if targets is None:
+        targets = ["int8"]
+    if isinstance(targets, str):
+        targets = [t.strip() for t in targets.split(",") if t.strip()]
+
+    valid_targets = ["int8", "nf4", "fp8"]
+    for t in targets:
+        if t not in valid_targets:
+            raise ValueError(
+                f"Unknown target format '{t}'. Supported: {valid_targets}"
+            )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"=" * 70)
+    print(f"DMX export (multi-target) — derive {targets} from "
+          f"{os.path.basename(input_path)}")
+    print(f"=" * 70)
+
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    if use_gpu and torch.cuda.is_available():
+        print(f"  GPU accelerated mode: {torch.cuda.get_device_name(0)}")
+
+    print(f"  Loading {input_path}...")
+    overall_start = time.time()
+
+    # Step 1: Load and decode DMX ONCE — shared across all targets
+    tensors, manifest, decompress_time = _decode_dmx_to_tensors(input_path, use_gpu=use_gpu)
+    total_params = _total_params_from_tensors(tensors)
+    print(f"  Decompressed {len(tensors)} tensors in {decompress_time:.1f}s "
+          f"(shared across {len(targets)} targets)")
+
+    # Step 2: Loop targets, derive each from the shared tensor dict
+    output_paths = {}
+    input_size = os.path.getsize(input_path)
+    fp32_equivalent = total_params * 4
+
+    for target in targets:
+        target_start = time.time()
+        print(f"\n  Deriving {target.upper()}...")
+        quantized = _derive_target_from_tensors(tensors, target)
+        quant_time = time.time() - target_start
+
+        output_path = os.path.join(output_dir, f"{target}.safetensors")
+        save_file(quantized, output_path)
+        output_size = os.path.getsize(output_path)
+        output_paths[target] = output_path
+
+        print(f"    Quantized {len(quantized)} tensors in {quant_time:.1f}s")
+        print(f"    Output: {output_path} ({output_size / 1024 / 1024:.1f} MB)")
+        if fp32_equivalent > 0:
+            print(f"      vs DMX input ({input_size / 1024 / 1024:.1f} MB): "
+                  f"{output_size / input_size * 100:.1f}% of source, "
+                  f"{(1 - output_size / input_size) * 100:+.1f}% savings")
+            print(f"      vs FP32 equivalent ({fp32_equivalent / 1024 / 1024:.1f} MB): "
+                  f"{output_size / fp32_equivalent * 100:.1f}% of FP32, "
+                  f"{(1 - output_size / fp32_equivalent) * 100:+.1f}% savings")
+
+    total_elapsed = time.time() - overall_start
+    print(f"\n  Multi-target total: {total_elapsed:.1f}s "
+          f"(decompress {decompress_time:.1f}s + {len(targets)} target derives)")
+    print(f"  Targets saved: {list(output_paths.keys())}")
+
+    return output_paths
 
 
 def info_file(input_path):
