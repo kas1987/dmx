@@ -15,6 +15,7 @@ tests/
 
 # Local working directory
 .archived/
+.pipeline_local/
 
 # Python
 __pycache__/
