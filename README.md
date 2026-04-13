@@ -8,7 +8,7 @@ DMX transforms weight tensors into aligned integer representations, enabling eff
 
 ---
 
-**Contents:** [What is DMX?](#what-is-dmx) · [How It Works](#how-it-works) · [Installation](#installation) · [Quick Start](#quick-start) · [Delta Compression](#delta-compression-checkpoint--model-versioning) · [Chain Compression](#chain-compression-training-run-checkpoints-every-n-step-cadences) · [Quantized Export](#quantized-export-derive-int8--nf4--fp8-on-demand) · [Benchmarks](#benchmarks) · [Why DMX Matters](#why-dmx-matters-for-training) · [Validated Results](#validated-results-checkpoint-delta-compression) · [Research](#research-directions) · [License & Patent](#license--patent)
+**Contents:** [What is DMX?](#what-is-dmx) · [How It Works](#how-it-works) · [Installation](#installation) · [Quick Start](#quick-start) · [Delta Compression](#delta-compression-checkpoint--model-versioning) · [Chain Compression](#chain-compression-training-run-checkpoints-every-n-step-cadences) · [Quantized Export](#quantized-export-derive-int8--nf4--fp8-on-demand) · [Browser Decoder & 3DGS](#browser-decoder-and-3dgs-support) · [Benchmarks](#benchmarks) · [Why DMX Matters](#why-dmx-matters-for-training) · [Validated Results](#validated-results-checkpoint-delta-compression) · [Research](#research-directions) · [License & Patent](#license--patent)
 
 ---
 
