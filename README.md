@@ -261,6 +261,10 @@ dmx compress ./wan_model/model.safetensors wan_compressed.dmx
 dmx verify ./wan_model/model.safetensors wan_compressed.dmx --report report.json
 ```
 
+### Browser decoder and 3DGS support
+
+[dmx-web](https://github.com/willjriley/dmx-web) — Rust/WASM decoder for browser-based decompression. Includes a real-time 3D Gaussian Splatting viewer. DMX compresses 3DGS scenes at 60%+ savings with roundtrip-verified visual fidelity (PSNR 48-53 dB, SSIM 0.9997+).
+
 ---
 
 ## Benchmarks
