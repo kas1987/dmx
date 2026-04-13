@@ -992,7 +992,11 @@ def encode_tensor(tensor, encoding, entropy_mode=None):
             raw = quantized.numpy().tobytes()
             del src
         else:
-            flat = t.flatten().float()
+            # Use float64 on CPU — float32 only has 24-bit mantissa (~16M levels)
+            # which is less precise than INT32's 2B levels. float64's 53-bit mantissa
+            # makes INT32 quantization the actual precision bottleneck, not the arithmetic.
+            # GPU path stays float32 because A100 fp64 is 1/32 throughput.
+            flat = t.flatten().double()
             scale = flat.abs().max().item()
             if scale == 0:
                 scale = 1.0
