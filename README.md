@@ -65,6 +65,7 @@ DMX also supports delta-based model storage with deterministic reconstruction an
 | Full checkpoint w/ optimizer (79%) | GPT-2 1000-step, weights + momentum + variance |
 | Zero chain accumulation error | Exact integer arithmetic, 10K steps / 50 resumes |
 | Fine-tune variant distribution (80%) | [Qwen 2.5 3B delta on HuggingFace](https://huggingface.co/Senat1/dmx-qwen2.5-3b-instruct-delta) |
+| Browser decoder + 3DGS viewer | [dmx-web](https://github.com/willjriley/dmx-web) — WASM decoder, real-time 3DGS rendering |
 
 ## How It Works
 
