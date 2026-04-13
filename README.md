@@ -23,8 +23,8 @@ DMX:       1.5 GB  (142/142 tensors verified)
 ```
 
 ```
-Original:  16 GB   (Llama 3 8B, FP16 — 55% pure FP16 compression)
-DMX:       ~7.2 GB (+0.16% perplexity on wikitext-2)
+Original:  16 GB   (Llama 3.1 8B, BF16 — 53% pure BF16 compression)
+DMX:       ~7.5 GB (+0.70% perplexity on wikitext-2)
 ```
 
 ### Try it now
@@ -46,7 +46,7 @@ dmx compress your_model.safetensors compressed.dmx
 
 ## What is DMX?
 
-DMX is a structure-aware compression system for neural networks. It reduces model file sizes by 55-80% while preserving quality (+0.03-0.16% perplexity), with reversible decompression back to the original format.
+DMX is a structure-aware compression system for neural networks. It reduces model file sizes by 55-80% while preserving quality (+0.03-0.70% perplexity), with reversible decompression back to the original format.
 
 DMX also supports delta-based model storage with deterministic reconstruction and ROI-driven adaptive rebasing — enabling efficient versioning across model families.
 
@@ -89,6 +89,20 @@ Integer quantization as a preprocessing step (not a lossy final format) transfor
 DMX automatically picks the best compression for each tensor in your model — you don't choose a compressor, DMX does, per tensor, every time. Each tensor gets the strongest compression the candidate set can deliver, capturing the maximum benefit available without any manual tuning.
 
 Actual savings depend on model architecture, source precision (FP16 / BF16 / FP32), and the quantization mode you select. Across the model families we have measured, savings typically fall in the 50–80% range vs the original safetensors file, with no manual tuning required.
+
+### Precision: below the FP32 arithmetic noise floor
+
+DMX INT32 mode roundtrip error falls **below the noise floor of FP32 arithmetic itself.** A single FP32 matrix multiply introduces more error than a full DMX compress → decompress cycle.
+
+| Measurement | RelL2 |
+|-------------|-------|
+| FP32 matmul noise floor (1000 samples, dim=768) | ~1.5–1.8e-07 |
+| DMX INT32 roundtrip (GPU path, real GPT-2 weights) | ~4.1e-08 |
+| DMX INT32 roundtrip (CPU float64 path) | ~1.1e-10 |
+
+On GPU: **~4.5x below** the FP32 noise floor. On CPU with float64 arithmetic: **~1,300x below.**
+
+This means DMX does not degrade the model — it stores weights more faithfully than FP32 represents them during computation. See [`benchmarks/dmx_noise_floor_benchmark.py`](benchmarks/dmx_noise_floor_benchmark.py) to reproduce.
 
 ### Why DMX beats generic compression
 
@@ -278,7 +292,7 @@ If lossless is enough, use DFloat11 or ZipNN. If you need to run inference at lo
 
 | Model | Type | Original | DMX | Savings | Quality |
 |-------|------|----------|-----|---------|---------|
-| Llama 3 8B | LLM | 16 GB | ~7.2 GB | **55%** | **+0.16% PPL** (wikitext-2) |
+| Llama 3.1 8B | LLM | 16 GB | ~7.5 GB | **53%** | **+0.70% PPL** (wikitext-2) |
 | Wan 2.2 shard | Video | 7.2 GB | 1.5 GB | **79.5%** | 142/142 tensors pass |
 | Wan 1.3B | Diffusion | 2.7 GB | 1.1 GB | **60%** | 825/825 tensors pass |
 | SVD-XT | Video | 9.1 GB | 1.8 GB | **80%** | Verified roundtrip |
