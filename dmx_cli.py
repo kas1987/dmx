@@ -29,6 +29,8 @@ import tempfile
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -1790,6 +1792,226 @@ def _decode_dmx_to_tensors(input_path, use_gpu=None):
 
     decompress_time = time.time() - start
     return tensors, manifest, decompress_time
+
+
+@dataclass
+class BFPPayload:
+    """Compressed-residency form of a BFP tensor.
+
+    Holds the raw exponent + packed-sign-mantissa streams produced by the
+    BFP encoder, without reconstructing an FP16/FP32 view. This is the
+    Sprint B entry point that lets BFPLinear keep weights resident in VRAM
+    in their compressed form and dequantize per-tile on demand.
+
+    Attributes
+    ----------
+    exponents : torch.Tensor
+        Shared per-block exponents. dtype=uint8, shape=[n_blocks].
+        (FP16 exponents are 5 bits so uint8 is the natural container; the
+        field is named `exponents` but stored as uint8, matching the
+        on-disk format. The `int8` name in the public docstring refers to
+        the 8-bit width, not signedness.)
+    packed_mantissa : torch.Tensor
+        Packed per-element sign+mantissa byte. dtype=uint8, shape=[n_elements]
+        including pad. Each byte is `(sign << mantissa_bits) | truncated_mantissa`.
+    shape : tuple[int, ...]
+        Original tensor logical shape.
+    dtype : torch.dtype
+        Original dtype (e.g. torch.float16 for Qwen weights).
+    group_size : int
+        Block size used during BFP encoding (typically 32).
+    mantissa_bits : int
+        Mantissa bit width (typically 6 or 7).
+    pad_len : int
+        Number of padding elements appended to reach a multiple of
+        group_size. Needed to trim after dequant.
+    orig_len : int
+        Original flat element count (pre-pad). Needed to trim after dequant.
+    scale : float | None
+        Reserved; None for pure BFP path. Populated only when BFP was
+        preceded by an affine scale (INT16Q hybrid, not a Sprint B target).
+    """
+    exponents: "torch.Tensor"
+    packed_mantissa: "torch.Tensor"
+    shape: tuple
+    dtype: "torch.dtype"
+    group_size: int
+    mantissa_bits: int
+    pad_len: int = 0
+    orig_len: int = 0
+    scale: Optional[float] = None
+
+
+_DTYPE_STR_TO_TORCH = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float64": torch.float64,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+
+
+def _decode_bfp_streams_only(compressed_bytes, meta):
+    """Unwrap the entropy coder(s) around a BFP tensor and return
+    (exp_stream_np_uint8, sign_mant_stream_np_uint8).
+
+    This is the first half of decode_tensor's BFP branch — everything up to
+    but not including the call to bfp_decompress. Extracted so the partial
+    decoder can stop here. The full decoder still uses its inline version
+    (byte-for-byte identical to the original implementation); this helper
+    is only consumed by _decode_dmx_to_bfp_payloads.
+    """
+    use_lpc = _is_lpc_encoding(meta["encoding"])
+
+    exp_comp_len = struct.unpack("<I", compressed_bytes[:4])[0]
+    exp_compressed = compressed_bytes[4:4 + exp_comp_len]
+    mant_data = compressed_bytes[4 + exp_comp_len:]
+
+    dctx = zstd.ZstdDecompressor()
+    exp_stream = np.frombuffer(
+        dctx.decompress(exp_compressed, max_output_size=meta["bfp_exp_size"]),
+        dtype=np.uint8,
+    ).copy()
+
+    bfp_mant_codec = meta.get("bfp_mant_codec")
+    if bfp_mant_codec is not None:
+        bfp_mant_codec_meta = {}
+        if "bfp_mant_orig_len" in meta:
+            bfp_mant_codec_meta["uint8_orig_len"] = meta["bfp_mant_orig_len"]
+        mant_raw = _decompress_uint8_dispatch(
+            mant_data, bfp_mant_codec, bfp_mant_codec_meta
+        )
+        sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
+    elif use_lpc:
+        mant_orig_len = meta["bfp_mant_orig_len"]
+        mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
+        sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
+    else:
+        sign_mant_stream = np.frombuffer(
+            dctx.decompress(mant_data, max_output_size=meta["bfp_mant_size"]),
+            dtype=np.uint8,
+        ).copy()
+
+    return exp_stream, sign_mant_stream
+
+
+def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
+    """Partial-decode variant of _decode_dmx_to_tensors.
+
+    For BFP-coded tensors (encoding ENC_BFP_ZSTD=4 or ENC_BFP_LPC=14):
+    returns a :class:`BFPPayload` containing the exponent tensor, packed
+    sign+mantissa tensor, and shape / dtype / group-size metadata — WITHOUT
+    reconstructing fp32/fp16.
+
+    For all other encodings (FP16, INT16Q, INT32Q, DELTA, RAW): falls back
+    to the full ``decode_tensor``/``decode_tensor_gpu`` path and returns
+    the same torch.Tensor that :func:`_decode_dmx_to_tensors` would produce.
+    Callers that care about Sprint B compressed residency should inspect
+    each value's type (BFPPayload vs torch.Tensor) to decide whether to
+    keep compressed or inflate.
+
+    GPU path decision: B1 returns BFPPayloads with CPU-resident
+    exponents/mantissas. Sprint B's matmul / materialize path copies to
+    GPU itself. This keeps the partial decoder cheap and side-effect-free
+    and lets callers control device placement. Non-BFP tensors still use
+    ``decode_tensor_gpu`` when ``use_gpu=True``, matching the full
+    decoder's behaviour.
+
+    Returns
+    -------
+    (payloads_dict, manifest, elapsed_seconds)
+        payloads_dict: dict[str, Union[BFPPayload, torch.Tensor]]
+    """
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    decode_fn = decode_tensor_gpu if (use_gpu and torch.cuda.is_available()) else decode_tensor
+
+    start = time.time()
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            raise ValueError(f"Not a DMX file (magic: {magic})")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version > DMX_VERSION:
+            raise ValueError(f"Unsupported DMX version: {version}")
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_size))
+
+        payloads = {}
+        keys = sorted(manifest["tensors"].keys())
+        for i, key in enumerate(keys):
+            meta = manifest["tensors"][key]
+            f.seek(meta["offset"])
+            compressed = f.read(meta["compressed_size"])
+
+            base_enc = _base_encoding(meta["encoding"])
+            if base_enc == ENC_BFP_ZSTD:
+                # Partial decode: unwrap entropy coder once, stop before
+                # bfp_decompress. No FP32/FP16 transient materialized.
+                exp_stream_np, sign_mant_stream_np = _decode_bfp_streams_only(
+                    compressed, meta
+                )
+                exponents = torch.from_numpy(exp_stream_np)  # uint8
+                packed_mantissa = torch.from_numpy(sign_mant_stream_np)  # uint8
+
+                original_dtype_str = meta.get("original_dtype", meta["dtype"])
+                torch_dtype = _DTYPE_STR_TO_TORCH.get(
+                    original_dtype_str, torch.float16
+                )
+
+                payloads[key] = BFPPayload(
+                    exponents=exponents,
+                    packed_mantissa=packed_mantissa,
+                    shape=tuple(meta["shape"]),
+                    dtype=torch_dtype,
+                    group_size=meta.get("bfp_group_size", BFP_GROUP_SIZE),
+                    mantissa_bits=meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
+                    pad_len=meta["bfp_pad_len"],
+                    orig_len=meta["bfp_orig_len"],
+                    scale=None,
+                )
+            else:
+                # Non-BFP: delegate to the existing full decoder. No
+                # duplication of FP16/INT16/INT32/DELTA/RAW logic.
+                payloads[key] = decode_fn(compressed, meta)
+
+            if (i + 1) % 500 == 0 or (i + 1) == len(keys):
+                print(f"  Partial-decoded {i+1}/{len(keys)} tensors...")
+
+    elapsed = time.time() - start
+    return payloads, manifest, elapsed
+
+
+def bfp_payload_to_tensor(payload: "BFPPayload") -> "torch.Tensor":
+    """Reconstruct a full-precision torch.Tensor from a :class:`BFPPayload`.
+
+    Thin wrapper around :func:`bfp_decompress` that takes a BFPPayload
+    instead of loose streams. Produces bit-for-bit the same tensor that
+    the full decoder would have produced for the same BFP-encoded tensor.
+    Provided for callers that want to inflate a single payload on demand
+    (e.g. Sprint B's BFPTensor.materialize()) without rewriting the
+    dequant math.
+    """
+    dtype_str = {
+        torch.float16: "float16",
+        torch.float32: "float32",
+        torch.bfloat16: "bfloat16",
+    }.get(payload.dtype, "float16")
+    exp_np = payload.exponents.numpy() if payload.exponents.device.type == "cpu" \
+        else payload.exponents.cpu().numpy()
+    mant_np = payload.packed_mantissa.numpy() if payload.packed_mantissa.device.type == "cpu" \
+        else payload.packed_mantissa.cpu().numpy()
+    return bfp_decompress(
+        exp_np, mant_np,
+        payload.pad_len, payload.orig_len,
+        payload.shape, dtype_str,
+        payload.group_size, payload.mantissa_bits,
+    )
 
 
 # NF4 codebook — shared constant for the NF4 derive path.
