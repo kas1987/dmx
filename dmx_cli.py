@@ -85,6 +85,18 @@ ENC_INT32_QUANT_LPC = 15 # FP32 -> int32 aligned quantization + FLAC (practicall
 # Module-level flag for GPU compression (set by CLI --gpu)
 _use_gpu_compress = False
 
+# Tensor name patterns that should be stored as FP16 when --fast-load is set.
+# These cover HuggingFace naming conventions for embeddings and language model
+# heads across Llama, Qwen, GPT-2, Phi, Mistral families.
+FAST_LOAD_PATTERNS = ("embed_tokens", "lm_head", "wte", "wpe", "word_embeddings",
+                      "embed_in", "embed_out")
+
+# Module-level flag for fast-load mode (set by compress_file(fast_load=True)).
+# When True, tensors matching FAST_LOAD_PATTERNS are stored as FP16+entropy
+# instead of BFP, so compressed-residency loads skip the materialize step.
+# Restored to False at the end of each compress_file() call so state never leaks.
+_fast_load_override = False
+
 # Module-level override for BFP mantissa bits during compress_file() calls.
 # None means "use the default BFP_MANTISSA_BITS constant." When set by
 # compress_file(mantissa_bits=N), it is read by the BFP encode path in
@@ -1439,8 +1451,18 @@ def auto_detect_mode(tensors):
     return "int16"
 
 
+def _is_fast_load_tensor(name):
+    """Return True if this tensor name matches FAST_LOAD_PATTERNS.
+
+    Used by --fast-load to identify embed_tokens, lm_head, and other
+    embedding/head tensors that should be stored as FP16 instead of BFP
+    so compressed-residency loads skip the materialize step.
+    """
+    return any(pat in name for pat in FAST_LOAD_PATTERNS)
+
+
 def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=None,
-                  parallel_workers=None, mantissa_bits=None):
+                  parallel_workers=None, mantissa_bits=None, fast_load=False):
     """Compress a safetensors file to .dmx format.
 
     mode: 'auto', 'bfp', 'int16', or 'int32'
@@ -1475,7 +1497,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         bfp_compress_gpu at function-definition time; the runtime override
         mechanism here is the supported way to change mantissa width per call.
     """
-    global _use_gpu_compress, _bfp_mantissa_override
+    global _use_gpu_compress, _bfp_mantissa_override, _fast_load_override
     # Auto-detect GPU: use CUDA if available unless explicitly disabled
     if use_gpu is None:
         use_gpu = torch.cuda.is_available()
@@ -1507,6 +1529,13 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         _bfp_mantissa_override = mantissa_bits
         print(f"  Mantissa bits override: M={mantissa_bits} "
               f"(default is {BFP_MANTISSA_BITS})")
+
+    # Resolve fast_load override. When True, tensors matching FAST_LOAD_PATTERNS
+    # are stored as FP16+entropy instead of BFP, enabling instant loading for
+    # compressed residency (no materialize step needed).
+    _fast_load_override = bool(fast_load)
+    if _fast_load_override:
+        print(f"  Fast-load mode: embed/head tensors stored as FP16 (patterns: {FAST_LOAD_PATTERNS})")
 
     # Resolve entropy mode. Normalize legacy aliases to the canonical names
     # used by the selector and dispatch helpers.
@@ -1594,7 +1623,13 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             # the entropy coder is decided per tensor inside encode_tensor
             # via entropy_mode, and recorded in meta["entropy_codec"].
             encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
+            # --fast-load override: store embed/head tensors as FP16+entropy
+            is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
+            if is_fast_load:
+                encoding = ENC_FP16_ZSTD
             compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
+            if is_fast_load:
+                meta["fast_load"] = True
             return key, encoding, compressed, meta
 
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
@@ -1611,9 +1646,15 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         for i, key in enumerate(keys):
             tensor = tensors[key]
             encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
+            # --fast-load override: store embed/head tensors as FP16+entropy
+            is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
+            if is_fast_load:
+                encoding = ENC_FP16_ZSTD
             enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
 
             compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
+            if is_fast_load:
+                meta["fast_load"] = True
             manifest["tensors"][key] = meta
             compressed_chunks[key] = compressed
 
@@ -1704,9 +1745,10 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     print(f"  Savings: {(original_size - output_size) / 1024 / 1024:.1f} MB")
     print(f"  Time: {elapsed:.1f}s")
 
-    # Restore the mantissa-bits override so it doesn't leak to subsequent
-    # calls. Done unconditionally to keep the module-level state clean.
+    # Restore the mantissa-bits and fast-load overrides so they don't leak to
+    # subsequent calls. Done unconditionally to keep the module-level state clean.
     _bfp_mantissa_override = _prior_mantissa_override
+    _fast_load_override = False
 
     return original_size, output_size
 
@@ -3988,6 +4030,10 @@ def main():
                                  "8 (conservative, highest fidelity). Default uses the shipping "
                                  "constant (6). The chosen value is stored per-tensor in the "
                                  "manifest so decoders always reconstruct correctly.")
+    p_compress.add_argument("--fast-load", action="store_true", default=False,
+                            help="Store embedding and output-head tensors as FP16 instead of BFP. "
+                                 "~13%% larger file but enables instant loading for compressed "
+                                 "residency (no materialize step). Recommended for interactive use.")
 
     p_decompress = sub.add_parser("decompress", help="Decompress .dmx to safetensors")
     p_decompress.add_argument("input", help="Input .dmx file")
@@ -4120,7 +4166,8 @@ def main():
         compress_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
                       use_gpu=args.gpu if args.gpu else None,
                       parallel_workers=args.parallel_workers,
-                      mantissa_bits=args.mantissa_bits)
+                      mantissa_bits=args.mantissa_bits,
+                      fast_load=args.fast_load)
         if args.report:
             print()
             print("=== Auto-verify after compression ===")
