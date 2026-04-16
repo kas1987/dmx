@@ -97,17 +97,37 @@ _bfp_mantissa_override = None
 _dmx_cuda = None
 
 def _get_cuda_kernels():
-    """Load native CUDA kernels if available. Returns module or None."""
+    """Load native CUDA kernels if available. Returns module or None.
+
+    Finds the sibling ``kernel/`` directory relative to this file, so the
+    import works regardless of the caller's cwd or sys.path. This matters
+    because dmx-compress is frequently imported from downstream tools
+    (hope, dmx-vram) that run from their own working directories, and
+    before this the `from kernel.build import get_kernels` statement
+    silently failed with ModuleNotFoundError → returned None → misled
+    callers into thinking CUDA kernels weren't available.
+
+    If ``DMX_REQUIRE_NATIVE=1`` is set in the environment, the silent
+    exception handler is bypassed and failures raise so downstream code
+    can surface the underlying cause.
+    """
+    import os
     global _dmx_cuda
     if _dmx_cuda is not None:
         return _dmx_cuda
     if not torch.cuda.is_available():
         return None
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    if _this_dir not in sys.path:
+        sys.path.insert(0, _this_dir)
+    _strict = os.environ.get("DMX_REQUIRE_NATIVE", "").strip() == "1"
     try:
         from kernel.build import get_kernels
         _dmx_cuda = get_kernels()
         return _dmx_cuda
     except Exception:
+        if _strict:
+            raise
         return None
 
 # BFP defaults
