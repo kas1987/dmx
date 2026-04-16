@@ -321,6 +321,155 @@ __global__ void count_zeros_i32_kernel(
 }
 
 // ============================================================
+// FUSED DEQUANT-GEMM: BFP compressed weight × FP16 input
+// BF1 skeleton — correctness-first, not optimized
+// ============================================================
+
+#include <cuda_fp16.h>
+
+#define FUSED_TILE_M 64
+#define FUSED_TILE_N 64
+#define FUSED_TILE_K 32
+#define FUSED_BLOCK_SIZE 128  // 4 warps
+
+// Device function: dequant a single BFP element to half
+__device__ __half bfp_dequant_element(uint8_t shared_exp, uint8_t mant_byte, int mantissa_bits) {
+    uint8_t mant_mask = (1 << mantissa_bits) - 1;
+    uint8_t sign = (mant_byte >> mantissa_bits) & 1;
+    uint16_t truncated = (uint16_t)(mant_byte & mant_mask);
+
+    if (truncated == 0) {
+        uint16_t bits = ((uint16_t)sign << 15);
+        return *reinterpret_cast<__half*>(&bits);
+    }
+
+    int shift_amount = 11 - mantissa_bits;
+    uint32_t recon_11 = (uint32_t)truncated << shift_amount;
+    int bit_pos = 31 - __clz(recon_11);
+    int offset = 10 - bit_pos;
+    int actual_exp = (int)shared_exp - offset;
+
+    uint16_t mant_10 = (uint16_t)(((recon_11 << offset) & 0x3FFu));
+    if (actual_exp < 0) actual_exp = 0;
+    if (actual_exp > 31) actual_exp = 31;
+
+    uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)actual_exp << 10) | mant_10;
+    return *reinterpret_cast<__half*>(&bits);
+}
+
+__global__ void bfp_fused_linear_kernel(
+    const __half* __restrict__ input,        // [M, K]
+    const uint8_t* __restrict__ exponents,   // [N_groups] where N_groups = (N * K_padded) / group_size
+    const uint8_t* __restrict__ sign_mant,   // [N * K_padded] packed mantissa
+    __half* __restrict__ output,             // [M, N]
+    const __half* __restrict__ bias,         // [N] or nullptr
+    int M, int N, int K,
+    int group_size,
+    int mantissa_bits,
+    int pad_len,                             // total padded length (N * K_padded_per_row or flat)
+    int orig_len                             // original unpadded length
+)
+{
+    // Each block computes a TILE_M x TILE_N output tile
+    int tile_m = blockIdx.x * FUSED_TILE_M;
+    int tile_n = blockIdx.y * FUSED_TILE_N;
+    int tid = threadIdx.x;
+
+    // Shared memory: weight tile (dequanted) + input tile
+    __shared__ __half smem_weight[FUSED_TILE_N * FUSED_TILE_K];  // [TILE_N, TILE_K]
+    __shared__ __half smem_input[FUSED_TILE_M * FUSED_TILE_K];   // [TILE_M, TILE_K]
+
+    // Each thread accumulates a subset of the TILE_M x TILE_N output
+    // Simple approach: each thread handles multiple (m, n) pairs
+    // With 128 threads and 64x64=4096 outputs, each thread does 32 outputs
+    // Layout: thread tid handles output elements tid, tid+128, tid+256, ...
+    float accum[32];
+    for (int i = 0; i < 32; i++) accum[i] = 0.0f;
+
+    // K_padded is the padded K dimension per weight row (aligned to group_size)
+    int K_padded = ((K + group_size - 1) / group_size) * group_size;
+    int groups_per_row = K_padded / group_size;
+
+    // Iterate over K in steps of TILE_K (= group_size = 32)
+    for (int k_step = 0; k_step < K; k_step += FUSED_TILE_K) {
+        // === Phase 1: Load and dequant weight tile [TILE_N x TILE_K] into shared memory ===
+        // Weight layout: weight[n, k] is stored at sign_mant[n * K_padded + k]
+        // Exponent for weight[n, k] is at exponents[n * groups_per_row + k / group_size]
+        int weight_elems = FUSED_TILE_N * FUSED_TILE_K;  // 2048
+        for (int idx = tid; idx < weight_elems; idx += FUSED_BLOCK_SIZE) {
+            int local_n = idx / FUSED_TILE_K;
+            int local_k = idx % FUSED_TILE_K;
+            int global_n = tile_n + local_n;
+            int global_k = k_step + local_k;
+
+            if (global_n < N && global_k < K) {
+                int flat_idx = global_n * K_padded + global_k;
+                int group_id = global_n * groups_per_row + global_k / group_size;
+                uint8_t exp = exponents[group_id];
+                uint8_t mant = sign_mant[flat_idx];
+                smem_weight[idx] = bfp_dequant_element(exp, mant, mantissa_bits);
+            } else {
+                smem_weight[idx] = __float2half(0.0f);
+            }
+        }
+
+        // === Phase 2: Load input tile [TILE_M x TILE_K] into shared memory ===
+        int input_elems = FUSED_TILE_M * FUSED_TILE_K;  // 2048
+        for (int idx = tid; idx < input_elems; idx += FUSED_BLOCK_SIZE) {
+            int local_m = idx / FUSED_TILE_K;
+            int local_k = idx % FUSED_TILE_K;
+            int global_m = tile_m + local_m;
+            int global_k = k_step + local_k;
+
+            if (global_m < M && global_k < K) {
+                smem_input[idx] = input[global_m * K + global_k];
+            } else {
+                smem_input[idx] = __float2half(0.0f);
+            }
+        }
+
+        __syncthreads();
+
+        // === Phase 3: Compute partial matmul from shared memory ===
+        // output[m, n] += sum_k(input[m, k] * weight[n, k])
+        // Each thread handles elements: for flat index = tid, tid+128, tid+256, ...
+        for (int out_idx = tid; out_idx < FUSED_TILE_M * FUSED_TILE_N; out_idx += FUSED_BLOCK_SIZE) {
+            int local_m = out_idx / FUSED_TILE_N;
+            int local_n = out_idx % FUSED_TILE_N;
+            int accum_slot = out_idx / FUSED_BLOCK_SIZE;  // 0..31
+
+            // Dot product over TILE_K
+            float dot = 0.0f;
+            for (int kk = 0; kk < FUSED_TILE_K; kk++) {
+                float a = __half2float(smem_input[local_m * FUSED_TILE_K + kk]);
+                float w = __half2float(smem_weight[local_n * FUSED_TILE_K + kk]);
+                dot += a * w;
+            }
+            accum[accum_slot] += dot;
+        }
+
+        __syncthreads();
+    }
+
+    // === Phase 4: Write output ===
+    for (int out_idx = tid; out_idx < FUSED_TILE_M * FUSED_TILE_N; out_idx += FUSED_BLOCK_SIZE) {
+        int local_m = out_idx / FUSED_TILE_N;
+        int local_n = out_idx % FUSED_TILE_N;
+        int global_m = tile_m + local_m;
+        int global_n = tile_n + local_n;
+        int accum_slot = out_idx / FUSED_BLOCK_SIZE;
+
+        if (global_m < M && global_n < N) {
+            float val = accum[accum_slot];
+            if (bias != nullptr) {
+                val += __half2float(bias[global_n]);
+            }
+            output[global_m * N + global_n] = __float2half(val);
+        }
+    }
+}
+
+// ============================================================
 // Python-callable functions via pybind11
 // ============================================================
 
@@ -455,6 +604,48 @@ torch::Tensor bfp_decompress(torch::Tensor exponents, torch::Tensor mantissas,
     return output.view(torch::kFloat16);
 }
 
+// --- Fused dequant-GEMM ---
+
+torch::Tensor bfp_fused_linear(
+    torch::Tensor input,         // float16 [M, K]
+    torch::Tensor exponents,     // uint8 [N_groups]
+    torch::Tensor sign_mant,     // uint8 [N * K_padded]
+    torch::Tensor bias,          // float16 [N] or empty tensor (numel==0 means no bias)
+    int M, int N, int K,
+    int group_size,
+    int mantissa_bits,
+    int pad_len,
+    int orig_len
+) {
+    auto output = torch::zeros({M, N}, torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
+
+    const __half* bias_ptr = nullptr;
+    if (bias.numel() > 0) {
+        bias_ptr = reinterpret_cast<const __half*>(bias.data_ptr<at::Half>());
+    }
+
+    dim3 grid(
+        (M + FUSED_TILE_M - 1) / FUSED_TILE_M,
+        (N + FUSED_TILE_N - 1) / FUSED_TILE_N
+    );
+    dim3 block(FUSED_BLOCK_SIZE);
+
+    bfp_fused_linear_kernel<<<grid, block>>>(
+        reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+        exponents.data_ptr<uint8_t>(),
+        sign_mant.data_ptr<uint8_t>(),
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+        bias_ptr,
+        M, N, K,
+        group_size,
+        mantissa_bits,
+        pad_len,
+        orig_len
+    );
+
+    return output;
+}
+
 // --- Utility ---
 
 int count_zeros_i16(torch::Tensor data) {
@@ -495,6 +686,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("delta_apply_i16", &delta_apply_i16, "Apply INT16 delta to base and dequantize (CUDA)");
     m.def("delta_apply_i32", &delta_apply_i32, "Apply INT32 delta to base and dequantize (CUDA)");
     m.def("bfp_decompress", &bfp_decompress, "BFP shared exponent + mantissa -> FP16 (CUDA)");
+
+    // Fused dequant-GEMM
+    m.def("bfp_fused_linear", &bfp_fused_linear, "BFP fused dequant + linear (CUDA)");
 
     // Utility
     m.def("count_zeros_i16", &count_zeros_i16, "Count zero elements in INT16 tensor (CUDA)");
