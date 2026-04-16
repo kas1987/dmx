@@ -167,19 +167,42 @@ __global__ void bfp_decompress_kernel(
     if (i >= num_elements) return;
 
     int group_id = i / group_size;
-    uint8_t shared_exp = exponents[group_id];
+    int shared_exp = (int)exponents[group_id];
 
     uint8_t mant_byte = mantissas[i];
     uint8_t mant_mask = (1 << mantissa_bits) - 1;
     uint8_t sign = (mant_byte >> mantissa_bits) & 1;
-    uint16_t mant = (uint16_t)(mant_byte & mant_mask);
+    uint16_t truncated = (uint16_t)(mant_byte & mant_mask);
 
-    // Reconstruct: shift mantissa back to 10-bit position
-    int shift = 10 - mantissa_bits;
-    mant = mant << shift;
+    // Zero case: truncated == 0 → output ±0
+    if (truncated == 0) {
+        fp16_output[i] = ((uint16_t)sign << 15);
+        return;
+    }
 
-    // Reconstruct FP16 bits
-    uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)shared_exp << 10) | mant;
+    // Reconstruct to 11-bit position (same as compression's inverse)
+    int shift_amount = 11 - mantissa_bits;
+    uint32_t recon_11 = (uint32_t)truncated << shift_amount;
+
+    // Leading-one-bit detection: find highest set bit in the 11-bit value.
+    // __clz counts leading zeros in a 32-bit int, so for an 11-bit value
+    // stored in a 32-bit int, bit_pos = 31 - __clz(recon_11).
+    // bit_pos 10 means the value had the same exponent as shared (offset=0),
+    // bit_pos 9 means offset=1, etc.
+    int bit_pos = 31 - __clz(recon_11);
+    int offset = 10 - bit_pos;
+    int actual_exp = shared_exp - offset;
+
+    // Shift recon_11 left by offset to align the leading 1 to bit 10,
+    // then mask to get the 10-bit mantissa (stripping the implicit leading 1)
+    uint16_t mant_10 = (uint16_t)(((recon_11 << offset) & 0x3FFu));
+
+    // Clamp exponent to valid FP16 range [0, 31]
+    if (actual_exp < 0) actual_exp = 0;
+    if (actual_exp > 31) actual_exp = 31;
+
+    // Reassemble FP16: sign(1) | exponent(5) | mantissa(10)
+    uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)actual_exp << 10) | mant_10;
     fp16_output[i] = bits;
 }
 
