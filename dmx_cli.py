@@ -643,15 +643,17 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
 
     # Truncate to mantissa_bits (keep top bits of 11-bit mantissa)
     shift_amount = 11 - mantissa_bits
-    truncated = (shifted_mantissa >> shift_amount).astype(np.uint8)
+    # Use uint16 for M>7 (sign + mantissa exceeds 8 bits)
+    pack_dtype = np.uint16 if mantissa_bits > 7 else np.uint8
+    truncated = (shifted_mantissa >> shift_amount).astype(pack_dtype)
 
     # Build streams
     exp_stream = shared_exp.astype(np.uint8)  # n_groups bytes
 
-    # Combine sign (1 bit) + truncated mantissa (mantissa_bits) into one byte
-    # For m=6: 1+6=7 bits, fits in uint8
-    sign_mant = (signs << mantissa_bits) | truncated
-    sign_mant_stream = sign_mant.flatten().astype(np.uint8)
+    # Combine sign (1 bit) + truncated mantissa (mantissa_bits)
+    # M<=7: 1+7=8 bits, fits uint8. M>7: needs uint16.
+    sign_mant = (signs.astype(pack_dtype) << mantissa_bits) | truncated
+    sign_mant_stream = sign_mant.flatten().astype(pack_dtype)
 
     return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
@@ -710,9 +712,12 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
     # Build streams: sign (1 bit) + truncated mantissa (mantissa_bits)
     sign_mant = (signs << mantissa_bits) | truncated
 
-    # Transfer back to CPU as numpy
+    # Transfer back to CPU as numpy. Use uint16 for M>7 (sign+mantissa > 8 bits).
     exp_stream = shared_exp.to(torch.uint8).cpu().numpy()
-    sign_mant_stream = sign_mant.flatten().to(torch.uint8).cpu().numpy()
+    pack_torch_dtype = torch.int16 if mantissa_bits > 7 else torch.uint8
+    sign_mant_stream = sign_mant.flatten().to(pack_torch_dtype).cpu().numpy()
+    if mantissa_bits > 7:
+        sign_mant_stream = sign_mant_stream.view(np.uint16)
 
     return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
@@ -1524,7 +1529,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         if not isinstance(mantissa_bits, int) or mantissa_bits < 1 or mantissa_bits > 10:
             raise ValueError(
                 f"mantissa_bits must be an int in [1, 10]; got {mantissa_bits!r}. "
-                f"Common values: 4 (aggressive), 6 (default), 7 (balanced), 8 (conservative)."
+                f"Common values: 6 (aggressive), 7 (balanced), 10 (full FP16 fidelity)."
             )
         _bfp_mantissa_override = mantissa_bits
         print(f"  Mantissa bits override: M={mantissa_bits} "
