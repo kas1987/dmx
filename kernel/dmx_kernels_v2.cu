@@ -322,7 +322,7 @@ __global__ void count_zeros_i32_kernel(
 
 // ============================================================
 // FUSED DEQUANT-GEMM: BFP compressed weight × FP16 input
-// BF1 skeleton — correctness-first, not optimized
+// BF1 (v1) skeleton preserved as fallback, BF2 optimized below
 // ============================================================
 
 #include <cuda_fp16.h>
@@ -333,7 +333,7 @@ __global__ void count_zeros_i32_kernel(
 #define FUSED_BLOCK_SIZE 128  // 4 warps
 
 // Device function: dequant a single BFP element to half
-__device__ __half bfp_dequant_element(uint8_t shared_exp, uint8_t mant_byte, int mantissa_bits) {
+__device__ __forceinline__ __half bfp_dequant_element(uint8_t shared_exp, uint8_t mant_byte, int mantissa_bits) {
     uint8_t mant_mask = (1 << mantissa_bits) - 1;
     uint8_t sign = (mant_byte >> mantissa_bits) & 1;
     uint16_t truncated = (uint16_t)(mant_byte & mant_mask);
@@ -357,45 +357,38 @@ __device__ __half bfp_dequant_element(uint8_t shared_exp, uint8_t mant_byte, int
     return *reinterpret_cast<__half*>(&bits);
 }
 
-__global__ void bfp_fused_linear_kernel(
-    const __half* __restrict__ input,        // [M, K]
-    const uint8_t* __restrict__ exponents,   // [N_groups] where N_groups = (N * K_padded) / group_size
-    const uint8_t* __restrict__ sign_mant,   // [N * K_padded] packed mantissa
-    __half* __restrict__ output,             // [M, N]
-    const __half* __restrict__ bias,         // [N] or nullptr
+// ============================================================
+// BF1 FALLBACK: Original unoptimized fused kernel (renamed)
+// ============================================================
+
+__global__ void bfp_fused_linear_kernel_v1(
+    const __half* __restrict__ input,
+    const uint8_t* __restrict__ exponents,
+    const uint8_t* __restrict__ sign_mant,
+    __half* __restrict__ output,
+    const __half* __restrict__ bias,
     int M, int N, int K,
     int group_size,
     int mantissa_bits,
-    int pad_len,                             // total padded length (N * K_padded_per_row or flat)
-    int orig_len                             // original unpadded length
+    int pad_len,
+    int orig_len
 )
 {
-    // Each block computes a TILE_M x TILE_N output tile
     int tile_m = blockIdx.x * FUSED_TILE_M;
     int tile_n = blockIdx.y * FUSED_TILE_N;
     int tid = threadIdx.x;
 
-    // Shared memory: weight tile (dequanted) + input tile
-    __shared__ __half smem_weight[FUSED_TILE_N * FUSED_TILE_K];  // [TILE_N, TILE_K]
-    __shared__ __half smem_input[FUSED_TILE_M * FUSED_TILE_K];   // [TILE_M, TILE_K]
+    __shared__ __half smem_weight[FUSED_TILE_N * FUSED_TILE_K];
+    __shared__ __half smem_input[FUSED_TILE_M * FUSED_TILE_K];
 
-    // Each thread accumulates a subset of the TILE_M x TILE_N output
-    // Simple approach: each thread handles multiple (m, n) pairs
-    // With 128 threads and 64x64=4096 outputs, each thread does 32 outputs
-    // Layout: thread tid handles output elements tid, tid+128, tid+256, ...
     float accum[32];
     for (int i = 0; i < 32; i++) accum[i] = 0.0f;
 
-    // K_padded is the padded K dimension per weight row (aligned to group_size)
     int K_padded = ((K + group_size - 1) / group_size) * group_size;
     int groups_per_row = K_padded / group_size;
 
-    // Iterate over K in steps of TILE_K (= group_size = 32)
     for (int k_step = 0; k_step < K; k_step += FUSED_TILE_K) {
-        // === Phase 1: Load and dequant weight tile [TILE_N x TILE_K] into shared memory ===
-        // Weight layout: weight[n, k] is stored at sign_mant[n * K_padded + k]
-        // Exponent for weight[n, k] is at exponents[n * groups_per_row + k / group_size]
-        int weight_elems = FUSED_TILE_N * FUSED_TILE_K;  // 2048
+        int weight_elems = FUSED_TILE_N * FUSED_TILE_K;
         for (int idx = tid; idx < weight_elems; idx += FUSED_BLOCK_SIZE) {
             int local_n = idx / FUSED_TILE_K;
             int local_k = idx % FUSED_TILE_K;
@@ -413,8 +406,7 @@ __global__ void bfp_fused_linear_kernel(
             }
         }
 
-        // === Phase 2: Load input tile [TILE_M x TILE_K] into shared memory ===
-        int input_elems = FUSED_TILE_M * FUSED_TILE_K;  // 2048
+        int input_elems = FUSED_TILE_M * FUSED_TILE_K;
         for (int idx = tid; idx < input_elems; idx += FUSED_BLOCK_SIZE) {
             int local_m = idx / FUSED_TILE_K;
             int local_k = idx % FUSED_TILE_K;
@@ -430,15 +422,11 @@ __global__ void bfp_fused_linear_kernel(
 
         __syncthreads();
 
-        // === Phase 3: Compute partial matmul from shared memory ===
-        // output[m, n] += sum_k(input[m, k] * weight[n, k])
-        // Each thread handles elements: for flat index = tid, tid+128, tid+256, ...
         for (int out_idx = tid; out_idx < FUSED_TILE_M * FUSED_TILE_N; out_idx += FUSED_BLOCK_SIZE) {
             int local_m = out_idx / FUSED_TILE_N;
             int local_n = out_idx % FUSED_TILE_N;
-            int accum_slot = out_idx / FUSED_BLOCK_SIZE;  // 0..31
+            int accum_slot = out_idx / FUSED_BLOCK_SIZE;
 
-            // Dot product over TILE_K
             float dot = 0.0f;
             for (int kk = 0; kk < FUSED_TILE_K; kk++) {
                 float a = __half2float(smem_input[local_m * FUSED_TILE_K + kk]);
@@ -451,7 +439,6 @@ __global__ void bfp_fused_linear_kernel(
         __syncthreads();
     }
 
-    // === Phase 4: Write output ===
     for (int out_idx = tid; out_idx < FUSED_TILE_M * FUSED_TILE_N; out_idx += FUSED_BLOCK_SIZE) {
         int local_m = out_idx / FUSED_TILE_N;
         int local_n = out_idx % FUSED_TILE_N;
@@ -467,6 +454,230 @@ __global__ void bfp_fused_linear_kernel(
             output[global_m * N + global_n] = __float2half(val);
         }
     }
+}
+
+// ============================================================
+// BF2 OPTIMIZED: WMMA tensor-core + double-buffered fused kernel
+//
+// Optimizations applied:
+//   1. WMMA tensor cores: 16x16x16 MMA fragments via nvcuda::wmma
+//      (massive throughput gain over scalar FMA on sm_89)
+//   2. Double-buffered shared memory: overlap next tile load with
+//      current tile compute
+//   3. Register blocking: each warp computes a 16x32 output sub-tile
+//      using 2 WMMA fragments along N (16x16 each)
+//   4. Shared memory padding: +8 pad to avoid bank conflicts on
+//      half-precision 16-wide access patterns
+// ============================================================
+
+#include <mma.h>
+using namespace nvcuda;
+
+// WMMA fragment dimensions
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+
+// We keep TILE_M=64, TILE_N=64, but TILE_K=32 (two WMMA K-steps per tile)
+// Each block has 128 threads = 4 warps
+// Warp layout: 2 warps along M (each handles 32 rows via 2 WMMA-M fragments)
+//              2 warps along N (each handles 32 cols via 2 WMMA-N fragments)
+// Actually: 4 warps in a 2x2 grid, each warp handles a 32x32 sub-tile
+// with 2x2 = 4 WMMA fragments (16x16 each), iterated over 2 WMMA K-steps
+
+// Smem padded stride for bank conflict avoidance
+#define SMEM_PAD 8
+#define SMEM_STRIDE_K (FUSED_TILE_K + SMEM_PAD)
+
+__global__ void bfp_fused_linear_kernel(
+    const __half* __restrict__ input,        // [M, K]
+    const uint8_t* __restrict__ exponents,   // [N_groups]
+    const uint8_t* __restrict__ sign_mant,   // [N * K_padded] packed mantissa
+    __half* __restrict__ output,             // [M, N]
+    const __half* __restrict__ bias,         // [N] or nullptr
+    int M, int N, int K,
+    int group_size,
+    int mantissa_bits,
+    int pad_len,
+    int orig_len
+)
+{
+    const int tile_m = blockIdx.x * FUSED_TILE_M;
+    const int tile_n = blockIdx.y * FUSED_TILE_N;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    // Warp layout: 2x2 grid of warps
+    // warp_row: 0 or 1 (handles rows 0-31 or 32-63 of the tile)
+    // warp_col: 0 or 1 (handles cols 0-31 or 32-63 of the tile)
+    const int warp_row = warp_id / 2;  // 0 or 1
+    const int warp_col = warp_id % 2;  // 0 or 1
+
+    // BFP layout params
+    const int K_padded = ((K + group_size - 1) / group_size) * group_size;
+    const int groups_per_row = K_padded / group_size;
+
+    // Double-buffered shared memory
+    // Weight: [TILE_N, TILE_K+PAD] in row-major (N is row, K is col)
+    // Input:  [TILE_M, TILE_K+PAD] in row-major (M is row, K is col)
+    __shared__ __half smem_weight[2][FUSED_TILE_N * SMEM_STRIDE_K];
+    __shared__ __half smem_input[2][FUSED_TILE_M * SMEM_STRIDE_K];
+
+    // WMMA accumulators: each warp computes a 32x32 sub-tile = 2x2 WMMA fragments
+    // Fragment: accumulator for 16x16 output, stored as FP32
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[2][2];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    const int num_k_steps = (K + FUSED_TILE_K - 1) / FUSED_TILE_K;
+
+    // ---- Tile loading helpers (same structure as before, into double-buffered smem) ----
+
+    #define LOAD_TILES(buf, k_step_val)                                              \
+    {                                                                                \
+        const int _ks = (k_step_val);                                                \
+        /* Load weight tile [TILE_N x TILE_K] */                                     \
+        const int weight_elems = FUSED_TILE_N * FUSED_TILE_K;                        \
+        for (int idx = tid; idx < weight_elems; idx += FUSED_BLOCK_SIZE) {           \
+            int local_n = idx / FUSED_TILE_K;                                        \
+            int local_k = idx % FUSED_TILE_K;                                        \
+            int global_n = tile_n + local_n;                                         \
+            int global_k = _ks + local_k;                                            \
+            if (global_n < N && global_k < K) {                                      \
+                int flat_idx = global_n * K_padded + global_k;                       \
+                int group_id = global_n * groups_per_row + global_k / group_size;    \
+                uint8_t exp = exponents[group_id];                                   \
+                uint8_t mant = sign_mant[flat_idx];                                  \
+                smem_weight[(buf)][local_n * SMEM_STRIDE_K + local_k] =              \
+                    bfp_dequant_element(exp, mant, mantissa_bits);                   \
+            } else {                                                                 \
+                smem_weight[(buf)][local_n * SMEM_STRIDE_K + local_k] =              \
+                    __float2half(0.0f);                                               \
+            }                                                                        \
+        }                                                                            \
+        /* Load input tile [TILE_M x TILE_K] */                                      \
+        const int input_elems = FUSED_TILE_M * FUSED_TILE_K;                         \
+        for (int idx = tid; idx < input_elems; idx += FUSED_BLOCK_SIZE) {            \
+            int local_m = idx / FUSED_TILE_K;                                        \
+            int local_k = idx % FUSED_TILE_K;                                        \
+            int global_m = tile_m + local_m;                                         \
+            int global_k = _ks + local_k;                                            \
+            if (global_m < M && global_k < K) {                                      \
+                smem_input[(buf)][local_m * SMEM_STRIDE_K + local_k] =               \
+                    input[global_m * K + global_k];                                  \
+            } else {                                                                 \
+                smem_input[(buf)][local_m * SMEM_STRIDE_K + local_k] =               \
+                    __float2half(0.0f);                                               \
+            }                                                                        \
+        }                                                                            \
+    }
+
+    // ---- Compute macro: WMMA matmul from smem[buf] ----
+    // Each warp loads its 32x32 sub-tile as 2x2 WMMA 16x16 fragments
+    // TILE_K = 32 = 2 * WMMA_K(16), so we iterate twice over the K-dimension
+    #define COMPUTE_WMMA(buf)                                                        \
+    {                                                                                \
+        for (int wk = 0; wk < 2; wk++) {                                            \
+            /* K offset within the tile for this WMMA K-step */                      \
+            int k_off = wk * WMMA_K;                                                 \
+            /* Load 2 input fragments (rows: warp_row*32 + {0,16}, K: k_off) */      \
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half,           \
+                           wmma::row_major> a_frag[2];                               \
+            _Pragma("unroll")                                                        \
+            for (int mi = 0; mi < 2; mi++) {                                         \
+                int m_off = warp_row * 32 + mi * WMMA_M;                             \
+                wmma::load_matrix_sync(a_frag[mi],                                   \
+                    &smem_input[(buf)][m_off * SMEM_STRIDE_K + k_off],               \
+                    SMEM_STRIDE_K);                                                  \
+            }                                                                        \
+            /* Load 2 weight fragments (rows: warp_col*32 + {0,16}, K: k_off) */     \
+            /* Weight is [N, K] in row-major. For B matrix we need col_major */      \
+            /* so that the N dimension is along columns. */                           \
+            /* Actually, wmma C = A * B where A is [M,K] and B is [K,N]. */          \
+            /* Our weight is [N,K], so we load it as col_major to get [K,N]. */      \
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half,           \
+                           wmma::col_major> b_frag[2];                               \
+            _Pragma("unroll")                                                        \
+            for (int ni = 0; ni < 2; ni++) {                                         \
+                int n_off = warp_col * 32 + ni * WMMA_N;                             \
+                wmma::load_matrix_sync(b_frag[ni],                                   \
+                    &smem_weight[(buf)][n_off * SMEM_STRIDE_K + k_off],              \
+                    SMEM_STRIDE_K);                                                  \
+            }                                                                        \
+            /* 2x2 WMMA MMA operations */                                            \
+            _Pragma("unroll")                                                        \
+            for (int mi = 0; mi < 2; mi++)                                           \
+                _Pragma("unroll")                                                    \
+                for (int ni = 0; ni < 2; ni++)                                       \
+                    wmma::mma_sync(acc[mi][ni], a_frag[mi], b_frag[ni], acc[mi][ni]);\
+        }                                                                            \
+    }
+
+    // ---- Main double-buffered loop ----
+    LOAD_TILES(0, 0);
+    __syncthreads();
+
+    for (int step = 0; step < num_k_steps; step++) {
+        int cur_buf = step & 1;
+        int nxt_buf = 1 - cur_buf;
+
+        if (step + 1 < num_k_steps) {
+            int next_k = (step + 1) * FUSED_TILE_K;
+            LOAD_TILES(nxt_buf, next_k);
+        }
+
+        COMPUTE_WMMA(cur_buf);
+
+        __syncthreads();
+    }
+
+    // ---- Write output from WMMA accumulators ----
+    // Each warp stores its 2x2 WMMA fragments (16x16 each) to output.
+    // We store the FP32 accumulator to a per-warp scratch region in smem,
+    // then add bias and convert to FP16 for the global write.
+    // Each warp gets 256 floats of scratch = 1024 bytes. 4 warps = 4KB.
+    // Reuse smem_input[0] (2560 halves = 5120 bytes, plenty of room).
+
+    // Per-warp scratch: 256 floats = 1024 bytes each. 4 warps = 4096 bytes.
+    // smem_input[0] has 2560 halves = 5120 bytes, plenty of room.
+    // Index by float offset: warp_id * 256 floats = warp_id * 1024 bytes.
+    float* all_scratch = reinterpret_cast<float*>(&smem_input[0][0]);
+    float* warp_scratch = all_scratch + warp_id * 256;
+
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++) {
+        #pragma unroll
+        for (int ni = 0; ni < 2; ni++) {
+            int frag_m = tile_m + warp_row * 32 + mi * WMMA_M;
+            int frag_n = tile_n + warp_col * 32 + ni * WMMA_N;
+
+            // Store accumulator fragment to per-warp scratch (FP32)
+            wmma::store_matrix_sync(warp_scratch, acc[mi][ni], WMMA_N,
+                                    wmma::mem_row_major);
+
+            // Each thread in warp writes 8 of the 256 elements
+            for (int idx = lane_id; idx < WMMA_M * WMMA_N; idx += 32) {
+                int local_m = idx / WMMA_N;
+                int local_n = idx % WMMA_N;
+                int gm = frag_m + local_m;
+                int gn = frag_n + local_n;
+                if (gm < M && gn < N) {
+                    float val = warp_scratch[idx];
+                    if (bias != nullptr) {
+                        val += __half2float(bias[gn]);
+                    }
+                    output[gm * N + gn] = __float2half(val);
+                }
+            }
+        }
+    }
+
+    #undef LOAD_TILES
+    #undef COMPUTE_WMMA
 }
 
 // ============================================================
