@@ -82,6 +82,9 @@ ENC_RAW_LPC = 13         # Fallback: raw bytes + FLAC (for odd dtypes)
 ENC_BFP_LPC = 14         # Block Floating Point: shared exponent + truncated mantissa + FLAC
 ENC_INT32_QUANT_LPC = 15 # FP32 -> int32 aligned quantization + FLAC (practically lossless)
 
+# Lossless byte-transposition encoding
+ENC_TRANSPOSE_LOSSLESS = 16  # Byte transposition + zstd per plane (truly lossless)
+
 # Module-level flag for GPU compression (set by CLI --gpu)
 _use_gpu_compress = False
 
@@ -866,7 +869,13 @@ def detect_encoding(tensor, mode="auto", entropy="zstd"):
     entropy: 'zstd' or 'lpc' -- selects entropy coding backend
     """
     # First, pick the zstd-based encoding as baseline
-    if mode == "bfp":
+    if mode == "transpose":
+        # Byte transposition is truly lossless for any float dtype
+        if tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            return ENC_TRANSPOSE_LOSSLESS
+        else:
+            return ENC_RAW_ZSTD  # Fallback for non-float dtypes
+    elif mode == "bfp":
         if tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
             enc = ENC_BFP_ZSTD
         else:
@@ -943,8 +952,13 @@ def _base_encoding(encoding):
     return encoding
 
 
-def encode_tensor(tensor, encoding, entropy_mode=None):
+def encode_tensor(tensor, encoding, entropy_mode=None, mode=None):
     """Encode a single tensor. Returns (encoded_bytes, metadata_dict).
+
+    If ``mode`` is provided (e.g. ``mode='transpose'``), it overrides the
+    ``encoding`` parameter by calling ``detect_encoding(tensor, mode=mode)``
+    to resolve the encoding constant. This is a convenience for callers that
+    want to specify the compression mode by name rather than by constant.
 
     entropy_mode:
       - "auto": per-tensor competitive selection across the available
@@ -962,6 +976,10 @@ def encode_tensor(tensor, encoding, entropy_mode=None):
         Files written under this mode have no `entropy_codec` field and
         the decoder falls back to the same legacy heuristic.
     """
+    # If mode is provided, resolve encoding from it (convenience API)
+    if mode is not None:
+        encoding = detect_encoding(tensor, mode=mode)
+
     meta = {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype).replace("torch.", ""),
@@ -1132,6 +1150,43 @@ def encode_tensor(tensor, encoding, entropy_mode=None):
         meta["compressed_size"] = len(packed)
         return packed, meta
 
+    elif base_enc == ENC_TRANSPOSE_LOSSLESS:
+        t = tensor.contiguous().cpu()
+        if t.numel() == 0:
+            meta["encoding"] = ENC_TRANSPOSE_LOSSLESS
+            meta["compressed_size"] = 0
+            return b"", meta
+        meta["original_dtype"] = str(t.dtype).replace("torch.", "")
+        if t.dtype == torch.bfloat16:
+            # Serialize bf16 as raw 2-byte values via int16 view — no fp16 conversion
+            raw = t.view(torch.int16).numpy().tobytes()
+            bpv = 2
+        else:
+            raw = t.numpy().tobytes()
+            bpv = t.element_size()
+        n = len(raw) // bpv
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(n, bpv)
+        planes = arr.T
+
+        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        compressed_planes = []
+        for plane in planes:
+            compressed_planes.append(cctx.compress(plane.tobytes()))
+
+        # Pack: [1B n_planes][4B plane_size] * n_planes + plane_data
+        packed = struct.pack("<B", bpv)  # n_planes = bytes per value
+        for cp in compressed_planes:
+            packed += struct.pack("<I", len(cp))
+        for cp in compressed_planes:
+            packed += cp
+
+        meta["encoding"] = ENC_TRANSPOSE_LOSSLESS
+        meta["transpose_n_values"] = n
+        meta["transpose_bpv"] = bpv
+        meta["raw_size"] = len(raw)
+        meta["compressed_size"] = len(packed)
+        return packed, meta
+
     # Entropy coding for non-BFP paths.
     #
     # The branching here is the entropy_mode contract from the docstring:
@@ -1227,6 +1282,46 @@ def decode_tensor(compressed_bytes, meta):
     dtype_str = meta.get("original_dtype", meta["dtype"])
     use_lpc = _is_lpc_encoding(encoding)
     base_enc = _base_encoding(encoding)
+
+    # Transpose lossless: decompress each byte plane, transpose back
+    if base_enc == ENC_TRANSPOSE_LOSSLESS:
+        if meta.get("compressed_size", 0) == 0:
+            orig_dtype = meta.get("original_dtype", "float32")
+            dt = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[orig_dtype]
+            return torch.empty(shape, dtype=dt)
+        bpv = meta["transpose_bpv"]
+        n = meta["transpose_n_values"]
+
+        offset = 0
+        stored_bpv = struct.unpack_from("<B", compressed_bytes, offset)[0]
+        offset += 1
+        plane_sizes = []
+        for i in range(stored_bpv):
+            plane_sizes.append(struct.unpack_from("<I", compressed_bytes, offset)[0])
+            offset += 4
+
+        dctx = zstd.ZstdDecompressor()
+        planes = []
+        for size in plane_sizes:
+            plane_data = compressed_bytes[offset:offset + size]
+            planes.append(np.frombuffer(dctx.decompress(plane_data), dtype=np.uint8))
+            offset += size
+
+        arr = np.stack(planes).T  # (n, bpv)
+        raw = arr.tobytes()
+
+        # Determine output dtype
+        orig_dtype = meta.get("original_dtype", meta.get("dtype", "float32"))
+        if orig_dtype == "float32":
+            result = torch.frombuffer(bytearray(raw), dtype=torch.float32).reshape(shape).clone()
+        elif orig_dtype == "float16":
+            result = torch.frombuffer(bytearray(raw), dtype=torch.float16).reshape(shape).clone()
+        elif orig_dtype == "bfloat16":
+            # bf16 was serialized as raw int16 bytes — reinterpret back
+            result = torch.frombuffer(bytearray(raw), dtype=torch.int16).view(torch.bfloat16).reshape(shape).clone()
+        else:
+            raise ValueError(f"Unsupported dtype for transpose decode: {orig_dtype}")
+        return result
 
     # BFP handles its own decompression (two separate streams)
     if base_enc == ENC_BFP_ZSTD:
@@ -1377,6 +1472,10 @@ def decode_tensor_gpu(compressed_bytes, meta):
     use_lpc = _is_lpc_encoding(encoding)
     base_enc = _base_encoding(encoding)
 
+    # Transpose lossless: no GPU path, fall back to CPU decode
+    if base_enc == ENC_TRANSPOSE_LOSSLESS:
+        return decode_tensor(compressed_bytes, meta)
+
     # BFP: GPU-accelerated reconstruction
     if base_enc == ENC_BFP_ZSTD:
         exp_comp_len = struct.unpack("<I", compressed_bytes[:4])[0]
@@ -1465,7 +1564,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
                   parallel_workers=None, mantissa_bits=None, fast_load=False):
     """Compress a safetensors file to .dmx format.
 
-    mode: 'auto', 'bfp', 'int16', or 'int32'
+    mode: 'auto', 'bfp', 'int16', 'int32', or 'transpose'
     entropy: 'auto' (default) | 'zstd-19' | 'zstd' | 'flac' | 'lpc' | 'brotli-11' | 'brotli'
 
       - 'auto' (default): per-tensor competitive selection across the
@@ -1601,6 +1700,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         ENC_FP16_LPC: "FP16+lpc", ENC_INT16_QUANT_LPC: "INT16Q+lpc",
         ENC_DELTA_LPC: "Delta+lpc", ENC_RAW_LPC: "Raw+lpc",
         ENC_BFP_LPC: "BFP+lpc", ENC_INT32_QUANT_LPC: "INT32Q+lpc",
+        ENC_TRANSPOSE_LOSSLESS: "Transpose+zstd",
     }
 
     keys = sorted(tensors.keys())
@@ -2354,6 +2454,7 @@ def info_file(input_path):
         ENC_FP16_LPC: "FP16+lpc", ENC_INT16_QUANT_LPC: "INT16Q+lpc",
         ENC_DELTA_LPC: "Delta+lpc", ENC_RAW_LPC: "Raw+lpc",
         ENC_BFP_LPC: "BFP+lpc", ENC_INT32_QUANT_LPC: "INT32Q+lpc",
+        ENC_TRANSPOSE_LOSSLESS: "Transpose+zstd",
     }
 
     print(f"DMX File: {input_path}")
@@ -4007,9 +4108,10 @@ def main():
     p_compress = sub.add_parser("compress", help="Compress safetensors to .dmx")
     p_compress.add_argument("input", help="Input .safetensors file")
     p_compress.add_argument("output", help="Output .dmx file")
-    p_compress.add_argument("--mode", choices=["auto", "bfp", "int16", "int32"], default="auto",
+    p_compress.add_argument("--mode", choices=["auto", "bfp", "int16", "int32", "transpose"], default="auto",
                             help="Compression mode: bfp (FP16/BF16), int16 (FP32, best compression), "
-                                 "int32 (FP32, practically lossless), auto (detect)")
+                                 "int32 (FP32, practically lossless), transpose (truly lossless byte "
+                                 "transposition), auto (detect)")
     p_compress.add_argument("--entropy",
                             choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11", "brotli"],
                             default="auto",
@@ -4050,7 +4152,7 @@ def main():
     p_verify = sub.add_parser("verify", help="Compress, decompress, compare")
     p_verify.add_argument("source", help="Original .safetensors file")
     p_verify.add_argument("dmx", help="DMX file path (created if missing)")
-    p_verify.add_argument("--mode", choices=["auto", "bfp", "int16", "int32"], default="auto",
+    p_verify.add_argument("--mode", choices=["auto", "bfp", "int16", "int32", "transpose"], default="auto",
                             help="Compression mode (if dmx needs to be created)")
     p_verify.add_argument("--entropy",
                             choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11", "brotli"],
