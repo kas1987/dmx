@@ -591,88 +591,9 @@ def _decompress_bytes_uint8_lpc(flac_bytes, original_len):
     return uint8_data[:original_len].tobytes()
 
 
-def _bfp_compress_fp32(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=23):
-    """Native FP32 BFP compression (no downcast to FP16).
-
-    Keeps the full FP32 bit layout: 1 sign, 8 exponent, 23 mantissa.
-    The implicit leading 1 gives a 24-bit full mantissa.  Shared exponent
-    per group is the max of the 8-bit exponents.
-
-    This path is selected when the input is float32 and mantissa_bits > 10
-    (i.e. more precision than FP16 can represent).  For mantissa_bits <= 10,
-    the FP16 downcast path is used instead for backward compatibility.
-
-    Returns the same 5-tuple as bfp_compress:
-        (exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype)
-    """
-    t = tensor.contiguous().cpu()
-    original_dtype = str(t.dtype).replace("torch.", "")
-
-    # Ensure float32
-    if t.dtype != torch.float32:
-        t = t.float()
-
-    # Guard: clamp inf/NaN to finite range. Inf poisons the shared exponent
-    # for the entire group, corrupting all neighbors.
-    if not torch.isfinite(t).all():
-        t = torch.nan_to_num(t, nan=0.0, posinf=torch.finfo(torch.float32).max,
-                             neginf=-torch.finfo(torch.float32).max)
-
-    raw = t.view(torch.int32).numpy().astype(np.uint32)
-    flat = raw.flatten()
-    orig_len = len(flat)
-
-    # Pad to multiple of group_size
-    pad_len = (group_size - orig_len % group_size) % group_size
-    if pad_len:
-        flat = np.concatenate([flat, np.zeros(pad_len, dtype=np.uint32)])
-
-    n_groups = len(flat) // group_size
-    groups = flat.reshape(n_groups, group_size)
-
-    # Extract FP32 fields: sign(1) | exponent(8) | mantissa(23)
-    signs = ((groups >> 31) & 1).astype(np.uint8)          # 1 bit
-    exponents = ((groups >> 23) & 0xFF).astype(np.uint8)   # 8 bits
-    mantissas = (groups & 0x7FFFFF).astype(np.uint32)      # 23 bits
-
-    # Add implicit leading 1 for normal numbers (exponent != 0)
-    # For subnormals (exp=0), the implicit bit is 0
-    implicit = np.where(exponents > 0, np.uint32(0x800000), np.uint32(0))
-    full_mantissa = mantissas | implicit  # 24 bits
-
-    # Shared exponent per group = max exponent in each group
-    shared_exp = exponents.max(axis=1)  # shape [n_groups]
-
-    # Shift mantissas to align with shared exponent
-    exp_diff = shared_exp[:, np.newaxis].astype(np.int16) - exponents.astype(np.int16)
-    # Clamp shift to avoid shifting away everything (max meaningful shift ~ 24 bits)
-    exp_diff = np.clip(exp_diff, 0, 31)
-    shifted_mantissa = full_mantissa >> exp_diff.astype(np.uint32)
-
-    # Truncate to mantissa_bits (keep top bits of 24-bit mantissa)
-    shift_amount = 24 - mantissa_bits
-    # Pack dtype: M>15 needs uint32, M>7 needs uint16, M<=7 needs uint8
-    if mantissa_bits > 15:
-        pack_dtype = np.uint32
-    elif mantissa_bits > 7:
-        pack_dtype = np.uint16
-    else:
-        pack_dtype = np.uint8
-    truncated = (shifted_mantissa >> shift_amount).astype(pack_dtype)
-
-    # Build streams
-    exp_stream = shared_exp.astype(np.uint8)  # n_groups bytes
-
-    # Combine sign (1 bit) + truncated mantissa (mantissa_bits)
-    sign_mant = (signs.astype(pack_dtype) << mantissa_bits) | truncated
-    sign_mant_stream = sign_mant.flatten().astype(pack_dtype)
-
-    return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
-
-
 def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
     """
-    Block Floating Point compression for FP16/FP32 tensors.
+    Block Floating Point compression for FP16 tensors.
 
     For each group of `group_size` values:
     1. Find the max exponent in the group (shared exponent)
@@ -682,18 +603,9 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
 
     Effective bits per value: (8/group_size) + 1 + mantissa_bits
     At g=32, m=6: 7.25 bits/value (vs 16) = 54.7% before entropy coding.
-
-    Auto-routing for FP32 inputs:
-    - mantissa_bits > 10: use native FP32 path (no downcast)
-    - mantissa_bits <= 10: downcast to FP16 (backward compatible)
     """
+    # Convert to FP16 if needed (FP32/BF16 -> FP16)
     t = tensor.contiguous().cpu()
-
-    # Route FP32 tensors with M>10 to the native FP32 path
-    if t.dtype == torch.float32 and mantissa_bits > 10:
-        return _bfp_compress_fp32(t, group_size=group_size, mantissa_bits=mantissa_bits)
-
-    # FP16 path: Convert to FP16 if needed (FP32/BF16 -> FP16)
     original_dtype = str(t.dtype).replace("torch.", "")
     if t.dtype == torch.float32 or t.dtype == torch.bfloat16:
         t = t.half()
@@ -731,17 +643,15 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
 
     # Truncate to mantissa_bits (keep top bits of 11-bit mantissa)
     shift_amount = 11 - mantissa_bits
-    # Use uint16 for M>7 (sign + mantissa exceeds 8 bits)
-    pack_dtype = np.uint16 if mantissa_bits > 7 else np.uint8
-    truncated = (shifted_mantissa >> shift_amount).astype(pack_dtype)
+    truncated = (shifted_mantissa >> shift_amount).astype(np.uint8)
 
     # Build streams
     exp_stream = shared_exp.astype(np.uint8)  # n_groups bytes
 
-    # Combine sign (1 bit) + truncated mantissa (mantissa_bits)
-    # M<=7: 1+7=8 bits, fits uint8. M>7: needs uint16.
-    sign_mant = (signs.astype(pack_dtype) << mantissa_bits) | truncated
-    sign_mant_stream = sign_mant.flatten().astype(pack_dtype)
+    # Combine sign (1 bit) + truncated mantissa (mantissa_bits) into one byte
+    # For m=6: 1+6=7 bits, fits in uint8
+    sign_mant = (signs << mantissa_bits) | truncated
+    sign_mant_stream = sign_mant.flatten().astype(np.uint8)
 
     return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
@@ -800,109 +710,24 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
     # Build streams: sign (1 bit) + truncated mantissa (mantissa_bits)
     sign_mant = (signs << mantissa_bits) | truncated
 
-    # Transfer back to CPU as numpy. Use uint16 for M>7 (sign+mantissa > 8 bits).
+    # Transfer back to CPU as numpy
     exp_stream = shared_exp.to(torch.uint8).cpu().numpy()
-    pack_torch_dtype = torch.int16 if mantissa_bits > 7 else torch.uint8
-    sign_mant_stream = sign_mant.flatten().to(pack_torch_dtype).cpu().numpy()
-    if mantissa_bits > 7:
-        sign_mant_stream = sign_mant_stream.view(np.uint16)
+    sign_mant_stream = sign_mant.flatten().to(torch.uint8).cpu().numpy()
 
     return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
 
-def _bfp_decompress_fp32(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
-                         original_dtype, group_size=BFP_GROUP_SIZE, mantissa_bits=23):
-    """Decompress native FP32 BFP back to FP32.
-
-    Counterpart of _bfp_compress_fp32.  Leading-one scan over 24 bits,
-    exponent clamped to [0, 255], reassemble FP32: sign(1) | exp(8) | mant(23).
-    """
-    n_groups = len(exp_stream)
-    # Determine pack dtype from mantissa_bits (must match compress side)
-    if mantissa_bits > 15:
-        pack_dtype = np.uint32
-    elif mantissa_bits > 7:
-        pack_dtype = np.uint16
-    else:
-        pack_dtype = np.uint8
-    sign_mant = sign_mant_stream.view(pack_dtype).reshape(n_groups, group_size)
-
-    signs = ((sign_mant >> mantissa_bits) & 1).astype(np.uint32)
-    truncated = (sign_mant & ((1 << mantissa_bits) - 1)).astype(np.uint32)
-
-    # Reconstruct to 24-bit position (full FP32 mantissa + implicit bit width)
-    shift_amount = 24 - mantissa_bits
-    recon_24 = truncated << shift_amount
-
-    shared_exp = exp_stream[:, np.newaxis].astype(np.int16)
-
-    # Find the leading 1 bit to determine actual exponent
-    # Bit 23 = value had same exponent as shared (offset 0)
-    # Bit 22 = exponent was shared_exp - 1, etc.
-    result_exp = np.zeros_like(recon_24, dtype=np.int16)
-    result_mant = np.zeros_like(recon_24, dtype=np.uint32)
-    found = np.zeros_like(recon_24, dtype=bool)
-
-    for bit_pos in range(23, -1, -1):
-        mask = np.uint32(1 << bit_pos)
-        has_bit = (recon_24 & mask) != 0
-        unprocessed = (~found) & has_bit
-
-        actual_exp = shared_exp - np.int16(23 - bit_pos)
-        shift_up = np.uint32(23 - bit_pos)
-        shifted_up = recon_24.astype(np.uint64) << shift_up
-        mant_23 = (shifted_up & np.uint64(0x7FFFFF)).astype(np.uint32)
-
-        result_exp = np.where(unprocessed, actual_exp, result_exp)
-        result_mant = np.where(unprocessed, mant_23, result_mant)
-        found = found | unprocessed
-
-    # Clamp to valid FP32 exponent range [0, 255]
-    result_exp = np.clip(result_exp, 0, 255).astype(np.uint32)
-
-    # Zero values: if truncated was 0, output zero
-    is_zero = (truncated == 0)
-    result_exp = np.where(is_zero, np.uint32(0), result_exp)
-    result_mant = np.where(is_zero, np.uint32(0), result_mant)
-
-    # Reassemble FP32: sign(1) | exponent(8) | mantissa(23)
-    fp32_values = (signs << 31) | (result_exp << 23) | result_mant
-    fp32_values = fp32_values.astype(np.uint32)
-
-    flat = fp32_values.flatten()[:orig_len]
-
-    result = torch.from_numpy(flat.view(np.int32).copy()).view(torch.float32).reshape(shape)
-    return result
-
-
 def bfp_decompress(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
-                   original_dtype, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS,
-                   native_dtype="float16"):
-    """Decompress BFP back to FP16 or FP32 (depending on native_dtype).
+                   original_dtype, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
+    """Decompress BFP back to FP16 (or original dtype).
 
     During compression, values with smaller exponents than the group max had their
     mantissas shifted right, moving the implicit leading 1 to a lower bit position.
     To decompress, we find where that leading 1 ended up, derive the actual exponent
-    offset from shared_exp, and reconstruct the value properly.
-
-    native_dtype: "float16" (default, backward compatible) or "float32" for native
-    FP32 BFP. When "float32", routes to _bfp_decompress_fp32.
+    offset from shared_exp, and reconstruct the FP16 value properly.
     """
-    # Route to FP32 decompressor when native_dtype indicates FP32 path
-    if native_dtype == "float32":
-        return _bfp_decompress_fp32(
-            exp_stream, sign_mant_stream, pad_len, orig_len, shape,
-            original_dtype, group_size, mantissa_bits
-        )
-
-    # FP16 path (original behavior)
     n_groups = len(exp_stream)
-    # Determine pack dtype from mantissa_bits (must match compress side)
-    if mantissa_bits > 7:
-        pack_dtype = np.uint16
-    else:
-        pack_dtype = np.uint8
-    sign_mant = sign_mant_stream.view(pack_dtype).reshape(n_groups, group_size)
+    sign_mant = sign_mant_stream.reshape(n_groups, group_size)
 
     signs = ((sign_mant >> mantissa_bits) & 1).astype(np.uint16)
     truncated = (sign_mant & ((1 << mantissa_bits) - 1)).astype(np.uint16)
@@ -1233,9 +1058,7 @@ def encode_tensor(tensor, encoding, entropy_mode=None):
         # Resolve mantissa bits: use runtime override if set, otherwise
         # fall back to module-level default.
         effective_m = _bfp_mantissa_override if _bfp_mantissa_override is not None else BFP_MANTISSA_BITS
-        # FP32 native path (M>10) requires CPU — GPU compress is FP16-only
-        _use_fp32_native = (t.dtype == torch.float32 and effective_m > 10)
-        if _use_gpu_compress and torch.cuda.is_available() and not _use_fp32_native:
+        if _use_gpu_compress and torch.cuda.is_available():
             exp_stream, sign_mant_stream, pad_len, orig_len, orig_dtype = bfp_compress_gpu(
                 t, mantissa_bits=effective_m
             )
@@ -1249,18 +1072,9 @@ def encode_tensor(tensor, encoding, entropy_mode=None):
         meta["bfp_mantissa_bits"] = effective_m
         if orig_dtype != meta["dtype"]:
             meta["original_dtype"] = orig_dtype
-        # Record the native BFP dtype so the decoder knows which bit layout
-        # was used. "float32" = native FP32 path (no downcast), "float16" =
-        # FP16 path (default, backward compatible). Files without this field
-        # are assumed to be "float16".
-        if t.dtype == torch.float32 and effective_m > 10:
-            meta["bfp_native_dtype"] = "float32"
-        # Record pack dtype so decoder can reinterpret the raw byte stream
-        # correctly. Legacy files without this field assume uint8.
-        meta["bfp_pack_dtype"] = str(sign_mant_stream.dtype)
 
         meta["bfp_exp_size"] = len(exp_stream)
-        meta["bfp_mant_size"] = sign_mant_stream.nbytes
+        meta["bfp_mant_size"] = len(sign_mant_stream)
         meta["raw_size"] = len(exp_stream) + len(sign_mant_stream)
 
         # Exponent stream is always zstd. It's tiny (sub-3% of total bytes
@@ -1445,21 +1259,18 @@ def decode_tensor(compressed_bytes, meta):
             mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
             sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
         else:
-            _pack_dt = np.dtype(meta.get("bfp_pack_dtype", "uint8"))
             sign_mant_stream = np.frombuffer(
                 dctx.decompress(mant_data, max_output_size=meta["bfp_mant_size"]),
-                dtype=_pack_dt
+                dtype=np.uint8
             ).copy()
 
         original_dtype = meta.get("original_dtype", meta["dtype"])
-        native_dtype = meta.get("bfp_native_dtype", "float16")
         return bfp_decompress(
             exp_stream, sign_mant_stream,
             meta["bfp_pad_len"], meta["bfp_orig_len"],
             shape, original_dtype,
             meta.get("bfp_group_size", BFP_GROUP_SIZE),
             meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
-            native_dtype=native_dtype,
         )
 
     # Decompress the main payload (non-BFP paths)
@@ -1596,24 +1407,12 @@ def decode_tensor_gpu(compressed_bytes, meta):
             mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
             sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
         else:
-            _pack_dt = np.dtype(meta.get("bfp_pack_dtype", "uint8"))
             sign_mant_stream = np.frombuffer(
                 dctx.decompress(mant_data, max_output_size=meta["bfp_mant_size"]),
-                dtype=_pack_dt
+                dtype=np.uint8
             ).copy()
 
         original_dtype = meta.get("original_dtype", meta["dtype"])
-        native_dtype = meta.get("bfp_native_dtype", "float16")
-        # For native FP32 BFP, fall back to CPU decompress (GPU path is FP16-only)
-        if native_dtype == "float32":
-            return bfp_decompress(
-                exp_stream, sign_mant_stream,
-                meta["bfp_pad_len"], meta["bfp_orig_len"],
-                shape, original_dtype,
-                meta.get("bfp_group_size", BFP_GROUP_SIZE),
-                meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
-                native_dtype=native_dtype,
-            )
         return bfp_decompress_gpu(
             exp_stream, sign_mant_stream,
             meta["bfp_pad_len"], meta["bfp_orig_len"],
@@ -1687,11 +1486,9 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         core CPUs even with the GIL active.
     mantissa_bits: override the BFP mantissa bit width for this call. None (default)
         uses the module-level BFP_MANTISSA_BITS constant (currently 6). Valid range
-        is 1-23. Higher values give better fidelity at the cost of compression ratio
+        is 1-10. Higher values give better fidelity at the cost of compression ratio
         (M=4: aggressive, ~80% savings; M=8: conservative, ~48% savings; M=6: default
-        balance; M=23: full FP32 fidelity). For M>10 with float32 tensors, the
-        native FP32 BFP path is used (no downcast to FP16), preserving full FP32
-        bit layout. Only affects BFP mode — ignored for int16/int32/auto modes on
+        balance). Only affects BFP mode — ignored for int16/int32/auto modes on
         non-BFP paths. The chosen value is stored per-tensor in the manifest so
         the decoder always reconstructs correctly regardless of the current
         module-level default. Editing the module-level BFP_MANTISSA_BITS constant
@@ -1724,19 +1521,14 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     # prior value at the end of this function so state never leaks.
     _prior_mantissa_override = _bfp_mantissa_override
     if mantissa_bits is not None:
-        if not isinstance(mantissa_bits, int) or mantissa_bits < 1 or mantissa_bits > 23:
+        if not isinstance(mantissa_bits, int) or mantissa_bits < 1 or mantissa_bits > 10:
             raise ValueError(
-                f"mantissa_bits must be an int in [1, 23]; got {mantissa_bits!r}. "
-                f"Common values: 6 (aggressive), 7 (balanced), 10 (full FP16 fidelity), "
-                f"23 (full FP32 fidelity, native FP32 path)."
+                f"mantissa_bits must be an int in [1, 10]; got {mantissa_bits!r}. "
+                f"Common values: 4 (aggressive), 6 (default), 7 (balanced), 8 (conservative)."
             )
         _bfp_mantissa_override = mantissa_bits
-        if mantissa_bits > 10:
-            print(f"  Mantissa bits override: M={mantissa_bits} "
-                  f"(native FP32 BFP path for float32 tensors, default is {BFP_MANTISSA_BITS})")
-        else:
-            print(f"  Mantissa bits override: M={mantissa_bits} "
-                  f"(default is {BFP_MANTISSA_BITS})")
+        print(f"  Mantissa bits override: M={mantissa_bits} "
+              f"(default is {BFP_MANTISSA_BITS})")
 
     # Resolve fast_load override. When True, tensors matching FAST_LOAD_PATTERNS
     # are stored as FP16+entropy instead of BFP, enabling instant loading for
@@ -2110,7 +1902,6 @@ class BFPPayload:
     pad_len: int = 0
     orig_len: int = 0
     scale: Optional[float] = None
-    native_dtype: str = "float16"  # "float16" or "float32" — which BFP bit layout was used
 
 
 _DTYPE_STR_TO_TORCH = {
@@ -2163,10 +1954,9 @@ def _decode_bfp_streams_only(compressed_bytes, meta):
         mant_raw = _decompress_bytes_uint8_lpc(mant_data, mant_orig_len)
         sign_mant_stream = np.frombuffer(mant_raw, dtype=np.uint8).copy()
     else:
-        _pack_dt = np.dtype(meta.get("bfp_pack_dtype", "uint8"))
         sign_mant_stream = np.frombuffer(
             dctx.decompress(mant_data, max_output_size=meta["bfp_mant_size"]),
-            dtype=_pack_dt,
+            dtype=np.uint8,
         ).copy()
 
     return exp_stream, sign_mant_stream
@@ -2246,7 +2036,6 @@ def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
                     pad_len=meta["bfp_pad_len"],
                     orig_len=meta["bfp_orig_len"],
                     scale=None,
-                    native_dtype=meta.get("bfp_native_dtype", "float16"),
                 )
             else:
                 # Non-BFP: delegate to the existing full decoder. No
@@ -2284,7 +2073,6 @@ def bfp_payload_to_tensor(payload: "BFPPayload") -> "torch.Tensor":
         payload.pad_len, payload.orig_len,
         payload.shape, dtype_str,
         payload.group_size, payload.mantissa_bits,
-        native_dtype=payload.native_dtype,
     )
 
 
