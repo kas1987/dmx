@@ -57,7 +57,8 @@ __version__ = _read_package_version()
 
 
 # --- Constants ---
-DMX_MAGIC = b"DMX1"
+DMX_MAGIC = b"DMX1"            # Legacy format magic
+DMX_MAGIC_PROVENANCE = b"DMX\x00"  # New format with provenance manifest header
 DMX_VERSION = 3
 ZSTD_LEVEL = 19          # Single-file compression (archival, best ratio)
 ZSTD_LEVEL_DELTA = 3     # Delta compression (speed matters for training callbacks)
@@ -107,6 +108,92 @@ _fast_load_override = False
 # bypassing the frozen default arg values captured at function-definition time.
 # Restored to None at the end of each compress_file() call so state never leaks.
 _bfp_mantissa_override = None
+
+
+def build_provenance_manifest(source_path, source_format, param_count,
+                              parent_manifest=None):
+    """Build a Phase 1 provenance manifest for a DMX file.
+
+    Parameters
+    ----------
+    source_path : str
+        Path to the source file (used to compute source_hash).
+    source_format : str
+        Format of the source file (e.g. "safetensors").
+    param_count : int
+        Total number of parameters in the model.
+    parent_manifest : dict, optional
+        Provenance manifest from the parent DMX file (for future lineage
+        tracking). Currently unused in Phase 1.
+
+    Returns
+    -------
+    dict
+        Provenance manifest with all Phase 1 fields. The ``content_hash``
+        field is set to ``None`` and must be populated by the caller after
+        the compressed buffer is produced.
+    """
+    # Compute SHA-256 of the source file
+    h = hashlib.sha256()
+    with open(source_path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    source_hash = "sha256:" + h.hexdigest()
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    manifest = {
+        # Core
+        "dmx_version": "1.0",
+        "source_format": source_format,
+        "source_hash": source_hash,
+        "created": now_utc,
+        "model_architecture": "unknown",
+        "param_count": param_count,
+        # Lineage
+        "parent": None,
+        "delta_base": None,
+        "lineage_depth": 0,
+        "root_hash": source_hash,
+        # Export
+        "export_warning": None,
+        # Integrity
+        "content_hash": None,  # Populated after compression
+        "modification_history": [],
+    }
+
+    return manifest
+
+
+def _read_provenance_header(f):
+    """Read the provenance header from a DMX file opened in binary mode.
+
+    Assumes the file position is at byte 0. Reads the magic, determines
+    format, and returns (provenance_manifest_or_None, data_start_position).
+
+    For DMX\\x00 files: returns the parsed provenance dict and positions the
+    file at the start of the legacy header (DMX1 + version + ...).
+
+    For DMX1 files: returns None, resets position to 0.
+    """
+    magic = f.read(4)
+    if magic == DMX_MAGIC_PROVENANCE:
+        manifest_len = struct.unpack("<I", f.read(4))[0]
+        manifest_json = f.read(manifest_len)
+        provenance = json.loads(manifest_json)
+        # File is now positioned at the start of the compressed weight data
+        # which begins with the legacy DMX1 header
+        return provenance
+    else:
+        # Rewind — this is either DMX1 or invalid, let the caller handle it
+        f.seek(0)
+        return None
+
 
 # Native CUDA kernels (loaded on demand)
 _dmx_cuda = None
@@ -1527,9 +1614,9 @@ def decode_tensor_gpu(compressed_bytes, meta):
 
 
 def auto_detect_mode(tensors):
-    """Detect whether a model is primarily FP16/BF16 or FP32.
-    Returns 'bfp' if >80% of params are FP16/BF16, 'int16' if >80% are FP32.
-    Falls back to 'int16' for mixed models.
+    """Detect the default compression mode for a model.
+    Returns 'transpose' (lossless) for float-dominant models.
+    Lossy modes ('bfp', 'int16') remain available as explicit --mode opt-ins.
     """
     fp16_params = 0
     fp32_params = 0
@@ -1542,12 +1629,11 @@ def auto_detect_mode(tensors):
         elif tensor.dtype == torch.float32:
             fp32_params += n
     if total_params == 0:
-        return "int16"
-    if fp16_params / total_params > 0.80:
-        return "bfp"
-    if fp32_params / total_params > 0.80:
-        return "int16"
-    return "int16"
+        return "transpose"
+    float_frac = (fp16_params + fp32_params) / total_params
+    if float_frac > 0.50:
+        return "transpose"
+    return "transpose"
 
 
 def _is_fast_load_tensor(name):
@@ -1764,13 +1850,38 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             if (i + 1) % 100 == 0 or (i + 1) == len(keys):
                 print(f"  Compressed {i+1}/{len(keys)} tensors...")
 
+    # --- Build provenance manifest ---
+    # Compute content_hash over the compressed weight data
+    content_hasher = hashlib.sha256()
+    for key in keys:
+        content_hasher.update(compressed_chunks[key])
+    content_hash = "sha256:" + content_hasher.hexdigest()
+
+    # Compute total param count
+    total_param_count = sum(t.numel() for t in tensors.values() if hasattr(t, "numel"))
+
+    # Detect source format from extension
+    src_ext = os.path.splitext(input_path)[1].lower()
+    source_format = "safetensors" if src_ext == ".safetensors" else src_ext.lstrip(".")
+
+    provenance = build_provenance_manifest(
+        source_path=input_path,
+        source_format=source_format,
+        param_count=total_param_count,
+    )
+    provenance["content_hash"] = content_hash
+
+    provenance_json = json.dumps(provenance, separators=(",", ":")).encode("utf-8")
+    # Provenance header: [DMX\x00 4B][manifest_len 4B][manifest JSON]
+    provenance_header_size = 4 + 4 + len(provenance_json)
+
     # Write .dmx file
-    # Format: [MAGIC 4B][VERSION 4B][MANIFEST_SIZE 4B][MANIFEST JSON][CHUNK DATA...]
-    # Each chunk is written sequentially, manifest has offsets
+    # New format: [DMX\x00][prov_len][prov JSON][DMX1][VERSION][MANIFEST_SIZE][MANIFEST JSON][CHUNK DATA...]
+    # Each chunk is written sequentially, manifest has offsets (absolute from file start)
     manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
 
-    # Calculate offsets for chunks
-    header_size = 4 + 4 + 4 + len(manifest_json)
+    # Calculate offsets for chunks (must include provenance header prefix)
+    header_size = provenance_header_size + 4 + 4 + 4 + len(manifest_json)
     offset = header_size
     chunk_offsets = {}
     for key in keys:
@@ -1782,7 +1893,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
 
     # Recalculate offsets since manifest size may have changed
-    header_size = 4 + 4 + 4 + len(manifest_json)
+    header_size = provenance_header_size + 4 + 4 + 4 + len(manifest_json)
     offset = header_size
     for key in keys:
         manifest["tensors"][key]["offset"] = offset
@@ -1791,7 +1902,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     # Final manifest
     manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
     # One more pass to stabilize (offset digits may grow)
-    header_size_check = 4 + 4 + 4 + len(manifest_json)
+    header_size_check = provenance_header_size + 4 + 4 + 4 + len(manifest_json)
     if header_size_check != header_size:
         header_size = header_size_check
         offset = header_size
@@ -1801,6 +1912,11 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
 
     with open(output_path, "wb") as f:
+        # Provenance header (new format)
+        f.write(DMX_MAGIC_PROVENANCE)
+        f.write(struct.pack("<I", len(provenance_json)))
+        f.write(provenance_json)
+        # Legacy header (preserved for internal compatibility)
         f.write(DMX_MAGIC)
         f.write(struct.pack("<I", DMX_VERSION))
         f.write(struct.pack("<I", len(manifest_json)))
@@ -1876,6 +1992,9 @@ def decompress_file(input_path, output_path, use_gpu=None):
     start = time.time()
 
     with open(input_path, "rb") as f:
+        # Handle both provenance (DMX\x00) and legacy (DMX1) formats
+        _read_provenance_header(f)  # skips provenance header if present
+
         magic = f.read(4)
         if magic != DMX_MAGIC:
             raise ValueError(f"Not a DMX file (magic: {magic})")
@@ -1918,6 +2037,29 @@ def decompress_file(input_path, output_path, use_gpu=None):
     return output_size
 
 
+def _load_tensors_and_manifest(path):
+    """Load tensors from either a .safetensors or .dmx file.
+
+    Returns (tensors_dict, manifest_or_None).  For .dmx files the
+    provenance manifest is returned; for .safetensors it is None.
+    Decompression of .dmx files happens entirely in-memory (no temp
+    files).
+    """
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic == DMX_MAGIC_PROVENANCE:
+        tensors, manifest, _ = _decode_dmx_to_tensors(path, use_gpu=False)
+        # Also need the *provenance* manifest (the outer DMX\x00 envelope),
+        # which _decode_dmx_to_tensors returns as the inner DMX1 manifest.
+        # Re-read the provenance header separately.
+        with open(path, "rb") as f:
+            prov = _read_provenance_header(f)
+        return tensors, prov
+    else:
+        tensors = load_file(path)
+        return tensors, None
+
+
 def _decode_dmx_to_tensors(input_path, use_gpu=None):
     """Load a DMX file and return a dict of full-precision tensors.
 
@@ -1933,6 +2075,9 @@ def _decode_dmx_to_tensors(input_path, use_gpu=None):
 
     start = time.time()
     with open(input_path, "rb") as f:
+        # Handle both provenance (DMX\x00) and legacy (DMX1) formats
+        _read_provenance_header(f)
+
         magic = f.read(4)
         if magic != DMX_MAGIC:
             raise ValueError(f"Not a DMX file (magic: {magic})")
@@ -1962,7 +2107,7 @@ class BFPPayload:
 
     Holds the raw exponent + packed-sign-mantissa streams produced by the
     BFP encoder, without reconstructing an FP16/FP32 view. This is the
-    Sprint B entry point that lets BFPLinear keep weights resident in VRAM
+    Entry point that lets BFPLinear keep weights resident in VRAM
     in their compressed form and dequantize per-tile on demand.
 
     Attributes
@@ -1991,7 +2136,7 @@ class BFPPayload:
         Original flat element count (pre-pad). Needed to trim after dequant.
     scale : float | None
         Reserved; None for pure BFP path. Populated only when BFP was
-        preceded by an affine scale (INT16Q hybrid, not a Sprint B target).
+        preceded by an affine scale (INT16Q hybrid, not currently used).
     """
     exponents: "torch.Tensor"
     packed_mantissa: "torch.Tensor"
@@ -2073,12 +2218,12 @@ def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
     For all other encodings (FP16, INT16Q, INT32Q, DELTA, RAW): falls back
     to the full ``decode_tensor``/``decode_tensor_gpu`` path and returns
     the same torch.Tensor that :func:`_decode_dmx_to_tensors` would produce.
-    Callers that care about Sprint B compressed residency should inspect
+    Callers that care about compressed residency should inspect
     each value's type (BFPPayload vs torch.Tensor) to decide whether to
     keep compressed or inflate.
 
     GPU path decision: B1 returns BFPPayloads with CPU-resident
-    exponents/mantissas. Sprint B's matmul / materialize path copies to
+    exponents/mantissas. The matmul / materialize path copies to
     GPU itself. This keeps the partial decoder cheap and side-effect-free
     and lets callers control device placement. Non-BFP tensors still use
     ``decode_tensor_gpu`` when ``use_gpu=True``, matching the full
@@ -2095,6 +2240,9 @@ def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
 
     start = time.time()
     with open(path, "rb") as f:
+        # Handle both provenance (DMX\x00) and legacy (DMX1) formats
+        _read_provenance_header(f)
+
         magic = f.read(4)
         if magic != DMX_MAGIC:
             raise ValueError(f"Not a DMX file (magic: {magic})")
@@ -2156,7 +2304,7 @@ def bfp_payload_to_tensor(payload: "BFPPayload") -> "torch.Tensor":
     instead of loose streams. Produces bit-for-bit the same tensor that
     the full decoder would have produced for the same BFP-encoded tensor.
     Provided for callers that want to inflate a single payload on demand
-    (e.g. Sprint B's BFPTensor.materialize()) without rewriting the
+    (e.g. BFPTensor.materialize()) without rewriting the
     dequant math.
     """
     dtype_str = {
@@ -2432,9 +2580,75 @@ def export_quant_multi(input_path, output_dir, targets=None, use_gpu=None):
     return output_paths
 
 
+def inspect_file(input_path, verify=False):
+    """Print the provenance manifest of a .dmx file as JSON to stdout.
+
+    For legacy files (DMX1 magic), prints a message indicating no provenance
+    manifest is available.
+
+    Parameters
+    ----------
+    verify : bool
+        When True, re-compute SHA-256 of all data after the provenance
+        manifest block and compare to the stored ``content_hash``.
+        Returns ``"MISMATCH"`` (and prints an error) if they differ.
+    """
+    with open(input_path, "rb") as f:
+        provenance = _read_provenance_header(f)
+        data_start = f.tell()  # position right after provenance block
+
+    if provenance is None:
+        print("Legacy format -- no provenance manifest")
+    else:
+        # Show export_warning banner if present
+        warning = provenance.get("export_warning")
+        if warning is not None:
+            print(f"WARNING: {warning}\n")
+            print("Manifest:")
+
+        print(json.dumps(provenance, indent=2))
+
+    if verify and provenance is not None:
+        stored = provenance.get("content_hash", "")
+        # Re-compute SHA-256 over compressed weight data (chunk bytes
+        # after the DMX1 header inside the provenance-wrapped file).
+        # On-disk layout after provenance block:
+        #   DMX1 (4B) + version (4B) + manifest_size (4B) + manifest JSON + chunks
+        hasher = hashlib.sha256()
+        with open(input_path, "rb") as f:
+            f.seek(data_start)
+            inner_magic = f.read(4)
+            if inner_magic != DMX_MAGIC:
+                print("  Cannot verify: inner DMX1 header not found")
+                return provenance
+            f.read(4)  # version
+            inner_manifest_size = struct.unpack("<I", f.read(4))[0]
+            f.read(inner_manifest_size)  # skip inner manifest JSON
+            # Now positioned at start of chunk data
+            while True:
+                chunk = f.read(1 << 20)  # 1 MB at a time
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        computed = "sha256:" + hasher.hexdigest()
+        match = "MATCH" if stored == computed else "MISMATCH"
+        print(f"\nVerification:")
+        print(f"  Stored content_hash:    {stored}")
+        print(f"  Computed content_hash:  {computed}")
+        print(f"  Result:                 {match}")
+        if match == "MISMATCH":
+            return "MISMATCH"
+        return None
+
+    return provenance
+
+
 def info_file(input_path):
     """Display info about a .dmx file."""
     with open(input_path, "rb") as f:
+        # Handle both provenance (DMX\x00) and legacy (DMX1) formats
+        _read_provenance_header(f)
+
         magic = f.read(4)
         if magic != DMX_MAGIC:
             raise ValueError(f"Not a DMX file (magic: {magic})")
@@ -2509,6 +2723,9 @@ def _sha256_file(path):
 def _read_dmx_mode(dmx_path):
     """Read the compression mode from a DMX file's manifest."""
     with open(dmx_path, "rb") as f:
+        # Handle both provenance (DMX\x00) and legacy (DMX1) formats
+        _read_provenance_header(f)
+
         magic = f.read(4)
         if magic != DMX_MAGIC:
             return "unknown"
@@ -3060,6 +3277,192 @@ def _detect_legacy_aux_buffers(state_dict):
             excluded.append(key)
 
     return sorted(excluded)
+
+
+# ── Lossless delta (bit-exact) with provenance ────────────────────────────────
+
+
+def delta_lossless_compress_file(base_path, target_path, output_path):
+    """Lossless delta-compress a target safetensors file against a base.
+
+    Uses the bit-exact delta_lossless codec (integer subtraction + byte-plane
+    transposition + zstd) and wraps the result in a DMX provenance envelope.
+    The output file starts with DMX\\x00 magic and contains a full Phase 1
+    provenance manifest followed by the per-tensor delta payload.
+
+    Guarantees bit-exact reconstruction when paired with
+    delta_lossless_reconstruct_file.
+    """
+    from dmx.delta_lossless import delta_lossless_encode
+
+    print(f"  Base: {base_path}")
+    print(f"  Target: {target_path}")
+    print(f"  Mode: lossless (bit-exact)")
+    start = time.time()
+
+    base, base_manifest = _load_tensors_and_manifest(base_path)
+    target, target_manifest = _load_tensors_and_manifest(target_path)
+
+    common_keys = sorted(set(base.keys()) & set(target.keys()))
+    if not common_keys:
+        raise ValueError("No common tensor keys between base and target")
+
+    # Build per-tensor delta payload
+    # Format: [4B num_tensors][per tensor: 4B key_len, key bytes, 4B delta_len, delta bytes]
+    parts = []
+    parts.append(struct.pack("<I", len(common_keys)))
+    for key in common_keys:
+        key_bytes = key.encode("utf-8")
+        delta_bytes = delta_lossless_encode(base[key], target[key])
+        parts.append(struct.pack("<I", len(key_bytes)))
+        parts.append(key_bytes)
+        parts.append(struct.pack("<I", len(delta_bytes)))
+        parts.append(delta_bytes)
+    payload = b"".join(parts)
+
+    # Content hash of payload
+    content_hash = "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    # Source hash & lineage from target
+    if target_manifest is not None:
+        source_hash = target_manifest["content_hash"]
+        parent = target_manifest["content_hash"]
+        lineage_depth = target_manifest["lineage_depth"] + 1
+        root_hash = target_manifest["root_hash"]
+    else:
+        with open(target_path, "rb") as f:
+            source_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+        parent = None
+        lineage_depth = 1
+        root_hash = source_hash
+
+    # Delta base hash
+    if base_manifest is not None:
+        delta_base = base_manifest["content_hash"]
+    else:
+        with open(base_path, "rb") as f:
+            delta_base = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+
+    # Export warning propagation
+    export_warning = None
+    if base_manifest is not None and base_manifest.get("export_warning"):
+        export_warning = ("WARNING: Delta computed against a base with quality "
+                          "warning. Reconstruction fidelity may be bounded.")
+
+    # Detect source format from target tensor dtypes
+    dtypes_seen = set()
+    total_params = 0
+    for key in common_keys:
+        dtypes_seen.add(str(target[key].dtype))
+        total_params += target[key].numel()
+    source_format = "/".join(sorted(dtypes_seen))
+
+    # Build Phase 1 provenance manifest
+    provenance = {
+        "dmx_version": "1.0",
+        "source_format": source_format,
+        "source_hash": source_hash,
+        "created": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "model_architecture": "unknown",
+        "param_count": total_params,
+        "parent": parent,
+        "delta_base": delta_base,
+        "lineage_depth": lineage_depth,
+        "root_hash": root_hash,
+        "export_warning": export_warning,
+        "content_hash": content_hash,
+        "modification_history": [],
+    }
+    provenance_json = json.dumps(provenance, separators=(",", ":")).encode("utf-8")
+
+    # Write file: [DMX\x00][4B manifest_len][manifest JSON][payload blob]
+    with open(output_path, "wb") as f:
+        f.write(DMX_MAGIC_PROVENANCE)  # b"DMX\x00"
+        f.write(struct.pack("<I", len(provenance_json)))
+        f.write(provenance_json)
+        f.write(payload)
+
+    output_size = os.path.getsize(output_path)
+    target_size = os.path.getsize(target_path)
+    elapsed = time.time() - start
+    ratio = output_size / target_size * 100 if target_size > 0 else 0
+    print(f"  Output: {output_path}")
+    print(f"  Tensors: {len(common_keys)}")
+    print(f"  Params: {total_params:,}")
+    print(f"  Size: {output_size:,} bytes ({ratio:.1f}% of target)")
+    print(f"  Time: {elapsed:.2f}s")
+
+
+def delta_lossless_reconstruct_file(base_path, delta_path, output_path):
+    """Reconstruct a safetensors file from base + lossless delta.
+
+    Expects a delta file written by delta_lossless_compress_file (DMX\\x00
+    magic with provenance manifest). Verifies the delta_base hash against
+    the provided base file and warns on mismatch.
+    """
+    from dmx.delta_lossless import delta_lossless_decode
+
+    print(f"  Base: {base_path}")
+    print(f"  Delta: {delta_path}")
+    start = time.time()
+
+    # Read delta file
+    with open(delta_path, "rb") as f:
+        magic = f.read(4)
+        if magic != DMX_MAGIC_PROVENANCE:
+            raise ValueError(f"Not a lossless DMX delta file (got {magic!r}, "
+                             f"expected {DMX_MAGIC_PROVENANCE!r})")
+        manifest_len = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_len))
+        payload = f.read()
+
+    # Verify delta_base hash
+    base, base_manifest = _load_tensors_and_manifest(base_path)
+    if base_manifest is not None:
+        base_hash = base_manifest["content_hash"]
+    else:
+        with open(base_path, "rb") as f:
+            base_hash = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+    expected_base = manifest.get("delta_base")
+    if expected_base and expected_base != base_hash:
+        print(f"  WARNING: delta_base hash mismatch!")
+        print(f"    Expected: {expected_base}")
+        print(f"    Got:      {base_hash}")
+
+    # Parse payload
+    buf = memoryview(payload)
+    off = 0
+    num_tensors = struct.unpack_from("<I", buf, off)[0]
+    off += 4
+
+    tensor_deltas = {}
+    for _ in range(num_tensors):
+        key_len = struct.unpack_from("<I", buf, off)[0]
+        off += 4
+        key = bytes(buf[off:off + key_len]).decode("utf-8")
+        off += key_len
+        delta_len = struct.unpack_from("<I", buf, off)[0]
+        off += 4
+        delta_bytes = bytes(buf[off:off + delta_len])
+        off += delta_len
+        tensor_deltas[key] = delta_bytes
+
+    # Reconstruct from base tensors (already loaded above)
+    result = {}
+    for key, delta_bytes in tensor_deltas.items():
+        if key not in base:
+            print(f"  WARNING: key '{key}' in delta but not in base, skipping")
+            continue
+        result[key] = delta_lossless_decode(base[key], delta_bytes)
+
+    save_file(result, output_path)
+
+    elapsed = time.time() - start
+    output_size = os.path.getsize(output_path)
+    print(f"  Output: {output_path}")
+    print(f"  Tensors: {len(result)}")
+    print(f"  Size: {output_size:,} bytes")
+    print(f"  Time: {elapsed:.2f}s")
 
 
 def delta_compress(base_path, target_path, output_path, precision="int16",
@@ -4109,9 +4512,10 @@ def main():
     p_compress.add_argument("input", help="Input .safetensors file")
     p_compress.add_argument("output", help="Output .dmx file")
     p_compress.add_argument("--mode", choices=["auto", "bfp", "int16", "int32", "transpose"], default="auto",
-                            help="Compression mode: bfp (FP16/BF16), int16 (FP32, best compression), "
-                                 "int32 (FP32, practically lossless), transpose (truly lossless byte "
-                                 "transposition), auto (detect)")
+                            help="Compression mode: auto (default: lossless transpose), "
+                                 "transpose (truly lossless byte transposition), "
+                                 "bfp (lossy, FP16/BF16), int16 (lossy, FP32 best compression), "
+                                 "int32 (lossy, FP32 practically lossless)")
     p_compress.add_argument("--entropy",
                             choices=["auto", "zstd-19", "zstd", "flac", "lpc", "brotli-11", "brotli"],
                             default="auto",
@@ -4145,6 +4549,11 @@ def main():
 
     p_info = sub.add_parser("info", help="Show info about a .dmx file")
     p_info.add_argument("input", help="Input .dmx file")
+
+    p_inspect = sub.add_parser("inspect", help="Print provenance manifest as JSON")
+    p_inspect.add_argument("input", help="Input .dmx file")
+    p_inspect.add_argument("--verify", action="store_true",
+                           help="Re-compute content hash and verify integrity")
 
     p_compress.add_argument("--report", default=None,
                             help="Auto-verify after compression and write JSON report to this path")
@@ -4190,6 +4599,10 @@ def main():
                                "because modern HF loaders ignore them anyway and they corrupt "
                                "aligned scale calculations. Only set this if you need bit-exact "
                                "round-trip of a legacy-format checkpoint.")
+    p_delta.add_argument("--lossy-quantized", action="store_true", default=False,
+                          help="Use the legacy lossy quantize-then-subtract delta path. "
+                               "Default (without this flag) uses the new bit-exact lossless "
+                               "delta codec with provenance manifest.")
 
     p_recon = sub.add_parser("delta-reconstruct",
                               help="Reconstruct a checkpoint from base + delta")
@@ -4279,16 +4692,29 @@ def main():
         decompress_file(args.input, args.output, use_gpu=args.gpu if args.gpu else None)
     elif args.command == "info":
         info_file(args.input)
+    elif args.command == "inspect":
+        result = inspect_file(args.input, verify=args.verify)
+        if result == "MISMATCH":
+            sys.exit(1)
     elif args.command == "verify":
         verify_file(args.source, args.dmx, mode=args.mode, entropy=args.entropy,
                     report_path=args.report, use_gpu=args.gpu if args.gpu else None)
     elif args.command == "delta-compress":
-        delta_compress(args.base, args.target, args.output, precision=args.precision,
-                      zstd_level=getattr(args, 'zstd_level', None),
-                      strip_legacy_buffers=not args.keep_legacy_buffers,
-                      entropy=getattr(args, 'entropy', 'auto'))
+        if getattr(args, 'lossy_quantized', False):
+            delta_compress(args.base, args.target, args.output, precision=args.precision,
+                          zstd_level=getattr(args, 'zstd_level', None),
+                          strip_legacy_buffers=not args.keep_legacy_buffers,
+                          entropy=getattr(args, 'entropy', 'auto'))
+        else:
+            delta_lossless_compress_file(args.base, args.target, args.output)
     elif args.command == "delta-reconstruct":
-        delta_reconstruct(args.base, args.delta, args.output)
+        # Auto-detect format: DMX\x00 = lossless, otherwise legacy
+        with open(args.delta, "rb") as _f:
+            _magic = _f.read(4)
+        if _magic == DMX_MAGIC_PROVENANCE:
+            delta_lossless_reconstruct_file(args.base, args.delta, args.output)
+        else:
+            delta_reconstruct(args.base, args.delta, args.output)
     elif args.command == "delta-info":
         delta_info(args.input)
     elif args.command == "chain-compress":

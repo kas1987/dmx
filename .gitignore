@@ -8,6 +8,9 @@
 
 .githooks/
 
+# Private documentation
+private_docs/
+
 experiments/
 
 internal_tests/
