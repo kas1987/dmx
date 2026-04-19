@@ -189,9 +189,17 @@ When the cascade reaches M=7 compressed residency, the quality cost of the step-
 | Mistral | 7B | Mistral | +0.16% | ~53% |
 | Llama 3.1 | 8B | Llama | +0.29% | 53.2% |
 
-Across the 9 architectures tested so far, M=7 selective-roundtrip delta stays under 1.5% on wikitext-2, with 8 of 9 models under 0.8%. Performance varies by architecture more than by size: within the Qwen family, delta is similar at 1.5B and 3B (+0.60% and +0.58%). Mistral 7B and Llama 3.1 8B — both standard modern transformer architectures — anchor the larger-model range at +0.16% and +0.29%. Phi-2 shows larger delta (+1.37%) than other models in its size range — Phi's architectural choices around rotary embedding and layer structure appear to make it less tolerant of aggressive quantization. Users deploying Phi-family models or architectures not included in this measurement set (Mamba, MoE, encoder-only, multimodal, vision transformers, etc.) should verify PPL on their specific model and task.
+Across the 9 architectures tested so far, M=7 selective-roundtrip delta stays under 1.5% on wikitext-2, with 8 of 9 models under 0.8%. Performance varies by architecture more than by size: within the Qwen family, delta is similar at 1.5B and 3B (+0.60% and +0.58%). Mistral 7B and Llama 3.1 8B — both standard modern transformer architectures — anchor the larger-model range at +0.16% and +0.29%. Phi-2 shows larger delta (+1.37%) than other models in its size range. Layer ablation shows 82% of this delta concentrates in the last 3 layers (29-31) — a fixable precision hotspot, not an architectural incompatibility. An extended skip_compression pattern protecting these layers is expected to reduce Phi-2's delta to ~0.24%. Users deploying Phi-family models or architectures not included in this measurement set (Mamba, MoE, encoder-only, multimodal, vision transformers, etc.) should verify PPL on their specific model and task.
 
 Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selective roundtrip at these sizes is statistically indistinguishable from FP16 inference.
+
+**BF16 source models:** When the source is BF16 (the native training format for most modern models), M=7 quality cost drops further — BF16 has exactly 7 mantissa bits, matching M=7's precision:
+
+| Model | Parameters | BF16 baseline PPL | M=7 quality cost |
+|---|---|---|---|
+| Qwen 2.5 | 1.5B | 9.1875 | +0.00% |
+| Pythia | 1.4B | 11.2500 | +0.00% |
+| Mistral | 7B | 5.0000 | +0.63% |
 
 ### What M=7 represents on DMX's curve
 
