@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmx-compress"
-version = "0.7.0"
-description = "Structure-aware neural network weight compression. 87% checkpoint delta encoding, not generic file compression."
+version = "1.0.0"
+description = "Lossless compression for neural network weights. Bit-exact storage, content-addressable deltas, embedded provenance."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
