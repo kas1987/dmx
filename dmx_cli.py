@@ -729,7 +729,10 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
             truncated = shifted_mantissa.astype(np.uint8)
         else:
             shift_amount = 8 - mantissa_bits
-            truncated = (shifted_mantissa >> shift_amount).astype(np.uint8)
+            rounding_bit = (shifted_mantissa >> (shift_amount - 1)) & 1
+            truncated = ((shifted_mantissa >> shift_amount) + rounding_bit).astype(np.uint8)
+            max_mant = (1 << mantissa_bits) - 1
+            truncated = np.minimum(truncated, max_mant).astype(np.uint8)
 
         exp_stream = shared_exp.astype(np.uint8)
         sign_mant = (signs << mantissa_bits) | truncated
@@ -771,9 +774,15 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
     exp_diff = np.clip(exp_diff, 0, 15)
     shifted_mantissa = full_mantissa >> exp_diff.astype(np.uint16)
 
-    # Truncate to mantissa_bits (keep top bits of 11-bit mantissa)
+    # Round to mantissa_bits (keep top bits of 11-bit mantissa, round-to-nearest)
     shift_amount = 11 - mantissa_bits
-    truncated = (shifted_mantissa >> shift_amount).astype(np.uint8)
+    rounding_bit = np.where(shift_amount > 0,
+                            (shifted_mantissa >> (shift_amount - 1)) & 1,
+                            np.uint16(0))
+    truncated = ((shifted_mantissa >> shift_amount) + rounding_bit).astype(np.uint8)
+    # Clamp to max mantissa value (prevent overflow from rounding up)
+    max_mant = (1 << mantissa_bits) - 1
+    truncated = np.minimum(truncated, max_mant).astype(np.uint8)
 
     # Build streams
     exp_stream = shared_exp.astype(np.uint8)  # n_groups bytes
@@ -821,7 +830,11 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
         if mantissa_bits >= 8:
             truncated = shifted_mantissa
         else:
-            truncated = shifted_mantissa >> (8 - mantissa_bits)
+            shift_amount = 8 - mantissa_bits
+            rounding_bit = (shifted_mantissa >> (shift_amount - 1)) & 1
+            truncated = (shifted_mantissa >> shift_amount) + rounding_bit
+            max_mant = (1 << mantissa_bits) - 1
+            truncated = truncated.clamp(max=max_mant)
         sign_mant = (signs << mantissa_bits) | truncated
         exp_stream = shared_exp.to(torch.uint8).cpu().numpy()
         sign_mant_stream = sign_mant.flatten().to(torch.uint8).cpu().numpy()
@@ -867,11 +880,14 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
     exp_diff = exp_diff.clamp(0, 15)
     shifted_mantissa = full_mantissa >> exp_diff
 
-    # Truncate to mantissa_bits
+    # Round to mantissa_bits (round-to-nearest instead of truncate)
     shift_amount = 11 - mantissa_bits
-    truncated = shifted_mantissa >> shift_amount
+    rounding_bit = (shifted_mantissa >> (shift_amount - 1)) & 1 if shift_amount > 0 else 0
+    truncated = (shifted_mantissa >> shift_amount) + rounding_bit
+    max_mant = (1 << mantissa_bits) - 1
+    truncated = truncated.clamp(max=max_mant)
 
-    # Build streams: sign (1 bit) + truncated mantissa (mantissa_bits)
+    # Build streams: sign (1 bit) + rounded mantissa (mantissa_bits)
     sign_mant = (signs << mantissa_bits) | truncated
 
     # Transfer back to CPU as numpy
