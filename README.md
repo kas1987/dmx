@@ -73,7 +73,7 @@ Neural network weights are more compressible at the top of their bit representat
 
 The savings DMX achieves are at the ceiling of what's possible without giving up bit-exactness, not at the ceiling of what aggressive lossy compression could reach. This is by design — the storage tier is the archival foundation, and it has to be exact.
 
-For a deeper explanation of why these numbers are what they are, see [technical design notes](./docs/DESIGN.md).
+For a deeper explanation of why these numbers are what they are, see the technical documentation (coming soon).
 
 ---
 
@@ -383,18 +383,85 @@ DMX is in active development. The format, tooling, and documentation are evolvin
 
 ## Technical details
 
-For the underlying mechanics — how storage compression works, how deltas are computed, how the inference auto-selection decides, and what the precision and correctness guarantees formally are — see [DESIGN.md].
+For the underlying mechanics — how storage compression works, how deltas are computed, how the inference auto-selection decides, and what the precision and correctness guarantees formally are — see the technical documentation (coming soon).
 
-For measurement methodology and reproducibility — how the numbers in this document were produced, which benchmarks were used, and how to reproduce them — see [BENCHMARKS.md].
+For measurement methodology and reproducibility — how the numbers in this document were produced, which benchmarks were used, and how to reproduce them — see the benchmark documentation (coming soon).
 
 ---
 
 ## Quick start
 
+### Install
+
+```bash
+pip install dmx-compress
 ```
-# placeholder — install and basic usage examples to be filled in
-# once the CLI surface stabilizes
+
+### Compress a model (lossless)
+
+```bash
+dmx compress model.safetensors model.dmx
 ```
+
+```
+Original:   474.7 MB  (GPT-2 124M, FP32)
+Compressed: 397.6 MB  (16.2% savings)
+Result:     LOSSLESS — all 148 tensors exactly match
+```
+
+### Decompress (bit-exact reconstruction)
+
+```bash
+dmx decompress model.dmx restored.safetensors
+```
+
+### Verify roundtrip
+
+```bash
+dmx verify model.safetensors model.dmx
+```
+
+```
+Result: LOSSLESS - all tensors exactly match
+Overall verdict: PASS
+```
+
+### Delta compression (training checkpoints)
+
+```bash
+dmx delta-compress base.safetensors checkpoint.safetensors delta.dmxd
+dmx delta-reconstruct base.safetensors delta.dmxd restored.safetensors
+```
+
+### Inspect provenance
+
+```bash
+dmx inspect model.dmx
+```
+
+```json
+{
+  "dmx_version": "1.0",
+  "source_format": "safetensors",
+  "source_hash": "sha256:ae60e8b7...",
+  "created": "2026-04-19T21:58:58Z",
+  "param_count": 124439808,
+  "lineage_depth": 0,
+  "root_hash": "sha256:ae60e8b7...",
+  "export_warning": null,
+  "content_hash": "sha256:3107d014..."
+}
+```
+
+```bash
+dmx inspect model.dmx --verify
+```
+
+### Download pre-compressed models
+
+| Model | Original | DMX | Savings | Verified |
+|-------|----------|-----|---------|----------|
+| [GPT-2 124M FP32](https://huggingface.co/Senat1/dmx-gpt2-lossless) | 474.7 MB | 397.6 MB | 16.2% | Bit-exact roundtrip |
 
 ---
 
