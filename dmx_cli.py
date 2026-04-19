@@ -694,10 +694,50 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
     Effective bits per value: (8/group_size) + 1 + mantissa_bits
     At g=32, m=6: 7.25 bits/value (vs 16) = 54.7% before entropy coding.
     """
-    # Convert to FP16 if needed (FP32/BF16 -> FP16)
+    if mantissa_bits > 7:
+        raise ValueError(f"mantissa_bits must be <= 7 (uint8 overflow at M>=8), got {mantissa_bits}")
     t = tensor.contiguous().cpu()
     original_dtype = str(t.dtype).replace("torch.", "")
-    if t.dtype == torch.float32 or t.dtype == torch.bfloat16:
+
+    if t.dtype == torch.bfloat16:
+        # BF16 native BFP path: BF16 has 1 sign + 8 exponent + 7 mantissa bits.
+        # Operate directly on BF16 without FP16 intermediate conversion.
+        raw = t.view(torch.int16).numpy().astype(np.uint16)
+        flat = raw.flatten()
+        orig_len = len(flat)
+        pad_len = (group_size - orig_len % group_size) % group_size
+        if pad_len:
+            flat = np.concatenate([flat, np.zeros(pad_len, dtype=np.uint16)])
+        n_groups = len(flat) // group_size
+        groups = flat.reshape(n_groups, group_size)
+
+        # Extract BF16 fields: sign(1) | exponent(8) | mantissa(7)
+        signs = ((groups >> 15) & 1).astype(np.uint8)
+        exponents = ((groups >> 7) & 0xFF).astype(np.uint16)
+        mantissas = (groups & 0x7F).astype(np.uint16)
+
+        # Add implicit leading 1 for normal numbers (exponent != 0)
+        implicit = np.where(exponents > 0, np.uint16(0x80), np.uint16(0))
+        full_mantissa = mantissas | implicit  # 8 bits (1 implicit + 7 stored)
+
+        shared_exp = exponents.max(axis=1)
+        exp_diff = shared_exp[:, np.newaxis].astype(np.int16) - exponents.astype(np.int16)
+        exp_diff = np.clip(exp_diff, 0, 15)
+        shifted_mantissa = full_mantissa >> exp_diff.astype(np.uint16)
+
+        if mantissa_bits >= 8:
+            truncated = shifted_mantissa.astype(np.uint8)
+        else:
+            shift_amount = 8 - mantissa_bits
+            truncated = (shifted_mantissa >> shift_amount).astype(np.uint8)
+
+        exp_stream = shared_exp.astype(np.uint8)
+        sign_mant = (signs << mantissa_bits) | truncated
+        sign_mant_stream = sign_mant.flatten().astype(np.uint8)
+        return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
+
+    if t.dtype == torch.float32:
+        print("  Source dtype: float32 — converting to float16 for BFP encoding")
         t = t.half()
 
     raw = t.view(torch.int16).numpy().astype(np.uint16)
@@ -752,9 +792,43 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
     Same algorithm as bfp_compress but with vectorized GPU operations
     instead of numpy CPU ops. Returns numpy arrays (same interface).
     """
+    if mantissa_bits > 7:
+        raise ValueError(f"mantissa_bits must be <= 7 (uint8 overflow at M>=8), got {mantissa_bits}")
     t = tensor.contiguous().cpu()
     original_dtype = str(t.dtype).replace("torch.", "")
-    if t.dtype == torch.float32 or t.dtype == torch.bfloat16:
+
+    if t.dtype == torch.bfloat16:
+        # BF16 native GPU BFP path
+        raw = t.view(torch.int16).flatten()
+        orig_len = len(raw)
+        pad_len = (group_size - orig_len % group_size) % group_size
+        if pad_len:
+            raw = torch.cat([raw, torch.zeros(pad_len, dtype=torch.int16)])
+        flat = raw.to(dtype=torch.int32, device='cuda') & 0xFFFF
+        n_groups = len(flat) // group_size
+        groups = flat.reshape(n_groups, group_size)
+
+        signs = ((groups >> 15) & 1)
+        exponents = ((groups >> 7) & 0xFF)
+        mantissas = (groups & 0x7F)
+        implicit = torch.where(exponents > 0,
+                              torch.ones_like(exponents) * 0x80,
+                              torch.zeros_like(exponents))
+        full_mantissa = mantissas | implicit
+        shared_exp = exponents.max(dim=1).values
+        exp_diff = (shared_exp.unsqueeze(1) - exponents).clamp(0, 15)
+        shifted_mantissa = full_mantissa >> exp_diff
+        if mantissa_bits >= 8:
+            truncated = shifted_mantissa
+        else:
+            truncated = shifted_mantissa >> (8 - mantissa_bits)
+        sign_mant = (signs << mantissa_bits) | truncated
+        exp_stream = shared_exp.to(torch.uint8).cpu().numpy()
+        sign_mant_stream = sign_mant.flatten().to(torch.uint8).cpu().numpy()
+        return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
+
+    if t.dtype == torch.float32:
+        print("  Source dtype: float32 — converting to float16 for BFP encoding")
         t = t.half()
 
     # View as uint16 via int16 reinterpret
@@ -809,12 +883,12 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
 
 def bfp_decompress(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
                    original_dtype, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_BITS):
-    """Decompress BFP back to FP16 (or original dtype).
+    """Decompress BFP back to FP16/BF16 (or original dtype).
 
     During compression, values with smaller exponents than the group max had their
     mantissas shifted right, moving the implicit leading 1 to a lower bit position.
     To decompress, we find where that leading 1 ended up, derive the actual exponent
-    offset from shared_exp, and reconstruct the FP16 value properly.
+    offset from shared_exp, and reconstruct the floating-point value properly.
     """
     n_groups = len(exp_stream)
     sign_mant = sign_mant_stream.reshape(n_groups, group_size)
@@ -822,7 +896,42 @@ def bfp_decompress(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
     signs = ((sign_mant >> mantissa_bits) & 1).astype(np.uint16)
     truncated = (sign_mant & ((1 << mantissa_bits) - 1)).astype(np.uint16)
 
-    # Reconstruct to 11-bit position
+    if original_dtype == "bfloat16":
+        # BF16 native reconstruction: 8-bit exponent, 7-bit mantissa
+        total_mant_bits = 8
+        if mantissa_bits >= total_mant_bits:
+            recon = truncated
+        else:
+            recon = truncated.astype(np.uint16) << (total_mant_bits - mantissa_bits)
+
+        shared_exp = exp_stream[:, np.newaxis].astype(np.int16)
+        top_bit = total_mant_bits - 1
+        result_exp = np.zeros_like(recon, dtype=np.int16)
+        result_mant = np.zeros_like(recon, dtype=np.uint16)
+        found = np.zeros_like(recon, dtype=bool)
+
+        for bit_pos in range(top_bit, -1, -1):
+            mask = np.uint16(1 << bit_pos)
+            has_bit = (recon & mask) != 0
+            unprocessed = (~found) & has_bit
+            actual_exp = shared_exp - np.int16(top_bit - bit_pos)
+            shift_up = np.uint16(top_bit - bit_pos)
+            shifted_up = recon.astype(np.uint32) << shift_up
+            mant_val = (shifted_up & 0x7F).astype(np.uint16)
+            result_exp = np.where(unprocessed, actual_exp, result_exp)
+            result_mant = np.where(unprocessed, mant_val, result_mant)
+            found = found | unprocessed
+
+        result_exp = np.clip(result_exp, 0, 255).astype(np.uint16)
+        is_zero = (truncated == 0)
+        result_exp = np.where(is_zero, np.uint16(0), result_exp)
+        result_mant = np.where(is_zero, np.uint16(0), result_mant)
+
+        bf16_values = (signs << 15) | (result_exp << 7) | result_mant
+        flat = bf16_values.astype(np.uint16).flatten()[:orig_len]
+        return torch.from_numpy(flat.astype(np.int16).copy()).view(torch.bfloat16).reshape(shape)
+
+    # FP16 reconstruction path
     shift_amount = 11 - mantissa_bits
     recon_11 = truncated.astype(np.uint16) << shift_amount
 
@@ -878,8 +987,7 @@ def bfp_decompress_gpu(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
     """GPU-accelerated BFP decompression using PyTorch CUDA ops.
 
     Replaces the CPU leading-one-bit scan loop with parallel GPU bit operations.
-    The exponent and sign-mantissa streams are transferred to GPU, reconstructed
-    via bitwise ops, and the result transferred back to CPU.
+    BF16 source tensors use a native BF16 reconstruction path.
     """
     n_groups = len(exp_stream)
 
@@ -888,16 +996,50 @@ def bfp_decompress_gpu(exp_stream, sign_mant_stream, pad_len, orig_len, shape,
         dtype=torch.int32, device='cuda'
     ).reshape(n_groups, group_size)
 
-    # Extract sign and truncated mantissa
     mant_mask = (1 << mantissa_bits) - 1
-    signs = (sign_mant_gpu >> mantissa_bits) & 1            # [n_groups, group_size]
-    truncated = sign_mant_gpu & mant_mask                   # [n_groups, group_size]
+    signs = (sign_mant_gpu >> mantissa_bits) & 1
+    truncated = sign_mant_gpu & mant_mask
 
-    # Reconstruct to 11-bit position
+    shared_exp = torch.from_numpy(exp_stream.copy()).to(
+        dtype=torch.int32, device='cuda'
+    ).unsqueeze(1)
+
+    if original_dtype == "bfloat16":
+        total_mant_bits = 8
+        if mantissa_bits >= total_mant_bits:
+            recon = truncated
+        else:
+            recon = truncated << (total_mant_bits - mantissa_bits)
+
+        top_bit = total_mant_bits - 1
+        result_exp = torch.zeros_like(recon)
+        result_mant = torch.zeros_like(recon)
+        found = torch.zeros(n_groups, group_size, dtype=torch.bool, device='cuda')
+
+        for bit_pos in range(top_bit, -1, -1):
+            mask = 1 << bit_pos
+            has_bit = (recon & mask) != 0
+            unprocessed = (~found) & has_bit
+            offset = top_bit - bit_pos
+            actual_exp = shared_exp - offset
+            shifted_up = (recon << offset) & 0x7F
+            result_exp = torch.where(unprocessed, actual_exp, result_exp)
+            result_mant = torch.where(unprocessed, shifted_up, result_mant)
+            found = found | unprocessed
+
+        result_exp = result_exp.clamp(0, 255)
+        is_zero = (truncated == 0)
+        result_exp = torch.where(is_zero, torch.zeros_like(result_exp), result_exp)
+        result_mant = torch.where(is_zero, torch.zeros_like(result_mant), result_mant)
+
+        bf16_bits = (signs << 15) | (result_exp << 7) | result_mant
+        flat = bf16_bits.flatten()[:orig_len].to(torch.int16)
+        return flat.cpu().view(torch.bfloat16).reshape(shape)
+
+    # FP16 reconstruction path
     shift_amount = 11 - mantissa_bits
-    recon_11 = truncated << shift_amount                     # [n_groups, group_size]
+    recon_11 = truncated << shift_amount
 
-    # Shared exponent per group, broadcast to [n_groups, 1]
     shared_exp = torch.from_numpy(exp_stream.copy()).to(
         dtype=torch.int32, device='cuda'
     ).unsqueeze(1)                                           # [n_groups, 1]
@@ -1671,9 +1813,9 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         core CPUs even with the GIL active.
     mantissa_bits: override the BFP mantissa bit width for this call. None (default)
         uses the module-level BFP_MANTISSA_BITS constant (currently 6). Valid range
-        is 1-10. Higher values give better fidelity at the cost of compression ratio
-        (M=4: aggressive, ~80% savings; M=8: conservative, ~48% savings; M=6: default
-        balance). Only affects BFP mode — ignored for int16/int32/auto modes on
+        is 1-7. Higher values give better fidelity at the cost of compression ratio
+        (M=4: aggressive, ~80% savings; M=7: quality-preserving; M=6: default
+        balance). M>=8 overflows uint8 packing. Only affects BFP mode — ignored for int16/int32/auto modes on
         non-BFP paths. The chosen value is stored per-tensor in the manifest so
         the decoder always reconstructs correctly regardless of the current
         module-level default. Editing the module-level BFP_MANTISSA_BITS constant
@@ -1706,10 +1848,11 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     # prior value at the end of this function so state never leaks.
     _prior_mantissa_override = _bfp_mantissa_override
     if mantissa_bits is not None:
-        if not isinstance(mantissa_bits, int) or mantissa_bits < 1 or mantissa_bits > 10:
+        if not isinstance(mantissa_bits, int) or mantissa_bits < 1 or mantissa_bits > 7:
             raise ValueError(
-                f"mantissa_bits must be an int in [1, 10]; got {mantissa_bits!r}. "
-                f"Common values: 4 (aggressive), 6 (default), 7 (balanced), 8 (conservative)."
+                f"mantissa_bits must be an int in [1, 7]; got {mantissa_bits!r}. "
+                f"M=7 is the maximum (matches BF16 native precision). "
+                f"M>=8 would overflow the uint8 packing format."
             )
         _bfp_mantissa_override = mantissa_bits
         print(f"  Mantissa bits override: M={mantissa_bits} "
@@ -4530,12 +4673,12 @@ def main():
                             help="Number of threads for per-tensor encoding (default: auto, "
                                  "uses min(8, cpu_count) on CPU and 1 on GPU)")
     p_compress.add_argument("--mantissa-bits", type=int, default=None,
-                            help="Override BFP mantissa bit width (int in [1, 10]). Only affects "
-                                 "BFP mode. Common values: 4 (aggressive, smaller files), "
-                                 "6 (default, balanced), 7 (balanced, better fidelity), "
-                                 "8 (conservative, highest fidelity). Default uses the shipping "
-                                 "constant (6). The chosen value is stored per-tensor in the "
-                                 "manifest so decoders always reconstruct correctly.")
+                            help="Override BFP mantissa bit width (int in [1, 7]). Only affects "
+                                 "BFP mode. Common values: 4 (aggressive), 6 (default), "
+                                 "7 (quality-preserving). M>=8 overflows uint8 packing. "
+                                 "Default uses the shipping constant (6). The chosen value is "
+                                 "stored per-tensor in the manifest so decoders always "
+                                 "reconstruct correctly.")
     p_compress.add_argument("--fast-load", action="store_true", default=False,
                             help="Store embedding and output-head tensors as FP16 instead of BFP. "
                                  "~13%% larger file but enables instant loading for compressed "

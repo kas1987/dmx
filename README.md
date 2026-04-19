@@ -1,549 +1,412 @@
-# DMX — Delta Multiplexed Model Format
+# DMX
 
-**Structure-aware compression for neural networks.**
-
-DMX transforms weight tensors into aligned integer representations, enabling efficient storage and distribution of model variants. The headline capability is **55-87% compression of safetensors / checkpoint files / checkpoint deltas with practically lossless reconstruction**.
-
-**Safe for production training.** Resuming from DMX-reconstructed checkpoints produces 0.15% loss difference after 50 chain resumes over 10,000 training steps — verified on GPU with reproducible scripts. Delta chains use exact integer arithmetic with zero error accumulation regardless of chain length.
+**DevOps primitives for neural networks: lossless storage, content-addressable deltas, provenance manifests, and runtime derivation — one file format for the entire model lifecycle.**
 
 ---
 
-**Contents:** [What is DMX?](#what-is-dmx) · [How It Works](#how-it-works) · [Installation](#installation) · [Quick Start](#quick-start) · [Delta Compression](#delta-compression-checkpoint--model-versioning) · [Chain Compression](#chain-compression-training-run-checkpoints-every-n-step-cadences) · [Quantized Export](#quantized-export-derive-int8--nf4--fp8-on-demand) · [Browser Decoder & 3DGS](#browser-decoder-and-3dgs-support) · [Benchmarks](#benchmarks) · [Why DMX Matters](#why-dmx-matters-for-training) · [Validated Results](#validated-results-checkpoint-delta-compression) · [Research](#research-directions) · [License & Patent](#license--patent)
+**Contents**
+
+- [What DMX is](#what-dmx-is)
+- [The gap DMX fills](#the-gap-dmx-fills)
+- [Storage: archival-grade lossless](#storage-archival-grade-lossless)
+- [Deltas: efficient updates across versions](#deltas-efficient-updates-across-versions)
+- [Inference: runtime derivation](#inference-runtime-derivation)
+- [Provenance: supply-chain visibility](#provenance-supply-chain-visibility)
+- [Beyond neural network weights](#beyond-neural-network-weights)
+- [Where DMX fits in ML DevOps](#where-dmx-fits-in-ml-devops)
+- [Roadmap](#roadmap)
+- [Status](#status)
+- [Technical details](#technical-details)
+- [Quick start](#quick-start)
+- [License and patent](#license-and-patent)
+- [Citation](#citation)
 
 ---
 
-```
-Original:  9.1 GB  (SVD-XT, FP32 — 80% includes FP32→FP16 conversion)
-DMX:       1.8 GB
-```
+## What DMX is
 
-```
-Original:  7.2 GB  (Wan 2.2 14B shard, FP32 — 79.5% includes FP32→FP16)
-DMX:       1.5 GB  (142/142 tensors verified)
-```
+DMX is a file format and set of primitives for managing neural network artifacts the way the rest of IT has managed artifacts for decades. A single DMX file serves the entire model lifecycle: lossless storage for archival and distribution, content-addressable deltas for training chains and variant families, embedded provenance for supply-chain visibility, and runtime derivation for efficient inference across heterogeneous hardware.
 
-```
-Original:  16 GB   (Llama 3.1 8B, BF16 — 53% pure BF16 compression)
-DMX:       ~7.5 GB (+0.70% perplexity on wikitext-2)
-```
-
-### Try it now
-
-```bash
-pip install dmx-compress
-dmx compress your_model.safetensors compressed.dmx
-```
-
-### Download pre-compressed models
-
-| Model | Original | DMX | Savings | Verified |
-|-------|----------|-----|---------|----------|
-| [Wan 1.3B](https://huggingface.co/Senat1/dmx-wan-1.3b) | 2.7 GB | 1.1 GB | 60% | 825/825 tensors |
-| [Wan 2.2 shard](https://huggingface.co/Senat1/dmx-wan2.2-shard6) | 7.2 GB | 1.5 GB | 79.5% | 142/142 tensors |
-| [SVD-XT](https://huggingface.co/Senat1/dmx-svd-xt) | 9.1 GB | 1.8 GB | 80% | Roundtrip verified |
+The core idea is that lossless storage is the foundation. Once the stored weights are bit-exact, everything else — deltas between related checkpoints, efficient distribution of model variants, fast inference-time derivations, verifiable lineage — becomes straightforward and trustworthy. Quality tradeoffs belong at inference (where they're reversible by going back to the source), not at storage (where they corrupt the foundation every downstream operation depends on).
 
 ---
 
-## What is DMX?
+## The gap DMX fills
 
-DMX is a structure-aware compression system for neural networks. It reduces model file sizes by 55-80% while preserving quality (+0.03-0.70% perplexity), with reversible decompression back to the original format.
+Neural network artifact handling today looks nothing like modern software artifact handling. Multi-gigabyte files download as single blobs with no resume. Checkpoints duplicate full files instead of storing deltas. Variants of the same base model re-duplicate most of the base across every fork. There's no content-addressable storage, no standard provenance tracking, no built-in supply-chain verification. A new model variant means a new full download.
 
-DMX also supports delta-based model storage with deterministic reconstruction and ROI-driven adaptive rebasing — enabling efficient versioning across model families.
+The rest of IT solved these problems decades ago. Resumable downloads, content-addressable storage, delta updates, dedup across related artifacts, signed provenance, versioned registries — these have been standard DevOps practice since the 1990s and early 2000s. ML adopted none of it.
 
-- **No retraining required** — compress any pretrained safetensors model
-- **Reversible** — decompress back to the original format
-- **Broad compatibility** — tested on LLMs, diffusion models, video models, encoder-decoder
+This gap isn't because the problems don't exist in ML. It's because the file formats (safetensors, pickle) are blob-oriented with no structural awareness, and the infrastructure grew up inside research contexts where "download the weights file" was the whole workflow. With models now reaching hundreds of billions of parameters, the gap has become operationally expensive.
 
-**DMX reduces the cost of storing, moving, and resuming large models — without breaking training.**
+DMX is the set of primitives that closes this gap. Each DMX feature maps onto a standard DevOps practice:
 
-## Compression & Delta Storage
+- **Archival integrity** → lossless storage with content-addressable hashes
+- **Efficient updates** → bit-exact deltas between related versions
+- **Supply-chain visibility** → embedded provenance manifests
+- **Flexible deployment** → runtime derivation to hardware-appropriate representations
+- **Registry compatibility** → fits into existing distribution infrastructure
 
-| Capability | Evidence |
-|-----------|---------|
-| Single-file compression (55-80%) | 6+ models, Llama 3 8B through SVD-XT |
-| Checkpoint delta chains (87%) | GPT-2, T5, TinyLlama, Qwen 3B |
-| Full checkpoint w/ optimizer (79%) | GPT-2 1000-step, weights + momentum + variance |
-| Zero chain accumulation error | Exact integer arithmetic, 10K steps / 50 resumes |
-| Fine-tune variant distribution (80%) | [Qwen 2.5 3B delta on HuggingFace](https://huggingface.co/Senat1/dmx-qwen2.5-3b-instruct-delta) |
-| Browser decoder + 3DGS viewer | [dmx-web](https://github.com/willjriley/dmx-web) — WASM decoder, real-time 3DGS rendering |
-
-## How It Works
-
-### BFP Mode (for FP16/BF16 models — recommended)
-```
-Standard FP16:  16 bits per weight (5-bit exponent wasted on unused dynamic range)
-DMX BFP:        ~7 bits per weight (shared exponent per group + truncated mantissa + entropy coding)
-```
-
-Trained weights cluster in a narrow magnitude range — 74% use only 3 of 31 possible exponents. DMX shares one exponent per group of 32 values, eliminating wasted dynamic range, then entropy-codes the mantissa stream.
-
-### int16 Mode (for FP32 models — near-lossless)
-```
-Standard FP32:  32 bits per weight
-DMX int16:      ~13 bits per weight (aligned cross-layer quantization + entropy coding)
-```
-
-Integer quantization as a preprocessing step (not a lossy final format) transforms float weights into a representation where entropy coding is effective. Aligned cross-layer quantization enforces a global coordinate system across layers, enabling structured compression.
-
-### Adaptive per-tensor compression
-
-DMX automatically picks the best compression for each tensor in your model — you don't choose a compressor, DMX does, per tensor, every time. Each tensor gets the strongest compression the candidate set can deliver, capturing the maximum benefit available without any manual tuning.
-
-Actual savings depend on model architecture, source precision (FP16 / BF16 / FP32), and the quantization mode you select. Across the model families we have measured, savings typically fall in the 50–80% range vs the original safetensors file, with no manual tuning required.
-
-### Precision: below the FP32 arithmetic noise floor
-
-DMX INT32 mode roundtrip error falls **below the noise floor of FP32 arithmetic itself.** A single FP32 matrix multiply introduces more error than a full DMX compress → decompress cycle.
-
-| Measurement | RelL2 |
-|-------------|-------|
-| FP32 matmul noise floor (1000 samples, dim=768) | ~1.5–1.8e-07 |
-| DMX INT32 roundtrip (GPU path, real GPT-2 weights) | ~4.1e-08 |
-| DMX INT32 roundtrip (CPU float64 path) | ~1.1e-10 |
-
-On GPU: **~4.5x below** the FP32 noise floor. On CPU with float64 arithmetic: **~1,300x below.**
-
-This means DMX does not degrade the model — it stores weights more faithfully than FP32 represents them during computation. See [`benchmarks/dmx_noise_floor_benchmark.py`](benchmarks/dmx_noise_floor_benchmark.py) to reproduce.
-
-### Why DMX beats generic compression
-
-| Method | Bits/value | Notes |
-|--------|-----------|-------|
-| gzip on safetensors | ~15.5 | Raw floats look like noise |
-| zstd level 19 | 14.06 | Dictionary matching, no prediction |
-| **DMX int16 + entropy** | **11.45** | Aligned quantization enables structured entropy coding |
-| **DMX BFP + zstd** | **~4.2** | Shared exponent eliminates wasted dynamic range |
-
-## Installation
-
-```bash
-pip install dmx-compress
-```
-
-Or from source:
-```bash
-git clone https://github.com/willjriley/dmx.git && cd dmx && pip install -e .
-```
-
-**Requirements:** Python 3.10+, PyTorch 2.0+. GPU (CUDA) is optional — automatically used when available for faster compression and decompression.
-
-## Quick Start
-
-```bash
-# Compress any safetensors model (auto-detects FP16 vs FP32)
-dmx compress model.safetensors model.dmx --mode auto
-
-# Practically lossless compression (FP32 models — error below FP32 noise floor)
-dmx compress model.safetensors model.dmx --mode int32
-
-# Compress with explicit parallel encoding (defaults to min(8, cpu_count) on CPU,
-# 1 on GPU). zstd releases the GIL so threads give real parallelism.
-dmx compress model.safetensors model.dmx --parallel-workers 8
-
-# Tune BFP fidelity with the mantissa-bits slider (4-8, default 6)
-# M=4: aggressive compression, lower fidelity
-# M=6: default, balanced
-# M=8: conservative, highest fidelity
-dmx compress model.safetensors model.dmx --mode bfp --mantissa-bits 7
-
-# Decompress back to safetensors (auto-uses GPU if available)
-dmx decompress model.dmx model.safetensors
-
-# Verify roundtrip quality (with JSON report)
-dmx verify model.safetensors model.dmx --report verify.json
-
-# View compression info
-dmx info model.dmx
-```
-
-Compression output now reports savings against **two baselines** so you can see
-both the source-file ratio and the dtype-independent FP32 baseline side by side:
-
-```text
-Output size: 129.95 MB
-  vs source file (375 MB): 65.3% of source, +34.7% savings
-  vs FP32 equivalent (750 MB): 17.3% of FP32, +82.7% savings
-```
-
-Same compressed bytes, different baselines. The FP32-equivalent column is the
-canonical baseline (`total_params × 4 bytes`) and stays constant regardless of
-whether the input was FP16 or FP32 source.
-
-### Delta compression (checkpoint / model versioning)
-
-```bash
-# Delta-compress a checkpoint against a base (near-lossless, ~87% savings)
-dmx delta-compress base.safetensors checkpoint.safetensors delta.dmxd
-
-# Practically lossless delta (error below FP32 noise floor, ~87% savings)
-dmx delta-compress base.safetensors checkpoint.safetensors delta.dmxd --precision int32
-
-# Reconstruct checkpoint from base + delta
-dmx delta-reconstruct base.safetensors delta.dmxd restored.safetensors
-
-# View delta file info (sparsity, compression, per-component breakdown)
-dmx delta-info delta.dmxd
-```
-
-### Chain compression (training-run checkpoints, every-N-step cadences)
-
-DMX chain compression takes a sequence of related checkpoints (training run, fine-tune steps, branch variants) and stores them as one or more anchors plus deltas, with an automatic anchor-promotion policy that keeps the chain mathematically guaranteed to be no larger than storing each checkpoint with `dmx compress` independently.
-
-```bash
-# Chain-compress a sequence of checkpoints into one output directory
-dmx chain-compress step_1000.safetensors step_2000.safetensors step_3000.safetensors \
-    --output-dir ./compressed_chain
-
-# Reconstruct every checkpoint in the chain back to safetensors
-dmx chain-reconstruct ./compressed_chain --output-dir ./restored
-
-# Reconstruct only specific entries by index
-dmx chain-reconstruct ./compressed_chain --output-dir ./restored --indices 0 2
-```
-
-The auto-anchor policy promotes a checkpoint to a fresh anchor whenever its delta would be larger than re-encoding the checkpoint from scratch, so the chain is self-calibrating across source dtypes and cadences. No manual tuning required.
-
-### Quantized export (derive INT8 / NF4 / FP8 on demand)
-
-One DMX file can serve as the source of truth for multiple quantized formats. Instead of storing separate INT8, NF4, and FP8 files alongside the original, derive them on demand:
-
-```bash
-# Derive INT8 per-channel from a DMX file
-dmx export model.dmx model_int8.safetensors --target int8
-
-# Derive NF4 (QLoRA codebook, group_size=64)
-dmx export model.dmx model_nf4.safetensors --target nf4
-
-# Derive FP8 E4M3 (best results from int32-mode DMX files)
-dmx export model.dmx model_fp8.safetensors --target fp8
-```
-
-**Multi-target export** — derive several formats in a single DMX load:
-
-```bash
-# Write int8.safetensors, nf4.safetensors, and fp8.safetensors to an output dir,
-# decoding the DMX file exactly once and deriving all three from the shared
-# in-memory tensors.
-dmx export model.dmx ./quant_out/ --targets int8,nf4,fp8
-```
-
-When `--targets` is used, the positional `output` must be a directory (created
-if missing) rather than a single file path. Each target is written as
-`{target}.safetensors` inside that directory.
-
-**Performance notes**
-
-Speed improvements depend on your model and workload.
-
-- On decode-dominated models (measured on Pythia 160M), exports can be
-  **~27% faster with 2 targets and ~48% faster with 3 targets** thanks to
-  shared decoding.
-- On models where the derive step dominates (measured on Qwen 2.5 0.5B,
-  where FP8 derivation is heavier), results may vary — **~22% faster with
-  2 targets, but up to ~33% slower with 3 targets** because the per-target
-  work outweighs what decoding-once saves.
-
-Output is byte-equivalent either way — only wall-time varies. If wall-time
-is critical for your use case, benchmark on your target model.
-
-The derived codes are bounded to ±1 LSB of what you'd get by quantizing the original full-precision weights directly. Only RTN-family formats are derivable — calibration-dependent formats like GPTQ and AWQ are not supported because they require activation data that DMX does not store.
-
-### Example: Compress and verify a model from HuggingFace
-
-```bash
-# Download a model
-pip install huggingface_hub
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./wan_model
-
-# Compress it
-dmx compress ./wan_model/model.safetensors wan_compressed.dmx
-
-# Decompress and verify
-dmx verify ./wan_model/model.safetensors wan_compressed.dmx --report report.json
-```
-
-### Browser decoder and 3DGS support
-
-[dmx-web](https://github.com/willjriley/dmx-web) — Rust/WASM decoder for browser-based decompression. Includes a real-time 3D Gaussian Splatting viewer. DMX compresses 3DGS scenes at 60%+ savings with roundtrip-verified visual fidelity (PSNR 48-53 dB, SSIM 0.9997+). [**Live demo**](https://huggingface.co/spaces/Senat1/dmx-3dgs-viewer)
+The sections below describe each primitive, with measured data on current behavior.
 
 ---
 
-## Benchmarks
+## Storage: archival-grade lossless
 
-### Storage and transfer comparison
+DMX stores weights losslessly. When you save a model as DMX, the bits you get back on load are identical to the bits you put in. This is bit-exact, not "practically lossless," not "within noise tolerance" — the reconstructed tensors pass strict bitwise equality against the originals, including for NaN and infinity values.
 
-How a 140 GB model (Llama 3 70B, FP16) compares across compression approaches:
+**Why this matters operationally:** archival integrity. A model stored losslessly can be reproduced exactly years later. Training can resume from any checkpoint with bit-identical weights. Delta chains can extend indefinitely without error accumulation. Downstream consumers can verify they received what the source produced. None of this works if the storage foundation is lossy.
 
-| Method | Compressed Size | Savings | Quality Loss | Purpose |
-|--------|----------------|---------|-------------|---------|
-| **safetensors** | 140 GB | 0% | None | Original format |
-| **gzip** | ~134 GB | ~4% | None | Generic compression (barely helps on floats) |
-| **zstd-19** | ~129 GB | ~8% | None | Better generic compression (still limited) |
-| **DFloat11** | ~98 GB | ~30% | None (lossless) | Lossless NN weight compression |
-| **ZipNN** | ~94 GB | ~33% | None (lossless) | Lossless NN weight compression |
-| **DMX M=7** | ~63 GB | ~55% | +0.03% PPL | **Near-original quality, high compression** |
-| **DMX M=6** | ~56 GB | ~60% | +0.16% PPL | **Aggressive storage compression** |
+### Measured compression
 
-For reference, quantized inference formats like GGUF Q8 (~50%) and Q4 (~75%) achieve similar or greater compression but are designed for a different purpose — running models directly at reduced precision with fused kernels. DMX and GGUF serve different needs and are not interchangeable.
+| Source format | Typical savings | Status |
+|---|---|---|
+| FP32 weights | ~16% | Measured on GPT-2 124M (byte transposition + zstd, bit-exact verified) |
+| FP16 weights | ~24% | Measured on Qwen 1.5B (byte transposition + zstd, bit-exact verified) |
+| BF16 weights | Measurement pending | — |
 
-If lossless is enough, use DFloat11 or ZipNN. If you need to run inference at lower precision, use GGUF. If you need high compression with near-original quality for storage and distribution, that's where DMX lives.
+The range on FP16 reflects a real phenomenon: the compressibility of weights depends on how they were trained and downcast, not just their stored format. Weights trained natively in FP16 or from a careful BF16→FP16 downcast compress differently from weights stored at low bit-widths after mixed-precision training.
 
-| Without DMX | With DMX |
-|-------------|----------|
-| Llama 3 70B: 140 GB download | ~36 GB download |
-| 4-5 models on 1 TB | 10+ models on 1 TB |
+### Why the numbers look modest
 
-### BFP Mode (FP16 models)
+Neural network weights are more compressible at the top of their bit representation (where structure lives) than at the bottom (where noise lives). Lossless compression can only exploit the structured part. The remaining bits are information-theoretically incompressible without losing precision.
 
-| Model | Type | Original | DMX | Savings | Quality |
-|-------|------|----------|-----|---------|---------|
-| Llama 3.1 8B | LLM | 16 GB | ~7.5 GB | **53%** | **+0.70% PPL** (wikitext-2) |
-| Wan 2.2 shard | Video | 7.2 GB | 1.5 GB | **79.5%** | 142/142 tensors pass |
-| Wan 1.3B | Diffusion | 2.7 GB | 1.1 GB | **60%** | 825/825 tensors pass |
-| SVD-XT | Video | 9.1 GB | 1.8 GB | **80%** | Verified roundtrip |
+The savings DMX achieves are at the ceiling of what's possible without giving up bit-exactness, not at the ceiling of what aggressive lossy compression could reach. This is by design — the storage tier is the archival foundation, and it has to be exact.
 
-*Note: SVD-XT 80% includes FP32->FP16 conversion. Wan 2.2 79.5% is on FP32 source with BFP.*
-
-### BFP Quality-per-Bit (Llama 3 8B, wikitext-2, 289K tokens)
-
-| Config | Bits/Weight | Perplexity | vs FP16 |
-|--------|-----------|------------|---------|
-| FP16 baseline | 16.0 | 5.4958 | -- |
-| BFP(M=8) | 9.25 | 5.4964 | +0.01% |
-| BFP(M=7) | 8.25 | 5.4973 | **+0.03%** |
-| BFP(M=6) | 7.25 | 5.5045 | +0.16% |
-| *GGUF Q8_0 (ref)* | *8.50* | *~5.55-5.58* | *~1.0-1.5% (different purpose — inference format)* |
-
-### int16 Mode (FP32 models)
-
-| Model | Type | Original | DMX | Savings | PPL Change |
-|-------|------|----------|-----|---------|------------|
-| SVD-XT | Video | 8.9 GB | 4.0 GB | **55.5%** | Lossless |
-| GPT-2 | LLM | 475 MB | 201 MB | **57.7%** | +0.22% |
-| Phi-2 | LLM | 10.6 GB | 4.2 GB | **60.1%** | +0.12% |
-
-### Decompression Speed
-
-| Model | Mode | CPU | GPU (--gpu) | Speedup |
-|-------|------|-----|-------------|---------|
-| Wan 1.3B | BFP | 185s | 13.4s | 13.8x |
-| SVD-XT | BFP | 281s | 22.3s | 12.5x |
-| SVD-XT | int16 | 10.5s | -- | CPU-bound |
-
-*Benchmarked on RTX 4090 Laptop, Python 3.13. GPU path uses PyTorch CUDA ops.*
-
-**Native CUDA kernels** are available in `kernel/dmx_kernels_v2.cu` — 12 kernels covering the full compression and decompression pipeline (quantize, delta compute, BFP compress/decompress, dequantize, delta apply). Compiled and tested on A100. int32 roundtrip error: 9.3e-10.
+For a deeper explanation of why these numbers are what they are, see [technical design notes](./docs/DESIGN.md).
 
 ---
 
-## Why DMX Matters for Training
+## Deltas: efficient updates across versions
 
-Frontier training runs are $50M-$200M+ each. Checkpoint storage, bandwidth, and crash recovery are recurring operational costs that compound across every experiment and team. DMX addresses these directly.
+DMX supports lossless deltas between related DMX files. Given two DMX files representing related states of the same model — two training checkpoints, a base and a fine-tune, a model and one of its forks — DMX can compute a delta that reconstructs the target from the base exactly, with no floating-point error accumulation regardless of chain length or tree depth.
 
-### What DMX enables
+**Why this matters operationally:** the same delta mechanism that powers `git` and `rsync` applied to model weights. Training runs store checkpoint chains instead of duplicated full files. Model registries store base-plus-deltas instead of full copies per variant. Users download only the changes when updating. A workflow pattern familiar from every other artifact class, finally available for ML.
 
-- **Safe resumption from compressed checkpoints** — 0.15% loss difference after 50 chain resumes over 10K training steps
-- **87% checkpoint storage reduction** — 200 checkpoints of Llama 70B: ~28 TB raw → ~3 TB (projected)
-- **Full checkpoint compression including optimizer** — weights + momentum + variance: 79% savings (measured)
-- **Dense checkpoint history** — save 5-10x more often without the storage penalty
-- **Fine-tune distribution** — store base model once, each variant as a small delta (80% savings)
-- **Weight-shift analytics** — per-layer diffs show exactly what changed between any two checkpoints
+Deltas apply to two distinct use cases: **training chains** (time-ordered checkpoints during a training run) and **fork/variant families** (tree-ordered derivatives of a common base). The underlying mechanism is the same; the economics and workflows are different.
 
-### No other tool does all of this
+### Training chains
 
-| Tool | Delta between versions | Chain safety demonstrated |
-|------|:-:|:-:|
-| **DMX** | **87% savings (structure-aware)** | **0.15% loss diff after 50 resumes / 10K steps** |
-| ZipNN | XOR-based delta (~44% savings) | Not published |
-| DFloat11 | ✗ (per-file only, ~30%) | N/A |
-| Git LFS / DVC | ✗ (full copy each version) | N/A |
-| HuggingFace Hub | ✗ (full copy each version) | N/A |
-| W&B / MLflow | ✗ (full copy each version) | N/A |
-| xdelta (binary diff) | ~8.5% savings | Not published |
+A training run that checkpoints every N steps produces a time-ordered sequence of closely related model states. DMX stores the first checkpoint in full and each subsequent checkpoint as a delta from the previous one. Reconstructing any specific checkpoint is bit-exact — the same weights the training loop saved.
 
-Byte-level delta tools (xdelta, ZipNN XOR) operate on raw float bits, where IEEE 754 layout destroys numerical proximity. DMX produces dramatically sparser deltas (87% vs 44%) by encoding in a structure-aware representation where similar values map to similar integers.
+**Validated measurements:**
 
-### The operational impact
+| Scenario | Source | Compression per delta |
+|---|---|---|
+| Training checkpoints (10-1000 steps apart) | GPT-2 FP32 | 35-43%, distance-dependent |
+| Training checkpoints | FP16 sources | Measurement pending |
+| Training checkpoints | BF16 sources | Measurement pending |
 
-| Aspect | Current Status Quo | With DMX | Benefit |
-|--------|-------------------|---------|---------|
-| Checkpoint frequency | Sparse (forced by cost) | Dense and safe | Better science and debugging |
-| Storage for 200 ckpts (70B) | ~28 TB | ~3 TB (projected) | ~9x reduction |
-| Crash recovery | Reload full checkpoint | Reload small delta | Minutes instead of hours |
-| Fine-tune distribution | Full copy per variant | Small delta per variant | 80% savings (measured) |
-| Experimentation | Branching is expensive | Branch via small delta | 5-10x more experimental forks |
+A finding worth noting: **closer checkpoints compress better than distant ones**. A 10-step delta compresses at 43%; a 1000-step delta at 35%. Frequent checkpointing — which is also safer and more debuggable — costs less per checkpoint under DMX than under full-file storage. The format rewards good checkpointing discipline rather than penalizing it.
 
-DMX transforms checkpoint management into an operational advantage. It enables safe, multi-step training resumptions, preserves per-layer diffs, and drastically reduces the storage cost of model snapshots. Engineers and researchers gain usable model history that was previously impractical, minimizing wasted GPU time, improving training continuity, and lowering cloud storage costs.
+**Chain correctness:** Delta reconstruction uses integer arithmetic with exact round-tripping. Applying a chain of deltas produces the same result as applying each delta independently. There is no error accumulation across chain length. A model reconstructed from `base + delta_1 + delta_2 + ... + delta_N` is bit-identical to the original checkpoint at position N, for any N.
 
-### Efficient model distribution with deltas
+**Chain self-calibration:** When a checkpoint has drifted far enough from its anchor that the delta exceeds a size threshold, DMX drops a fresh anchor and the chain continues from there. No manual tuning required.
 
-DMX enables a new distribution model: send the base model once, then distribute only small aligned deltas for every variant.
+### Fork and variant families
 
-```
-Llama 70B base:          140 GB  (stored/downloaded once)
-  → chat fine-tune:       ~28 GB  (delta only)
-  → code fine-tune:       ~28 GB  (delta only)
-  → medical fine-tune:    ~28 GB  (delta only)
+A base model plus N variants usually means N full downloads. Under DMX, it means one download plus N small deltas.
 
-Traditional: 4 × 140 GB = 560 GB
-With DMX:    140 + 3 × 28 = 224 GB  (60% savings)
-```
+Models rarely exist alone. A base model typically has many derived variants — instruction-tuned forks, domain-specialized fine-tunes, LoRA merges, community variants, quantized exports. Under conventional file formats, each variant costs a full model's worth of storage and bandwidth, even though most bits are shared with the base.
 
-This applies to model hubs (HuggingFace, CivitAI), enterprise model management, and any workflow where multiple variants share a common base. Reconstruction from deltas is verified safe across 10K-step training chains (0.15% loss difference after 50 resumes).
+DMX delta compression applies directly to this case. A distributor or power user can store the base model once and maintain each variant as a small delta from that base. A user who already has the base and wants to try a new variant downloads only the delta and reconstructs the variant locally.
 
-**Where this matters today (estimated scale):**
+This changes the economics of model family distribution:
 
-| Platform | Hosted Models | Est. Fine-Tunes | Redundant Storage | Potential Savings with Deltas |
-|----------|:------------:|:--------------:|:-----------------:|:----------------------------:|
-| HuggingFace | 800K+ | ~500K (est. 60%) | Petabytes of duplicated base weights | ~60-80% bandwidth reduction |
-| CivitAI | 100K+ | Tens of thousands of SD variants | Each a full 2-4 GB copy of SD base | ~80% per variant |
-| Enterprise (per company) | 10-100 variants | Per-customer or per-use-case fine-tunes | Full copy per deployment | ~80% storage per variant |
+- **For users:** Trying multiple variants of a model family becomes cheap. The first variant costs a full base download; each subsequent variant costs only its delta.
+- **For distributors and model hubs:** Storage and bandwidth costs for a model family scale with the number of *distinct changes* across the family, not with the number of variants. A 50-variant family of an 8B model no longer requires 50× the base model's storage per mirror.
+- **For teams:** Maintaining many internal fine-tunes, customer-specific forks, or A/B candidates becomes a per-delta cost rather than a per-full-model cost.
 
-*Estimates based on public model counts and observed fine-tune ratios. Actual savings depend on how much each fine-tune diverges from its base.*
+Reconstructed variants are bit-identical to the original variant files. There is no quality difference between a variant downloaded as a full file and the same variant reconstructed from base plus delta.
 
-### Validated: Qwen 2.5 3B model family
+**Compression depends on how the variant was produced:**
 
-Measured on real HuggingFace models — [reconstructable delta available](https://huggingface.co/Senat1/dmx-qwen2.5-3b-instruct-delta):
+| Variant type | Expected delta size |
+|---|---|
+| LoRA merge into base | Small — LoRA changes are localized and sparse |
+| Light fine-tune (few hundred steps) | Small-to-moderate |
+| Full fine-tune (many epochs on new domain) | Moderate — most layers touched, changes stay structured |
+| Format conversion (e.g. FP16→BF16 of same weights) | Near-zero when source bits align |
 
-```
-Qwen/Qwen2.5-3B (base)           13.6 GB — stored once
-  → Qwen2.5-3B-Instruct          2.88 GB delta (78.8% savings)
-  → Qwen2.5-Coder-3B             5.60 GB delta (58.8% savings — fork, heavier retrain)
-```
-
-| Variant | int16 Zeros | int16 Savings | int32 Savings | RelL2 from Base |
-|---------|:-:|:-:|:-:|:-:|
-| **Instruct** (SFT+RLHF) | 29.2% | **90.7%** | 67.7% | 0.014 |
-| **Coder** (domain retrain) | 0.2% | **58.8%** | 14.9% | 0.828 |
-
-The Coder variant has diverged significantly from the base (RelL2 = 0.83). When a variant drifts this far, DMX supports auto-forking — promoting it to a new base and restarting the delta chain. Coder → Coder-Instruct would delta efficiently from the Coder anchor.
-
-**Reconstruction quality (verified roundtrip):**
-
-| Method | Precision Loss | Industry Acceptance |
-|--------|:-:|---|
-| FP32 → FP16 conversion | Measurable (~1e-3) | Standard practice everywhere |
-| GGUF Q8 quantization | ~1% PPL increase | Widely deployed in production |
-| **DMX int16 delta** | **+0.06% RelL2** | **Less loss than FP32→FP16** |
-| **DMX int32 delta** | **1.87e-7 RelL2** | **Below FP32 arithmetic noise** |
-
-**Try the distribution workflow yourself:**
-```bash
-pip install dmx-compress
-
-# Download base + delta from HuggingFace (base: 13.6 GB, delta: 2.9 GB)
-huggingface-cli download Senat1/dmx-qwen2.5-3b-instruct-delta --local-dir ./qwen-delta
-
-# Reconstruct the full Instruct model from base + delta
-dmx delta-reconstruct ./qwen-delta/qwen2.5-3b-base.safetensors ./qwen-delta/instruct.dmxd qwen2.5-3b-instruct.safetensors
-```
-If you already have the base model locally, you only need the 2.9 GB delta — not the full 13.6 GB Instruct model.
-
-DMX enables multi-million-dollar savings in storage and bandwidth for hubs and enterprises that maintain many fine-tuned model variants, because only small deltas need to be stored and transmitted instead of full checkpoints.
+Measurements across common variant types are in progress.
 
 ---
 
-## Validated Results: Checkpoint Delta Compression
+## Inference: runtime derivation — COMING SOON
 
-All results are measured on real data using an NVIDIA A100-SXM4-80GB. Full result data is in `benchmarks/`.
+> **Note:** The inference runtime (`dmx-vram`) is validated internally but not yet publicly released. The measurements below are from controlled testing. This section describes the target architecture; the shipped CLI currently supports lossless storage and deltas only.
 
-### Compression across architectures
+DMX's stored file is lossless — bit-exact with the source weights. At load time, DMX works down a cascade, starting from full source fidelity and stepping to a compressed representation only when hardware constraints require it. Users don't pick precision modes; the loader walks the cascade and picks the point that fits.
 
-| Model | Architecture | Params | Consecutive Delta Zeros | Entropy (bits) | Measured Savings |
-|-------|-------------|-------:|:----------------------:|:--------------:|:----------------:|
-| GPT-2 | Decoder-only | 163M | 33-67% | 1.76-3.02 | **87.3%** (measured, 498→63 MB) |
-| T5-small | Encoder-decoder | 110M | **89-94%** | **0.49-0.85** | Not yet measured in bytes |
-| TinyLlama | Decoder-only | 1.1B | 16-63% | 1.69-3.73 | **80%** (measured, fine-tune base→chat) |
+**Why this matters operationally:** one canonical artifact serves heterogeneous hardware. A 12 GB laptop, a 24 GB workstation, an 80 GB server GPU, and a 32 GB edge device can all run the same DMX file, each picking the representation that fits its constraints. No per-hardware variants to maintain, no separate pre-exports for every deployment target. The same file that went into archival distribution runs directly on whatever infrastructure needs it.
 
-Delta compression works across model architectures and scales. T5 encoder-decoder shows highest sparsity. TinyLlama 1.1B confirms the pattern holds at scale — sparsity increases as training progresses (16% → 63% zeros). int32 aligned entropy matches int16 at all scales tested (1.71 vs 1.69 bits at 1.1B).
+### The loading cascade
 
-### Precision tiers
+```
+  Lossless DMX file on disk (FP32 or FP16 source, bit-exact)
+                          │
+                          ▼
+    ┌────────────────────────────────────────────┐
+    │  Fit at full precision in VRAM, with room  │
+    │  for expected KV cache?                    │
+    └────────────────────────────────────────────┘
+        │ yes                          │ no
+        ▼                              ▼
+    ┌─────────────┐        ┌──────────────────────────────┐
+    │ Load at     │        │  Derive M=7 compressed form. │
+    │ full        │        │  Fit in VRAM now?            │
+    │ precision   │        └──────────────────────────────┘
+    └─────────────┘             │ yes                │ no
+    bit-exact with source       ▼                    ▼
+                          ┌─────────────┐    ┌─────────────────┐
+                          │ Compressed  │    │ Compressed      │
+                          │ residency   │    │ residency       │
+                          │ (M=7)       │    │ + weight pager  │
+                          └─────────────┘    └─────────────────┘
+                          weights as BFP    some weights paged
+                          in VRAM           from RAM or disk
+```
 
-Both tiers achieve comparable compression — the aligned quantization produces similar entropy regardless of bit width:
+The cascade starts at full source fidelity and steps to a compressed representation only when hardware can't hold the full precision form. Advanced users can override the default (force compressed residency for bandwidth-bound speed gains, pin a specific mode, or use DMX files with a custom loader that ignores the cascade entirely).
 
-| Tier | Consecutive Entropy | Compression | Error | Use Case |
-|------|-------------------:|:----------:|:-----:|----------|
-| **int16 aligned** | 0.6-1.3 bits | **87%** | +0.06% RelL2 | Maximum compression |
-| **int32 aligned** | 1.0-1.2 bits | **~87%** | 1.87e-7 RelL2 | Practically lossless (error below FP32 noise floor) |
-| Raw bit XOR (no alignment) | 14-16 bits | 8.5% | Bit-exact | Baseline — alignment is essential |
+The lossless file on disk is the same regardless of which runtime representation a given machine selects. The cascade happens per-machine at load time, using the same file.
 
-### Full checkpoint including optimizer states
+### Measured fallback quality
 
-Training checkpoints include model weights + Adam optimizer states (momentum + variance), typically 3x the weight size. Validated on GPT-2 124M, 1000 training steps:
+When the cascade reaches M=7 compressed residency, the quality cost of the step-down has been measured across multiple architectures. Numbers below are from selective-roundtrip evaluation that matches the production `dmx-vram` loader's skip_compression pattern (embeddings, `lm_head`, and normalization layers kept at FP16; linear layers compressed to M=7 BFP).
 
-| Component | % of Checkpoint | Delta Sparsity | Entropy | Compression |
-|-----------|:-:|:-:|:-:|:-:|
-| Weights | 33% | 55-66% zeros | 1.8-2.6 bits | ~84% |
-| Momentum (exp_avg) | 33% | 28-30% zeros | 7.5-9.0 bits | ~53% |
-| Variance (exp_avg_sq) | 33% | **91-92% zeros** | **0.6 bits** | **~96%** |
-| **Full checkpoint** | 100% | — | — | **~79%** |
+**Methodology:** wikitext-2 full test split (288K+ tokens), sliding window PPL with max_len=1024 and stride=512, per-token NLL averaged, PPL = exp(mean NLL). All models loaded as explicit FP16. Same methodology applied to every row.
 
-### Safety for training resumption
+| Model | Parameters | Architecture | M=7 PPL delta | BFP compression ratio |
+|---|---|---|---|---|
+| GPT-2 | 124M | GPT-2 | −0.19% | 53.8% |
+| GPT-2 Medium | 355M | GPT-2 | −0.52% | 53.8% |
+| OLMo | 1B | OLMo | +0.76% | ~53% |
+| Pythia | 1.4B | NeoX | +0.77% | ~53% |
+| Qwen 2.5 | 1.5B | Qwen | +0.60% | ~53% |
+| Phi-2 | 2.7B | Phi | +1.37% | ~53% |
+| Qwen 2.5 | 3B | Qwen | +0.58% | ~53% |
+| Mistral | 7B | Mistral | +0.16% | ~53% |
+| Llama 3.1 | 8B | Llama | +0.29% | 53.2% |
 
-Training from DMX-reconstructed checkpoints is safe for production use:
+Across the 9 architectures tested so far, M=7 selective-roundtrip delta stays under 1.5% on wikitext-2, with 8 of 9 models under 0.8%. Performance varies by architecture more than by size: within the Qwen family, delta is similar at 1.5B and 3B (+0.60% and +0.58%). Mistral 7B and Llama 3.1 8B — both standard modern transformer architectures — anchor the larger-model range at +0.16% and +0.29%. Phi-2 shows larger delta (+1.37%) than other models in its size range — Phi's architectural choices around rotary embedding and layer structure appear to make it less tolerant of aggressive quantization. Users deploying Phi-family models or architectures not included in this measurement set (Mamba, MoE, encoder-only, multimodal, vision transformers, etc.) should verify PPL on their specific model and task.
 
-| Test | Steps | DMX Resumes | Final Loss Diff | Result |
-|------|------:|:-----------:|:---------------:|--------|
-| Single resume (100 steps) | 100 | 1 | 0.042% | Negligible |
-| **Long-run chain (10K steps)** | **10,000** | **50** | **0.15%** | **Production-safe** |
+Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selective roundtrip at these sizes is statistically indistinguishable from FP16 inference.
 
-The 10K-step test reconstructed from a DMX delta chain every 200 steps — 50 total resumes over 10,000 training steps. Final loss tracks the clean baseline within 0.15%, with no divergence trend over time.
+### What M=7 represents on DMX's curve
 
-### Zero error accumulation in delta chains (Test 8)
+M=7 is not DMX's only operating point — it's the fallback point the cascade defaults to when the lossless source can't fit at FP16. M is a tunable parameter: the BFP mantissa bits preserved per block of 32 values. Lower M values produce smaller files and more aggressive VRAM savings, at increasing quality cost. M=7 is the point where the step-down from FP16 stays within the noise band of the standard FP32→FP16 conversion that production inference already performs.
 
-Chained reconstruction (base → delta1 → delta2 → ... → deltaN) produces **identical** results to direct reconstruction (base + deltaN) — verified to 10 decimal places across both int16 and int32 modes. This is not an approximation: delta application is exact integer arithmetic, so error is mathematically constant regardless of chain length. Re-anchoring is needed only for delta *size* control, never for error control.
+Lower M settings have not been characterized in this measurement campaign. They would extend DMX's curve toward more aggressive savings, at quality costs appropriate to their precision level. Users who need DMX's file beyond the M=7 regime can re-encode at a lower M; the lossless source remains the source of truth.
 
-### Fine-tune variant compression
+### VRAM characterization (Llama 3.1 8B)
 
-TinyLlama 1.1B base → chat fine-tune: **80% savings** (876 MB delta vs 4.4 GB full copy). Store the base model once, distribute each fine-tune variant as a small delta.
+| Runtime mode | Peak VRAM | Quality vs FP16 |
+|---|---|---|
+| Inflate to FP16 | 15.0 GB | Bit-exact with source |
+| Compressed residency (M=7) | 8.9 GB (~40% reduction) | +0.29% PPL delta |
+| Compressed + paging | ~3-5 GB | +0.29% PPL delta, slower inference |
 
-### Projected Savings at Scale
+### Beyond the default cascade
 
-These projections are extrapolated from observed sparsity and scaling behavior on GPT-2 (163M), T5 (110M), and TinyLlama (1.1B). The core property — very small per-step weight updates under SGD — appears scale-invariant, but we are actively validating on 8B+ models with frontier-scale schedules.
+The cascade above describes DMX's default behavior. Underneath it, DMX exposes a composable set of runtime components: lossless representations (FP32/FP16, INT16 via bitcast), lossy compressed residency (M=7 default, M=6 more aggressive), pre-exported quantization formats (INT8, NF4, FP8 — see Export section), and a weight pager for VRAM that can't hold the chosen representation.
 
-| Scenario                                      | Raw Storage     | Projected DMX     | Projected Savings |
-|-----------------------------------------------|-----------------|-------------------|-------------------|
-| 200 checkpoints of Llama 70B (weights only)   | 28 TB           | ~3.6 TB           | **~87%**          |
-| 200 checkpoints of Llama 70B (full + optimizer) | 84 TB         | ~18 TB            | **~79%**          |
-| 20 fine-tune variants of Llama 70B            | 2.8 TB          | ~700 GB           | **~75%**          |
+Power users can stack these differently than the default. Some examples:
 
-**Key Caveats**
-- Validation on 8B+ models with real frontier training schedules is in progress.
-- Optimizer state compression (currently ~53%) may drop to 40–45% on highly diverse data, reducing full-checkpoint savings to ~70–73%.
-- All projections assume continued zero error accumulation (exact integer arithmetic), as demonstrated in long-chain tests.
+- **Lossless INT16 with paging.** Weights stay bit-exact with source; when VRAM runs out, paging handles the overflow. No quality tradeoff at all.
+- **M=6 compressed residency.** More aggressive compression than the default, accepting a measurable quality cost in exchange for additional VRAM headroom.
+- **Pre-exported INT8 or NF4.** Generate a quantized file once, load it directly. Skips runtime derivation but locks in that format.
+- **Storage-only use.** Use DMX purely for lossless archival and delta compression, loading into your own inference pipeline with no runtime derivation involved.
 
-These numbers suggest DMX could reduce checkpoint storage and I/O pressure by nearly an order of magnitude while keeping training resumption safe.
+The tradeoff axis is **speed ←→ performance** per unit of VRAM. Full precision gives speed at nominal VRAM cost; heavier compression gives more performance per GB at some quality or latency cost. Generating a non-default representation takes one-time compute to derive; once derived, the result is cached and can be paged or switched between modes without re-derivation.
+
+Detailed configuration is documented separately in [technical design notes](./docs/DESIGN.md).
+
+### Export to other formats — COMING SOON
+
+DMX can derive and export weights in other formats — INT8, NF4, FP8, and additional quantization schemes — from the lossless source. This is useful when a deployment target expects a specific format natively, or when a user wants to pre-materialize a derivation rather than computing it at load time.
+
+Export produces a new file in the target format. The source DMX file remains unchanged. Each export is a derivation from the lossless source, so multiple exports from the same source are independent of each other — converting to INT8 and then to NF4 produces the same result as converting directly to NF4 from the DMX source.
+
+*Export paths are implemented but under audit. Behavior on lossless-transpose source files needs verification before export capabilities are documented in full detail here.*
 
 ---
 
-## Research Directions
+## Beyond neural network weights
 
-- **Multi-framework integration** — DeepSpeed, FSDP, and Megatron-LM callbacks for production training pipelines
-- **Checkpoint-efficient continual learning** — delta chains for long-running training with minimal storage overhead
+The structural properties DMX exploits — byte-plane decomposition, exponent clustering, exact integer deltas — are not unique to neural network weights. They apply to any dense floating-point data with similar statistical structure.
 
-We welcome collaboration — reach out via GitHub Issues or Discussions.
+### 3D Gaussian Splats
 
-## Format Specification
+3DGS rendering is structurally the same pattern as model inference: a lossless source is stored at rest, and at runtime DMX derives a representation optimized for the specific downstream consumer. For model inference, the consumer is a transformer and the derivation targets hardware constraints (VRAM, bandwidth, supported precision formats). For 3DGS, the consumer is a browser renderer and the derivation targets rendering speed and streaming bandwidth, with quality held below the perceptual threshold.
 
-See [spec/dmx_spec_v1.md](spec/dmx_spec_v1.md) for the complete format specification.
+The same DMX file can be the lossless source for either use. The derivation happens at load time, tuned to what the consumer needs.
 
-## Paper
+**Two workflows are supported:**
 
-[DMX: Delta Multiplexed Compression for Neural Network Model Weights (PDF)](https://github.com/willjriley/dmx/raw/main/paper/DMX_Paper.pdf) — click to download
+- **Lossless source with runtime derivation (recommended).** Store the 3DGS scene as a lossless DMX file. At load time, the decoder derives a streaming-quality representation for rendering. The source remains available for archival, re-derivation at different quality targets, or any future downstream use. Provenance records the file as lossless.
 
-## Background
+- **Direct lossy export (available when archival fidelity is not required).** When file size is the priority and the 3DGS scene will only ever be consumed by a renderer at perceptual quality, DMX can compress directly to a lossy representation at rest. This is opt-in, not the default. The provenance manifest records that the file is lossy, so downstream consumers know they are not receiving an archival source.
 
-DMX is based on the principle that floating-point weights should be transformed into multiple statistically distinct, independently modeled entropy domains prior to compression. Trained neural network weights exhibit extreme exponent clustering — 74% of FP16 values use only 3 of 31 possible exponents, wasting 2.4 bits per value. DMX decomposes the floating-point representation into separate exponent and mantissa streams, each with distinct statistical properties that benefit from independent entropy coding. For FP32 models, aligned cross-layer quantization enforces a global coordinate system across layers, enabling additional integer-domain compression. The format auto-profiles each model to select the optimal compression strategy per component.
+**Measured rendering quality on shipped lossy path:** The previously validated lossy compression path (BFP with FLAC entropy coding) produces ~63% bandwidth reduction on typical 3DGS scenes (measured on the bonsai scene, ~265 MB → 97.2 MB), with rendering quality at PSNR 48.50 dB mean and SSIM 0.9997 across 100 viewpoints per scene. These numbers are well above the perceptual threshold for visible difference — the rendered scene is indistinguishable from the source in practice. Lossless compression numbers under the current main encoder are pending measurement.
 
-## License & Patent
+**dmx-web** is the companion Rust/WASM browser decoder ([github.com/willjriley/dmx-web](https://github.com/willjriley/dmx-web)). It reconstructs DMX-compressed 3DGS data directly in the browser and includes a real-time Gaussian splatting viewer rendered via WebGL2. The same compressed file sitting on a server decodes and renders in a browser tab — no server-side processing, no intermediate format conversions, and no Python runtime required.
+
+**Live demo:** [huggingface.co/spaces/Senat1/dmx-3dgs-viewer](https://huggingface.co/spaces/Senat1/dmx-3dgs-viewer)
+
+The decoder has been validated against 2,436 tensor roundtrips across all encoding paths and entropy codecs (zstd, brotli, FLAC).
+
+---
+
+## Provenance: supply-chain visibility
+
+Every DMX file carries an embedded provenance manifest that records what it is, where it came from, and what operations produced it. The manifest is part of the file itself, not a sidecar — it travels with the data and cannot be lost or replaced independently.
+
+**Why this matters operationally:** supply-chain visibility for ML artifacts. The same pattern that SBOMs (Software Bill of Materials) provide for application builds and that signed commits provide for code, applied to neural network weights. A consumer receiving a DMX file can verify its source, trace its lineage, and detect whether lossy operations appear anywhere in its history. This matters for regulated deployment contexts, for distribution integrity, and for debugging when a model variant behaves unexpectedly in production.
+
+The manifest provides three concrete capabilities:
+
+**Identity.** Each file carries a hash of its source weights and a hash of its own compressed data. A user receiving a DMX file can verify that it came from the source it claims to come from and that its contents haven't been altered since creation.
+
+**Lineage.** Every file records its parent (if derived), its delta base (if it's a delta), its lineage depth, and the hash of the original root source. A user can trace any DMX file back to the original checkpoint it descended from, through any number of intermediate operations.
+
+**Warnings at boundaries.** When an operation produces a derivative file whose quality is bounded by an earlier lossy step — for example, a delta computed against a lossy base — the resulting file carries a warning in its manifest. Downstream tooling can detect these warnings and decide how to handle them (proceed with caveat, refuse to use as a lossless source, require explicit user confirmation). The format reports the state; consumers enforce policy.
+
+The manifest aligns with real standards where they exist: field conventions draw from the EU AI Act Article 13 transparency requirements, the NIST AI Risk Management Framework, and the C2PA content provenance standard. This is deliberate — DMX is designed to work in regulated and distribution-integrity-sensitive contexts, not only in research settings.
+
+### What Phase 1 delivers
+
+The initial implementation focuses on the trust-critical subset:
+
+- Source identity (source hash, content hash)
+- Lineage (parent, delta base, lineage depth, root hash)
+- Lossy-source warnings (automatic when an operation produces output bounded by an earlier lossy step)
+- Integrity (cryptographic hash of the compressed data)
+- Creation metadata (timestamp, model architecture, parameter count, source format)
+
+### What's coming later
+
+Training-pipeline integration (checkpoint step, epoch, training config hash), cryptographic signing (C2PA-compatible detached signatures), regulatory metadata fields (license, author, intended use, known limitations), and merge-tracking for weight-averaged models are defined in the manifest schema and will ship in subsequent phases.
+
+For the full manifest schema, see [DMX_MANIFEST_SCHEMA.md](./private_docs/DMX_MANIFEST_SCHEMA.md).
+
+---
+
+## Where DMX fits in ML DevOps
+
+DMX maps onto the stages that existing ML infrastructure already has. It doesn't ask operators to adopt new workflows — it improves the economics of stages they're already running.
+
+### Training and checkpointing
+
+Training pipelines already produce checkpoints at intervals. DMX replaces bulk full-file checkpoint storage with lossless base-plus-deltas, recording ~35-43% per-delta compression on measured training chains. Frequent checkpointing becomes affordable; checkpoint rollback is bit-exact reconstruction from any point in the chain. Provenance captures checkpoint step, training configuration hash, and lineage to the root source.
+
+### Model registry and distribution
+
+Model registries currently store full files per variant. DMX stores the base once and maintains variants as small deltas, scaling registry storage with the number of distinct changes across a model family rather than the number of variants. A registry with 50 variants of an 8B model stops requiring 50× the base model's storage per mirror. Distribution bandwidth drops accordingly — users pull the base once, variants arrive as small delta files.
+
+### Serving and deployment — COMING SOON
+
+> **Note:** Compressed residency requires the `dmx-vram` runtime, which is validated internally but not yet publicly released. The numbers below are from controlled testing.
+
+Production inference infrastructure has a VRAM budget per GPU and wants to maximize throughput per dollar. DMX compressed residency (measured +0.29% PPL delta on Llama 3.1 8B) reduces weight VRAM by ~40%, freeing that capacity for larger batch sizes, longer contexts, multi-model tenancy, or deployment on smaller hardware tiers. One DMX file serves all of these use cases; the runtime picks the appropriate representation per machine.
+
+### Governance and compliance
+
+Regulated deployment contexts (EU AI Act, NIST AI RMF, industry-specific compliance) require supply-chain documentation for model artifacts. DMX's embedded provenance manifests align with these standards — source identity, lineage tracing, lossy-operation warnings, integrity verification. The same infrastructure that provides DevOps convenience also satisfies audit requirements.
+
+### Edge and on-device inference — COMING SOON
+
+> **Note:** Requires `dmx-vram` runtime. Not yet publicly released.
+
+Mobile and embedded devices have sharply constrained memory. At DMX M=7 compressed residency, models that don't fit natively (3B-8B class on 8-12 GB mobile devices) become candidates. The same file that ships to server clusters ships to on-device deployment; the cascade picks compressed residency automatically on memory-constrained hardware. *(Mobile runtime kernels are roadmap; current runtime is CUDA-based.)*
+
+### When DMX is less interesting
+
+DMX is less interesting if you only deploy a single model to a single hardware target and don't care about checkpoint history, distribution topology, or lineage verification. Conventional tools work fine for that case. DMX's value scales with the complexity of the artifact lifecycle you're managing.
+
+---
+
+## Roadmap
+
+These are directional ideas under consideration, not committed features. They describe where the format could go if the foundations hold up.
+
+### DMX-Server
+
+A server component that holds DMX files (base models, variants, checkpoint chains) and serves derived artifacts on demand. Local or cloud-hosted.
+
+A client asks for "this base model at this precision for this hardware," and the server derives the requested representation on the fly from the lossless source it holds, then streams the result. The same derivation mechanism that enables local load-time auto-selection (see Inference section) extends naturally to server-side on-demand export — the local DMX loader and DMX-Server are running the same transformation, just in different locations.
+
+This inverts the conventional distribution model. Rather than pre-exporting every possible variant for every possible hardware target and storing them all, the server stores only the lossless canonical source plus any relevant deltas, and produces variants as needed. Popular derivations can be cached; cold derivations are cheap to recompute on demand.
+
+### DMX-REPO (or HuggingFace extension)
+
+Version-control-like workflow for model families. Base models as commits, variants as branches, deltas as the diffs. Whether this lives as a standalone repository format or as an extension layered onto existing model hubs (HuggingFace in particular) is under consideration — the extension path is likely the more pragmatic route because it meets users where they already are.
+
+### Other directions under exploration
+
+- Additional data modalities beyond neural network weights and 3D Gaussian Splats — any dense floating-point data with exploitable structure is a candidate.
+- Provenance manifest expansion beyond Phase 1 — cryptographic signing (C2PA-compatible), training pipeline integration (checkpoint step, epoch, training config hash), regulatory metadata fields, and merge tracking for weight-averaged models. Schema defined; implementation staged.
+- Format conversion utilities that make DMX a transit format between existing neural network file formats without requiring full re-export.
+
+---
+
+## Status
+
+DMX is in active development. The format, tooling, and documentation are evolving.
+
+**Currently shipped:**
+- Lossless storage on FP32, FP16, and BF16 sources
+- Lossless storage as the default CLI behavior
+- Lossless delta compression on FP32 training checkpoints via the CLI
+- `.dmx` files accepted directly as delta inputs (base or target, any combination)
+- Provenance manifest Phase 1 embedded in every new `.dmx` and `.dmxd` file (source identity, lineage, lossy-source warnings, integrity)
+- Lineage chain reference through delta operations (content_hash-based, not file-SHA-based, when inputs are `.dmx`)
+- `dmx inspect` command for manifest display and content-hash verification
+- Legacy lossy delta path preserved as `--lossy-quantized` opt-in
+- 3DGS streaming at ~60%+ bandwidth reduction with perceptual quality (PSNR 48-53 dB, SSIM 0.9997+); dmx-web Rust/WASM browser decoder with real-time viewer; decoder validated against 2,436 tensor roundtrips
+
+**Validated internally (not yet publicly released):**
+- Auto-selected inference mode on Llama-class models (requires dmx-vram runtime)
+- M=7 compressed residency with measured PPL across 9 architectures
+
+**In validation:**
+- Lossless delta compression on FP16 and BF16 training checkpoints
+- Fork and variant delta scenarios (LoRA merges, fine-tunes, format conversions)
+- Additional model architectures for inference quality measurement
+
+**Planned (Phase 2 and beyond):**
+- Provenance manifest expansion: cryptographic signing, training pipeline integration, regulatory fields, merge tracking
+- Published benchmark corpus and reproducibility scripts
+- Expanded auto-selection heuristics for emerging hardware
+
+---
+
+## Technical details
+
+For the underlying mechanics — how storage compression works, how deltas are computed, how the inference auto-selection decides, and what the precision and correctness guarantees formally are — see [DESIGN.md].
+
+For measurement methodology and reproducibility — how the numbers in this document were produced, which benchmarks were used, and how to reproduce them — see [BENCHMARKS.md].
+
+---
+
+## Quick start
+
+```
+# placeholder — install and basic usage examples to be filled in
+# once the CLI surface stabilizes
+```
+
+---
+
+## License and patent
 
 **Code:** MIT License — free to use, modify, and distribute.
 
-**Methods:** Patent Pending (U.S. Provisional Applications filed April 2026). The patented methods cover aligned cross-layer quantization for neural network weight compression and stream-separated block floating point encoding with independent entropy coding. Personal, academic, and open-source use is unrestricted. Commercial use of the patented methods may require a license from the inventor — contact bill.riley@gmail.com.
+**Methods:** Patent Pending (U.S. Provisional Applications filed April 2026). The patented methods cover aligned cross-layer quantization for neural network weight compression and stream-separated block floating point encoding with independent entropy coding. Personal, academic, and open-source use is unrestricted. Commercial use of the patented methods may require a license from the inventor — contact **bill.riley@gmail.com**.
 
 ## Citation
 
-```bibtex
+```
 @software{riley2026dmx,
   author = {Riley, William J},
   title = {DMX: Delta Multiplexed Model Format},
@@ -551,3 +414,7 @@ DMX is based on the principle that floating-point weights should be transformed 
   url = {https://github.com/willjriley/dmx}
 }
 ```
+
+---
+
+*End of README.*
