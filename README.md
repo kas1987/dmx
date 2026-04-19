@@ -134,7 +134,7 @@ Measurements across common variant types are in progress.
 
 ## Inference: runtime derivation — COMING SOON
 
-> **Note:** The inference runtime (`dmx-vram`) is validated internally but not yet publicly released. The measurements below are from controlled testing. This section describes the target architecture; the shipped CLI currently supports lossless storage and deltas only.
+> **Note:** The inference runtime (`dmx-vram`) is not yet publicly released. The measurements below are preliminary. This section describes the target architecture; the shipped CLI currently supports lossless storage and deltas only.
 
 DMX's stored file is lossless — bit-exact with the source weights. At load time, DMX works down a cascade, starting from full source fidelity and stepping to a compressed representation only when hardware constraints require it. Users don't pick precision modes; the loader walks the cascade and picks the point that fits.
 
@@ -197,7 +197,7 @@ Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selec
 
 M=7 is not DMX's only operating point — it's the fallback point the cascade defaults to when the lossless source can't fit at FP16. M is a tunable parameter: the BFP mantissa bits preserved per block of 32 values. Lower M values produce smaller files and more aggressive VRAM savings, at increasing quality cost. M=7 is the point where the step-down from FP16 stays within the noise band of the standard FP32→FP16 conversion that production inference already performs.
 
-Lower M settings have not been characterized in this measurement campaign. They would extend DMX's curve toward more aggressive savings, at quality costs appropriate to their precision level. Users who need DMX's file beyond the M=7 regime can re-encode at a lower M; the lossless source remains the source of truth.
+Lower M settings have not yet been characterized. They would extend DMX's curve toward more aggressive savings, at quality costs appropriate to their precision level. Users who need DMX's file beyond the M=7 regime can re-encode at a lower M; the lossless source remains the source of truth.
 
 ### VRAM characterization (Llama 3.1 8B)
 
@@ -228,7 +228,7 @@ DMX can derive and export weights in other formats — INT8, NF4, FP8, and addit
 
 Export produces a new file in the target format. The source DMX file remains unchanged. Each export is a derivation from the lossless source, so multiple exports from the same source are independent of each other — converting to INT8 and then to NF4 produces the same result as converting directly to NF4 from the DMX source.
 
-*Export paths are implemented but under audit. Behavior on lossless-transpose source files needs verification before export capabilities are documented in full detail here.*
+*Export paths are implemented but not yet fully verified. Detailed documentation will follow once behavior on all source file types is confirmed.*
 
 ---
 
@@ -248,7 +248,7 @@ The same DMX file can be the lossless source for either use. The derivation happ
 
 - **Direct lossy export (available when archival fidelity is not required).** When file size is the priority and the 3DGS scene will only ever be consumed by a renderer at perceptual quality, DMX can compress directly to a lossy representation at rest. This is opt-in, not the default. The provenance manifest records that the file is lossy, so downstream consumers know they are not receiving an archival source.
 
-**Measured rendering quality on shipped lossy path:** The previously validated lossy compression path (BFP with FLAC entropy coding) produces ~63% bandwidth reduction on typical 3DGS scenes (measured on the bonsai scene, ~265 MB → 97.2 MB), with rendering quality at PSNR 48.50 dB mean and SSIM 0.9997 across 100 viewpoints per scene. These numbers are well above the perceptual threshold for visible difference — the rendered scene is indistinguishable from the source in practice. Lossless compression numbers under the current main encoder are pending measurement.
+**Measured rendering quality on shipped lossy path:** The lossy compression path (BFP with FLAC entropy coding) produces ~63% bandwidth reduction on typical 3DGS scenes (measured on the bonsai scene, ~265 MB → 97.2 MB), with rendering quality at PSNR 48.50 dB mean and SSIM 0.9997 across 100 viewpoints per scene. These numbers are well above the perceptual threshold for visible difference — the rendered scene is indistinguishable from the source in practice. Lossless compression numbers under the current main encoder are pending measurement.
 
 **dmx-web** is the companion Rust/WASM browser decoder ([github.com/willjriley/dmx-web](https://github.com/willjriley/dmx-web)). It reconstructs DMX-compressed 3DGS data directly in the browser and includes a real-time Gaussian splatting viewer rendered via WebGL2. The same compressed file sitting on a server decodes and renders in a browser tab — no server-side processing, no intermediate format conversions, and no Python runtime required.
 
@@ -288,7 +288,7 @@ The initial implementation focuses on the trust-critical subset:
 
 Training-pipeline integration (checkpoint step, epoch, training config hash), cryptographic signing (C2PA-compatible detached signatures), regulatory metadata fields (license, author, intended use, known limitations), and merge-tracking for weight-averaged models are defined in the manifest schema and will ship in subsequent phases.
 
-For the full manifest schema, see [DMX_MANIFEST_SCHEMA.md](./private_docs/DMX_MANIFEST_SCHEMA.md).
+The full manifest schema is documented in [DESIGN.md](./docs/DESIGN.md).
 
 ---
 

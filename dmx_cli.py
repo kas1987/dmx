@@ -4676,7 +4676,7 @@ def main():
                             help="Override BFP mantissa bit width (int in [1, 7]). Only affects "
                                  "BFP mode. Common values: 4 (aggressive), 6 (default), "
                                  "7 (quality-preserving). M>=8 overflows uint8 packing. "
-                                 "Default uses the shipping constant (6). The chosen value is "
+                                 "Default: 6. The chosen value is "
                                  "stored per-tensor in the manifest so decoders always "
                                  "reconstruct correctly.")
     p_compress.add_argument("--fast-load", action="store_true", default=False,
