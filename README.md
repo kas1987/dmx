@@ -63,7 +63,7 @@ DMX stores weights losslessly. When you save a model as DMX, the bits you get ba
 |---|---|---|
 | FP32 weights | ~16% | Measured on GPT-2 124M (byte transposition + zstd, bit-exact verified) |
 | FP16 weights | ~24% | Measured on Qwen 1.5B (byte transposition + zstd, bit-exact verified) |
-| BF16 weights | Measurement pending | — |
+| BF16 weights | ~33% | Measured on Qwen 1.5B (byte transposition + zstd, bit-exact verified) |
 
 The range on FP16 reflects a real phenomenon: the compressibility of weights depends on how they were trained and downcast, not just their stored format. Weights trained natively in FP16 or from a careful BF16→FP16 downcast compress differently from weights stored at low bit-widths after mixed-precision training.
 
@@ -197,7 +197,7 @@ Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selec
 
 M=7 is not DMX's only operating point — it's the fallback point the cascade defaults to when the lossless source can't fit at FP16. M is a tunable parameter: the BFP mantissa bits preserved per block of 32 values. Lower M values produce smaller files and more aggressive VRAM savings, at increasing quality cost. M=7 is the point where the step-down from FP16 stays within the noise band of the standard FP32→FP16 conversion that production inference already performs.
 
-Lower M settings have not yet been characterized. They would extend DMX's curve toward more aggressive savings, at quality costs appropriate to their precision level. Users who need DMX's file beyond the M=7 regime can re-encode at a lower M; the lossless source remains the source of truth.
+Lower M settings (M=6, M=5, M=4) have been characterized on Qwen 1.5B BF16, with PPL deltas ranging from near-zero (M=6) to significant (M=4). Detailed M-dial data will be published in a future update. They would extend DMX's curve toward more aggressive savings, at quality costs appropriate to their precision level. Users who need DMX's file beyond the M=7 regime can re-encode at a lower M; the lossless source remains the source of truth.
 
 ### VRAM characterization (Llama 3.1 8B)
 
