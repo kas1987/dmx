@@ -1805,7 +1805,8 @@ def _is_fast_load_tensor(name):
 
 
 def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=None,
-                  parallel_workers=None, mantissa_bits=None, fast_load=False):
+                  parallel_workers=None, mantissa_bits=None, fast_load=False,
+                  skip_layers=None):
     """Compress a safetensors file to .dmx format.
 
     mode: 'auto', 'bfp', 'int16', 'int32', or 'transpose'
@@ -1881,6 +1882,14 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     if _fast_load_override:
         print(f"  Fast-load mode: embed/head tensors stored as FP16 (patterns: {FAST_LOAD_PATTERNS})")
 
+    # Resolve skip_layers. Comma-separated patterns — matching tensors are stored
+    # as lossless (ENC_TRANSPOSE_LOSSLESS) instead of BFP. Recorded in manifest.
+    _skip_layers_patterns = tuple(p.strip() for p in skip_layers.split(",")) if skip_layers else ()
+    if _skip_layers_patterns:
+        print(f"  Skip-layers: {len(_skip_layers_patterns)} patterns — matching tensors stored losslessly")
+        for p in _skip_layers_patterns:
+            print(f"    - {p}")
+
     # Resolve entropy mode. Normalize legacy aliases to the canonical names
     # used by the selector and dispatch helpers.
     if entropy in (None, "auto"):
@@ -1933,6 +1942,9 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         "tensor_count": len(tensors),
         "tensors": {},
     }
+    # Record skip_layers intent in manifest (Option D: loader visibility)
+    if _skip_layers_patterns:
+        manifest["skip_layers"] = list(_skip_layers_patterns)
 
     compressed_chunks = {}
     total_raw = 0
@@ -1972,9 +1984,15 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
             if is_fast_load:
                 encoding = ENC_FP16_ZSTD
+            # --skip-layers override: store matching tensors as lossless transpose
+            is_skip_layer = _skip_layers_patterns and any(pat in key for pat in _skip_layers_patterns)
+            if is_skip_layer:
+                encoding = ENC_TRANSPOSE_LOSSLESS
             compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
             if is_fast_load:
                 meta["fast_load"] = True
+            if is_skip_layer:
+                meta["skip_layer"] = True
             return key, encoding, compressed, meta
 
         with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
@@ -1995,11 +2013,17 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
             if is_fast_load:
                 encoding = ENC_FP16_ZSTD
+            # --skip-layers override: store matching tensors as lossless transpose
+            is_skip_layer = _skip_layers_patterns and any(pat in key for pat in _skip_layers_patterns)
+            if is_skip_layer:
+                encoding = ENC_TRANSPOSE_LOSSLESS
             enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
 
             compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
             if is_fast_load:
                 meta["fast_load"] = True
+            if is_skip_layer:
+                meta["skip_layer"] = True
             manifest["tensors"][key] = meta
             compressed_chunks[key] = compressed
 
@@ -4699,6 +4723,12 @@ def main():
                             help="Store embedding and output-head tensors as FP16 instead of BFP. "
                                  "~13%% larger file but enables instant loading for compressed "
                                  "residency (no materialize step). Recommended for interactive use.")
+    p_compress.add_argument("--skip-layers", type=str, default=None,
+                            help="Comma-separated list of layer name patterns to protect at FP16 "
+                                 "instead of BFP. Matching tensors are stored losslessly. "
+                                 "Example: 'model.layers.29,model.layers.30,model.layers.31' "
+                                 "protects Phi-2's output layers for quality. "
+                                 "Recorded in the manifest as skip_layers for loader visibility.")
 
     p_decompress = sub.add_parser("decompress", help="Decompress .dmx to safetensors")
     p_decompress.add_argument("input", help="Input .dmx file")
@@ -4841,7 +4871,8 @@ def main():
                       use_gpu=args.gpu if args.gpu else None,
                       parallel_workers=args.parallel_workers,
                       mantissa_bits=args.mantissa_bits,
-                      fast_load=args.fast_load)
+                      fast_load=args.fast_load,
+                      skip_layers=args.skip_layers)
         if args.report:
             print()
             print("=== Auto-verify after compression ===")
