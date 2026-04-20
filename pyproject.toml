@@ -59,3 +59,4 @@ dmx = "dmx_cli:main"
 
 [tool.setuptools]
 py-modules = ["dmx_cli"]
+packages = ["dmx"]
