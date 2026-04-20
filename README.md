@@ -185,11 +185,11 @@ The lossless file on disk is the same regardless of which runtime representation
 
 All sub-FP16 formats require a decode step to produce FP16 values for the MAC unit. The cost differs:
 
-| Format | Decode mechanism | Cost per weight | Typical PPL delta |
+| Format | Decode mechanism | Cost per weight | PPL delta |
 |---|---|---|---|
-| Q8_0 (GGUF) | `int8 × FP16_scale → FP16` | FP multiply | ~0.01–0.05% |
-| FP8 E4M3 | Hardware LUT (Hopper+ only) | Near-zero on Hopper; no native path elsewhere | 0.5–1.2% |
-| **DMX M=7** | `shifts + masks → legal FP16 bit pattern` | **Integer ops only, no FP arithmetic at decode** | **0.29% (measured, Llama 3.1 8B)** |
+| Q8_0 (GGUF) | `int8 × FP16_scale → FP16` | FP multiply | Minimal (8-bit mantissa equivalent) |
+| FP8 E4M3 | Hardware LUT (Hopper+ only) | Near-zero on Hopper; no native path elsewhere | Higher (3-bit mantissa) |
+| **DMX M=7** | `shifts + masks → legal FP16 bit pattern` | **Integer ops only, no FP arithmetic at decode** | **+0.29% measured (Llama 3.1 8B, wikitext-2)** |
 
 DMX's decode reconstructs a legal FP16 value from the shared exponent + 7-bit mantissa via bit manipulation. No floating-point multiply, no rounding from the decode itself, no precision loss at the reconstruction step. This runs on any GPU with integer ALUs — no generation-specific hardware required.
 
@@ -227,9 +227,11 @@ Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selec
 
 | Model | Parameters | BF16 baseline PPL | M=7 quality cost |
 |---|---|---|---|
-| Qwen 2.5 | 1.5B | 9.1875 | +0.00% |
-| Pythia | 1.4B | 11.2500 | +0.00% |
+| Qwen 2.5 | 1.5B | 9.1875 | +0.00%* |
+| Pythia | 1.4B | 11.2500 | +0.00%* |
 | Mistral | 7B | 5.0000 | +0.63% |
+
+*\*Identical at BF16 inference precision. The shared-exponent difference is below the output resolution of BF16 computation on these models.*
 
 ### What M=7 represents on DMX's curve
 
