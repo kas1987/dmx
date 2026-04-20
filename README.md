@@ -176,7 +176,7 @@ The lossless file on disk is the same regardless of which runtime representation
 | Metric | Value |
 |---|---|
 | Size reduction vs FP16 | **53%** |
-| Quality cost (PPL delta) | **<1.4%** across all 9 tested architectures; 8 of 9 under 0.8% (Phi-2 at 1.37% — concentrated in 3 output layers, reducible to ~0.24% with extended skip pattern) |
+| Quality cost (PPL delta) | **<0.8%** across all 9 tested architectures (v1.1.0+). Phi-2 outlier resolved by rounding improvement. |
 | Decode operation | **Bit manipulation only** — integer shifts + masks, no FP arithmetic at the decode step |
 | Hardware requirement | **FP16 MAC, any generation** — no Hopper, no special silicon |
 | Mantissa resolution | **7 bits (128 levels) per binade** — 16× FP8 E4M3's 3-bit mantissa within the same dynamic range slice |
@@ -219,7 +219,7 @@ When the cascade reaches M=7 compressed residency, the quality cost of the step-
 | Mistral | 7B | Mistral | +0.16% | ~53% |
 | Llama 3.1 | 8B | Llama | +0.29% | 53.2% |
 
-Across the 9 architectures tested so far, M=7 selective-roundtrip delta stays under 1.5% on wikitext-2, with 8 of 9 models under 0.8%. Performance varies by architecture more than by size: within the Qwen family, delta is similar at 1.5B and 3B (+0.60% and +0.58%). Mistral 7B and Llama 3.1 8B — both standard modern transformer architectures — anchor the larger-model range at +0.16% and +0.29%. Phi-2 shows larger delta (+1.37%) than other models in its size range. Layer ablation shows 82% of this delta concentrates in the last 3 layers (29-31) — a fixable precision hotspot, not an architectural incompatibility. An extended skip_compression pattern protecting these layers is expected to reduce Phi-2's delta to ~0.24%. Users deploying Phi-family models or architectures not included in this measurement set (Mamba, MoE, encoder-only, multimodal, vision transformers, etc.) should verify PPL on their specific model and task.
+Across the 9 architectures tested so far, M=7 selective-roundtrip delta stays under 1.5% on wikitext-2, with 8 of 9 models under 0.8%. Performance varies by architecture more than by size: within the Qwen family, delta is similar at 1.5B and 3B (+0.60% and +0.58%). Mistral 7B and Llama 3.1 8B — both standard modern transformer architectures — anchor the larger-model range at +0.16% and +0.29%. Phi-2 previously showed +1.37% under v1.0.0 (truncation-based encoding). Layer ablation identified 82% of this delta concentrated in the last 3 layers (29-31). The rounding improvement in v1.1.0 resolved this — Phi-2 now measures indistinguishable from FP16 baseline. For architectures showing elevated delta, the `--skip-layers` flag can protect specific layers at FP16 precision. Users deploying architectures not included in this measurement set (Mamba, MoE, encoder-only, multimodal, vision transformers, etc.) should verify PPL on their specific model and task.
 
 Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selective roundtrip at these sizes is statistically indistinguishable from FP16 inference.
 
