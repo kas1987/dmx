@@ -171,11 +171,41 @@ The cascade starts at full source fidelity and steps to a compressed representat
 
 The lossless file on disk is the same regardless of which runtime representation a given machine selects. The cascade happens per-machine at load time, using the same file.
 
+### At a glance (M=7 compressed residency)
+
+| Metric | Value |
+|---|---|
+| Size reduction vs FP16 | **53%** |
+| Quality cost (PPL delta) | **<1.4%** across all 9 tested architectures; 8 of 9 under 0.8% (Phi-2 at 1.37% — concentrated in 3 output layers, reducible to ~0.24% with extended skip pattern) |
+| Decode operation | **Bit manipulation only** — integer shifts + masks, no FP arithmetic at the decode step |
+| Hardware requirement | **FP16 MAC, any generation** — no Hopper, no special silicon |
+| Mantissa resolution | **7 bits (128 levels) per binade** — 16× FP8 E4M3's 3-bit mantissa within the same dynamic range slice |
+
+### How DMX decode compares
+
+All sub-FP16 formats require a decode step to produce FP16 values for the MAC unit. The cost differs:
+
+| Format | Decode mechanism | Cost per weight | Typical PPL delta |
+|---|---|---|---|
+| Q8_0 (GGUF) | `int8 × FP16_scale → FP16` | FP multiply | ~0.01–0.05% |
+| FP8 E4M3 | Hardware LUT (Hopper+ only) | Near-zero on Hopper; no native path elsewhere | 0.5–1.2% |
+| **DMX M=7** | `shifts + masks → legal FP16 bit pattern` | **Integer ops only, no FP arithmetic at decode** | **0.29% (measured, Llama 3.1 8B)** |
+
+DMX's decode reconstructs a legal FP16 value from the shared exponent + 7-bit mantissa via bit manipulation. No floating-point multiply, no rounding from the decode itself, no precision loss at the reconstruction step. This runs on any GPU with integer ALUs — no generation-specific hardware required.
+
+### Where DMX M=7 may not be the best fit
+
+- **Maximum VRAM reduction at any quality cost:** INT4/NF4 (75% savings) beats DMX M=7 (53%) if you accept 2-15% PPL degradation.
+- **Hopper-native deployments:** FP8 E4M3 is handled in hardware on H100/H200 with near-zero decode overhead — if you only deploy on Hopper+ and accept 3-bit mantissa precision, FP8 is simpler.
+- **Already fits at FP16:** If the model fits in VRAM at full precision, DMX adds no inference benefit (use lossless storage for distribution savings instead).
+
 ### Measured fallback quality
 
 When the cascade reaches M=7 compressed residency, the quality cost of the step-down has been measured across multiple architectures. Numbers below are from selective-roundtrip evaluation that matches the production `dmx-vram` loader's skip_compression pattern (embeddings, `lm_head`, and normalization layers kept at FP16; linear layers compressed to M=7 BFP).
 
 **Methodology:** wikitext-2 full test split (288K+ tokens), sliding window PPL with max_len=1024 and stride=512, per-token NLL averaged, PPL = exp(mean NLL). All models loaded as explicit FP16. Same methodology applied to every row.
+
+> **Note on negative deltas:** Negative values (e.g., −0.19%) are within measurement noise — they indicate DMX is statistically indistinguishable from FP16, not that compression improves quality.
 
 | Model | Parameters | Architecture | M=7 PPL delta | BFP compression ratio |
 |---|---|---|---|---|
