@@ -132,9 +132,11 @@ Measurements across common variant types are in progress.
 
 ---
 
-## Inference: runtime derivation — COMING SOON
+## Inference: runtime derivation
 
-> **Note:** The inference runtime (`dmx-vram`) is not yet publicly released. The measurements below are preliminary. This section describes the target architecture; the shipped CLI currently supports lossless storage and deltas only.
+> **Note:** Compressed residency inference is available via [`dmx-runtime`](https://pypi.org/project/dmx-runtime/) (`pip install dmx-runtime`). The full runtime engine (`dmx-vram`) with additional features (KV cache compression, weight paging) is not yet publicly released.
+>
+> **Hardware:** Compressed residency requires an NVIDIA GPU with CUDA support (any generation — RTX, A-series, H-series). Weight materialization uses standard PyTorch CUDA ops; no custom kernels or specific compute capability required. Lossless compression and decompression (storage/distribution) runs on CPU — no GPU needed.
 
 DMX's stored file is lossless — bit-exact with the source weights. At load time, DMX works down a cascade, starting from full source fidelity and stepping to a compressed representation only when hardware constraints require it. Users don't pick precision modes; the loader walks the cascade and picks the point that fits.
 
@@ -392,9 +394,9 @@ Training pipelines already produce checkpoints at intervals. DMX replaces bulk f
 
 Model registries currently store full files per variant. DMX stores the base once and maintains variants as small deltas, scaling registry storage with the number of distinct changes across a model family rather than the number of variants. A registry with 50 variants of an 8B model stops requiring 50× the base model's storage per mirror. Distribution bandwidth drops accordingly — users pull the base once, variants arrive as small delta files.
 
-### Serving and deployment — COMING SOON
+### Serving and deployment
 
-> **Note:** Compressed residency requires the `dmx-vram` runtime, which is validated internally but not yet publicly released. The numbers below are from controlled testing.
+> **Note:** Basic compressed residency is available via `dmx-runtime`. Production serving features (auto-cascade, weight paging, KV cache compression) require `dmx-vram`, which is not yet publicly released.
 
 Production inference infrastructure has a VRAM budget per GPU and wants to maximize throughput per dollar. DMX compressed residency (measured +0.29% PPL delta on Llama 3.1 8B) reduces weight VRAM by ~40%, freeing that capacity for larger batch sizes, longer contexts, multi-model tenancy, or deployment on smaller hardware tiers. One DMX file serves all of these use cases; the runtime picks the appropriate representation per machine.
 
@@ -402,7 +404,7 @@ Production inference infrastructure has a VRAM budget per GPU and wants to maxim
 
 Regulated deployment contexts (EU AI Act, NIST AI RMF, industry-specific compliance) require supply-chain documentation for model artifacts. DMX's embedded provenance manifests align with these standards — source identity, lineage tracing, lossy-operation warnings, integrity verification. The same infrastructure that provides DevOps convenience also satisfies audit requirements.
 
-### Edge and on-device inference — COMING SOON
+### Edge and on-device inference — ROADMAP
 
 > **Note:** Requires `dmx-vram` runtime. Not yet publicly released.
 
