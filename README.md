@@ -269,6 +269,8 @@ Scores are deterministic (std=0 across runs). Max absolute delta: 0.0055. Deltas
 
 ### Try compressed residency yourself
 
+> **VRAM requirement:** The compressed model must fit entirely in GPU memory. Compressed residency reduces VRAM by ~40%, but there is no automatic paging or CPU offload if the compressed model still exceeds your GPU's capacity. Check that your model's compressed size (roughly 53% of FP16) fits your GPU before loading. Weight paging for oversized models is on the roadmap.
+
 ```bash
 pip install dmx-compress dmx-runtime
 ```
