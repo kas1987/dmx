@@ -243,7 +243,7 @@ Lower M settings (M=6, M=5, M=4) have been characterized on Qwen 1.5B BF16, with
 
 ### Measured VRAM savings (compressed residency)
 
-Weights stay compressed as BFPLinear in VRAM during inference. Measured across 8 models, 6 architecture families. Quality is indistinguishable from FP16 on lm-eval-harness benchmarks.
+Weights stay compressed as BFPLinear in VRAM during inference. Measured across 9 models, 7 architecture families. Quality is indistinguishable from FP16 on lm-eval-harness benchmarks.
 
 | Model | Family | Size | Standard FP16 (uncompressed) | DMX M=7 (compressed) | VRAM Saved | Quality |
 |---|---|---|---|---|---|---|
@@ -255,6 +255,7 @@ Weights stay compressed as BFPLinear in VRAM during inference. Measured across 8
 | Qwen 2.5 | Qwen | 3B | 6.29 GB | 3.57 GB | **43%** | Identical |
 | Mistral | Mistral | 7B | 14.48 GB | 7.78 GB | **46%** | Identical |
 | Llama 3.1 | Llama | 8B | 16.06 GB | 9.36 GB | **42%** | Identical |
+| Qwen 2.5 | Qwen | 14B | 29.69 GB | 16.96 GB | **43%** | Identical |
 
 VRAM savings range: **37-46%**, increasing with model size. File size savings: consistently **53-54%**.
 
@@ -266,6 +267,17 @@ VRAM savings range: **37-46%**, increasing with model size. File size savings: c
 | ARC-Easy | 0.5185 → 0.5240 (Δ +0.0055) | 0.7673 → 0.7677 (Δ +0.0004) |
 
 Scores are deterministic (std=0 across runs). Max absolute delta: 0.0055. Deltas go both directions (no systematic bias). Evaluation ran through BFPLinear — weights stayed compressed in VRAM during the entire benchmark.
+
+**Distribution preservation (KL divergence):**
+
+DMX M=7 on BF16 models preserves not just accuracy but the full output distribution. KL divergence measures whether the compressed model's probability distribution over the vocabulary matches FP16 — catching "confident but wrong" drift that perplexity can miss.
+
+| Model | Source dtype | Mean KL | Top-1 Agreement | Verdict |
+|---|---|---|---|---|
+| Llama 3.1 8B | BF16 | 0.0011 | 98.14% | Equivalent to FP32→FP16 conversion |
+| Pythia 160M | FP16 | 0.0318 | 88.18% | Moderate (3 mantissa bits dropped) |
+
+On BF16 models, Mean KL of 0.001 is equivalent to the standard FP32→FP16 dtype conversion the industry treats as lossless. On FP16-source models, the shift from dropping 3 mantissa bits is measurable but moderate — still smaller than typical INT8 quantization (KL 0.01-0.05). Measured on 1024 tokens of wikitext-2 across 8 sliding windows.
 
 ### Try compressed residency yourself
 
@@ -298,7 +310,12 @@ To create the `.dmx` file:
 dmx compress model.safetensors model.dmx --mode bfp --mantissa-bits 7
 ```
 
-Pre-compressed models available on HuggingFace: [Senat1/dmx-qwen2.5-1.5b-m7](https://huggingface.co/Senat1/dmx-qwen2.5-1.5b-m7)
+Pre-compressed models available on HuggingFace:
+- [Senat1/dmx-pythia-160m-m7](https://huggingface.co/Senat1/dmx-pythia-160m-m7) — Pythia 160M
+- [Senat1/dmx-qwen2.5-1.5b-m7](https://huggingface.co/Senat1/dmx-qwen2.5-1.5b-m7) — Qwen 2.5 1.5B
+- [Senat1/dmx-mistral-7b-m7](https://huggingface.co/Senat1/dmx-mistral-7b-m7) — Mistral 7B
+- [Senat1/dmx-llama-3.1-8b-m7](https://huggingface.co/Senat1/dmx-llama-3.1-8b-m7) — Llama 3.1 8B
+- [Senat1/dmx-qwen2.5-14b-m7](https://huggingface.co/Senat1/dmx-qwen2.5-14b-m7) — Qwen 2.5 14B
 
 ### Beyond the default cascade
 
