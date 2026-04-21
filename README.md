@@ -243,7 +243,7 @@ Lower M settings (M=6, M=5, M=4) have been characterized on Qwen 1.5B BF16, with
 
 ### Measured VRAM savings (compressed residency)
 
-Weights stay compressed as BFPLinear in VRAM during inference. Measured across 7 models, 5 architecture families. Quality is indistinguishable from FP16 on lm-eval-harness benchmarks.
+Weights stay compressed as BFPLinear in VRAM during inference. Measured across 8 models, 6 architecture families. Quality is indistinguishable from FP16 on lm-eval-harness benchmarks.
 
 | Model | Family | Size | Standard FP16 (uncompressed) | DMX M=7 (compressed) | VRAM Saved | Quality |
 |---|---|---|---|---|---|---|
@@ -254,6 +254,7 @@ Weights stay compressed as BFPLinear in VRAM during inference. Measured across 7
 | Qwen 2.5 | Qwen | 1.5B | 3.12 GB | 1.91 GB | **39%** | Identical (lm-eval verified) |
 | Qwen 2.5 | Qwen | 3B | 6.29 GB | 3.57 GB | **43%** | Identical |
 | Mistral | Mistral | 7B | 14.48 GB | 7.78 GB | **46%** | Identical |
+| Llama 3.1 | Llama | 8B | 16.06 GB | 9.36 GB | **42%** | Identical |
 
 VRAM savings range: **37-46%**, increasing with model size. File size savings: consistently **53-54%**.
 
