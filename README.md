@@ -243,7 +243,7 @@ Lower M settings (M=6, M=5, M=4) have been characterized on Qwen 1.5B BF16, with
 
 Weights stay compressed as BFPLinear in VRAM during inference. Measured across 7 models, 5 architecture families. Quality is indistinguishable from FP16 on lm-eval-harness benchmarks.
 
-| Model | Family | Size | VRAM FP16 | VRAM Compressed | Savings | Output |
+| Model | Family | Size | Standard FP16 (uncompressed) | DMX M=7 (compressed) | VRAM Saved | Quality |
 |---|---|---|---|---|---|---|
 | Pythia | NeoX | 410M | 0.81 GB | 0.51 GB | **37%** | Identical (lm-eval verified) |
 | OLMo | OLMo | 1B | 2.35 GB | 1.35 GB | **43%** | Close |
