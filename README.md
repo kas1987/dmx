@@ -270,14 +270,14 @@ Scores are deterministic (std=0 across runs). Max absolute delta: 0.0055. Deltas
 
 **Distribution preservation (KL divergence):**
 
-DMX M=7 on BF16 models preserves not just accuracy but the full output distribution. KL divergence measures whether the compressed model's probability distribution over the vocabulary matches FP16 — catching "confident but wrong" drift that perplexity can miss.
+KL divergence measures whether the compressed model's probability distribution over the vocabulary matches FP16 — catching "confident but wrong" drift that perplexity can miss. On BF16 source models, M=7 keeps all 7 mantissa bits; the only source of difference is the shared block exponent (one exponent per 32 values instead of per-value).
 
-| Model | Source dtype | Mean KL | Top-1 Agreement | Verdict |
-|---|---|---|---|---|
-| Llama 3.1 8B | BF16 | 0.0011 | 98.14% | Equivalent to FP32→FP16 conversion |
-| Pythia 160M | FP16 | 0.0318 | 88.18% | Moderate (3 mantissa bits dropped) |
+| Model | Source dtype | Mean KL | P99 KL | Max KL | Top-1 Agreement |
+|---|---|---|---|---|---|
+| Llama 3.1 8B | BF16 | 0.0011 | 0.0132 | 0.0342 | 98.14% |
+| Pythia 160M | FP16 | 0.0318 | 0.0905 | 0.1334 | 88.18% |
 
-On BF16 models, Mean KL of 0.001 is equivalent to the standard FP32→FP16 dtype conversion the industry treats as lossless. On FP16-source models, the shift from dropping 3 mantissa bits is measurable but moderate — still smaller than typical INT8 quantization (KL 0.01-0.05). Measured on 1024 tokens of wikitext-2 across 8 sliding windows.
+On Llama 3.1 8B (BF16 source), mean KL of 0.001 indicates near-identical distributions. 98% of token positions produce the same greedy prediction; the remaining 2% reflect borderline cases where the shared block exponent shifts probability mass slightly. On FP16-source models (Pythia 160M), M=7 drops 3 of 10 mantissa bits, producing a larger but still moderate shift. Measured on 1024 tokens of wikitext-2 across 8 sliding windows. Additional BF16 architectures and longer-context evaluation are planned.
 
 ### Try compressed residency yourself
 
