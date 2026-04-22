@@ -15,11 +15,18 @@ from setuptools import setup
 ext_modules = []
 cmdclass = {}
 
+def _nvcc_available():
+    """Check if nvcc (CUDA compiler) is on PATH — doesn't need a GPU."""
+    import shutil
+    return shutil.which("nvcc") is not None
+
 try:
-    import torch
     from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
-    if torch.cuda.is_available() or os.environ.get("FORCE_CUDA", "0") == "1":
+    # Build CUDA kernel if nvcc is available OR FORCE_CUDA is set.
+    # Note: we check for nvcc (compiler), NOT torch.cuda.is_available() (runtime).
+    # Wheel builds happen on build machines that may not have a GPU attached.
+    if _nvcc_available() or os.environ.get("FORCE_CUDA", "0") == "1":
         kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel")
         cuda_source = os.path.join(kernel_dir, "dmx_kernels_v2.cu")
 
@@ -35,7 +42,7 @@ try:
         else:
             print(f"[dmx-compress] CUDA source not found at {cuda_source}, skipping kernel build")
     else:
-        print("[dmx-compress] CUDA not available, building pure Python wheel")
+        print("[dmx-compress] nvcc not found, building pure Python wheel")
 except ImportError:
     print("[dmx-compress] PyTorch not installed, building pure Python wheel")
 
