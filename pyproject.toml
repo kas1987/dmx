@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=68.0", "wheel", "torch>=2.0", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -29,19 +29,7 @@ dependencies = [
     "numpy",
     "zstandard",
     "safetensors",
-    # `packaging` is a runtime import inside safetensors.torch but is not
-    # declared by safetensors as a requirement. Listing it explicitly here
-    # ensures pip resolves it in fresh venvs where setuptools' vendored copy
-    # is not exposed. Without this line, `pip install dmx-compress` in a
-    # clean venv produces an installation that crashes at import time with
-    # "ModuleNotFoundError: No module named 'packaging'". Caught during the
-    # 0.4.0 PyPI publish smoke test.
     "packaging",
-    # Adaptive per-tensor entropy coder selection picks the smallest output
-    # from a candidate set per tensor. zstd is always available; soundfile and
-    # brotli expand the candidate set. They are listed as required (not extras)
-    # so a fresh `pip install dmx-compress` ships the full feature, not a
-    # silently-degraded selector.
     "soundfile",
     "brotli",
 ]
@@ -56,10 +44,3 @@ Issues = "https://github.com/willjriley/dmx/issues"
 
 [project.scripts]
 dmx = "dmx_cli:main"
-
-[tool.setuptools]
-py-modules = ["dmx_cli"]
-packages = ["dmx", "kernel"]
-
-[tool.setuptools.package-data]
-kernel = ["*.cu"]
