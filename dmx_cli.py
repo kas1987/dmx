@@ -216,8 +216,24 @@ def _get_cuda_kernels():
         return _dmx_cuda
     _strict = os.environ.get("DMX_REQUIRE_NATIVE", "").strip() == "1"
 
-    # Path 1: Pre-compiled extension (shipped in wheel) — importable
-    # even without CUDA runtime; will fail at call time if no GPU.
+    # Path 1: Standalone CUDA library (no torch ABI dependency)
+    # Works with ANY torch version — loaded via ctypes.
+    try:
+        from dmx.cuda_native import get_native_lib, bfp_decompress as _native_bfp
+        lib = get_native_lib()
+        if lib is not None:
+            # Wrap in a namespace object so callers can do mod.bfp_decompress()
+            class _NativeWrapper:
+                @staticmethod
+                def bfp_decompress(exponents, mantissas, group_size, mantissa_bits):
+                    return _native_bfp(exponents, mantissas, group_size, mantissa_bits)
+            _dmx_cuda = _NativeWrapper()
+            return _dmx_cuda
+    except Exception:
+        if _strict:
+            raise
+
+    # Path 2: Pre-compiled torch extension (torch ABI coupled)
     try:
         import dmx_cuda_v2
         _dmx_cuda = dmx_cuda_v2
@@ -225,7 +241,7 @@ def _get_cuda_kernels():
     except ImportError:
         pass
 
-    # Path 2: JIT compile from source (requires CUDA runtime + compiler)
+    # Path 3: JIT compile from source (requires CUDA runtime + compiler)
     if not torch.cuda.is_available():
         return None
     _this_dir = os.path.dirname(os.path.abspath(__file__))

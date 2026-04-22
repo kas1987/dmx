@@ -23,18 +23,13 @@ jobs:
         with:
           cuda: '12.4.0'
 
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip setuptools wheel ninja
-          pip install torch --index-url https://download.pytorch.org/whl/cu124
-          pip install numpy zstandard safetensors soundfile brotli packaging
+      - name: Install build deps
+        run: pip install --upgrade pip setuptools wheel
 
       - name: Build wheel
         env:
           TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
-          FORCE_CUDA: "1"
-        run: |
-          pip wheel . -w raw_dist/ --no-deps --no-build-isolation
+        run: pip wheel . -w raw_dist/ --no-deps --no-build-isolation
 
       - name: Retag wheel (manylinux)
         run: |
@@ -79,28 +74,25 @@ jobs:
         with:
           cuda: '12.4.0'
 
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip setuptools wheel ninja
-          pip install torch --index-url https://download.pytorch.org/whl/cu124
-          pip install numpy zstandard safetensors soundfile brotli packaging
+      - name: Install build deps
+        run: pip install --upgrade pip setuptools wheel
 
       - name: Build wheel
         env:
           TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
           FORCE_CUDA: "1"
-        run: |
-          pip wheel . -w dist/ --no-deps --no-build-isolation
+        run: pip wheel . -w dist/ --no-deps --no-build-isolation
 
-      - name: Verify .pyd in wheel
+      - name: Verify .dll in wheel
         run: |
           python -c "
           import zipfile, glob
           whl = glob.glob('dist/*.whl')[0]
+          print(f'Wheel: {whl}')
           with zipfile.ZipFile(whl) as z:
-              pyd = [f for f in z.namelist() if f.endswith('.pyd')]
-              assert pyd, f'No .pyd in {whl}'
-              print(f'OK: {whl} contains {pyd}')
+              dll = [f for f in z.namelist() if f.endswith(('.dll', '.pyd', '.so'))]
+              assert dll, f'No native lib in {whl}'
+              print(f'OK: contains {dll}')
           "
 
       - uses: actions/upload-artifact@v4
@@ -118,12 +110,7 @@ jobs:
       - name: Build pure Python wheel (fallback)
         run: |
           pip install setuptools wheel
-          python setup.py bdist_wheel
-          # Rename to pure Python wheel
-          cd dist && for f in *.whl; do
-            newname=$(echo $f | sed 's/cp[0-9]*-cp[0-9]*-[a-z_0-9]*/py3-none-any/')
-            mv "$f" "$newname" 2>/dev/null || true
-          done
+          pip wheel . -w dist/ --no-deps
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-pure
@@ -143,23 +130,20 @@ jobs:
         run: ls -la dist/
 
       - name: Check token
-        run: |
-          if [ -z "${{ secrets.PYPI_TOKEN }}" ]; then
-            echo "ERROR: PYPI_TOKEN secret is not set!"
-            exit 1
-          fi
-          echo "PYPI_TOKEN is set (${#TWINE_PASSWORD} chars)"
         env:
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-
-      - name: Inspect wheel metadata
         run: |
-          pip install twine
-          twine check dist/*.whl
+          if [ -z "$TWINE_PASSWORD" ]; then
+            echo "ERROR: PYPI_TOKEN secret not set"
+            exit 1
+          fi
+          echo "Token present (${#TWINE_PASSWORD} chars)"
 
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
+          pip install twine
+          twine check dist/*.whl
           twine upload --verbose dist/*.whl
