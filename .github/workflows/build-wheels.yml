@@ -1,0 +1,133 @@
+name: Build CUDA Wheels
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    container:
+      image: pytorch/manylinux-cuda124
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: |
+          python${{ matrix.python-version }} -m pip install --upgrade pip setuptools wheel ninja
+          python${{ matrix.python-version }} -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+          python${{ matrix.python-version }} -m pip install numpy zstandard safetensors soundfile brotli packaging
+
+      - name: Build wheel
+        env:
+          TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
+        run: |
+          python${{ matrix.python-version }} -m pip wheel . -w dist/ --no-deps --no-build-isolation
+
+      - name: Verify .so in wheel
+        run: |
+          python${{ matrix.python-version }} -c "
+          import zipfile, glob
+          whl = glob.glob('dist/*.whl')[0]
+          with zipfile.ZipFile(whl) as z:
+              so = [f for f in z.namelist() if f.endswith('.so')]
+              assert so, f'No .so in {whl}'
+              print(f'OK: {whl} contains {so}')
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-py${{ matrix.python-version }}
+          path: dist/*.whl
+
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda-toolkit
+        with:
+          cuda: '12.4.0'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel ninja
+          pip install torch --index-url https://download.pytorch.org/whl/cu124
+          pip install numpy zstandard safetensors soundfile brotli packaging
+
+      - name: Build wheel
+        env:
+          TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
+          FORCE_CUDA: "1"
+        run: |
+          pip wheel . -w dist/ --no-deps --no-build-isolation
+
+      - name: Verify .pyd in wheel
+        run: |
+          python -c "
+          import zipfile, glob
+          whl = glob.glob('dist/*.whl')[0]
+          with zipfile.ZipFile(whl) as z:
+              pyd = [f for f in z.namelist() if f.endswith('.pyd')]
+              assert pyd, f'No .pyd in {whl}'
+              print(f'OK: {whl} contains {pyd}')
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-py${{ matrix.python-version }}
+          path: dist/*.whl
+
+  build-pure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build pure Python wheel (fallback)
+        run: |
+          pip install setuptools wheel
+          python setup.py bdist_wheel
+          # Rename to pure Python wheel
+          cd dist && for f in *.whl; do
+            newname=$(echo $f | sed 's/cp[0-9]*-cp[0-9]*-[a-z_0-9]*/py3-none-any/')
+            mv "$f" "$newname" 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-pure
+          path: dist/*.whl
+
+  publish:
+    needs: [build-linux, build-windows, build-pure]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          pip install twine
+          twine upload dist/*.whl
