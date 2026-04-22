@@ -47,7 +47,7 @@ jobs:
           auditwheel repair dist/*.whl \
             --exclude libcudart.so.12 \
             --exclude libcuda.so.1 \
-            --plat manylinux_2_17_x86_64 \
+            --plat manylinux_2_28_x86_64 \
             -w dist_fixed/
           rm dist/*.whl
           mv dist_fixed/*.whl dist/
@@ -106,8 +106,8 @@ jobs:
 
       - name: Build platform wheel
         run: |
-          pip install setuptools wheel build
-          python -m build --wheel --no-isolation
+          pip install "setuptools>=68.0" wheel build
+          python -m build --wheel
           ls dist/
 
       - name: Verify .dll in wheel
