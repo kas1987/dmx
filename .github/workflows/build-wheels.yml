@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
@@ -22,7 +22,6 @@ jobs:
         id: cuda-toolkit
         with:
           cuda: '12.4.0'
-          method: network
 
       - name: Compile CUDA kernel
         run: |
@@ -83,8 +82,9 @@ jobs:
           cuda: '12.4.0'
 
       - name: Compile CUDA kernel
+        shell: cmd
         run: |
-          nvcc -shared -o dmx/dmx_cuda.dll kernel/dmx_standalone.cu -O2 -gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90
+          nvcc -shared -o dmx\dmx_cuda.dll kernel\dmx_standalone.cu -O2 "-gencode=arch=compute_70,code=sm_70" "-gencode=arch=compute_75,code=sm_75" "-gencode=arch=compute_80,code=sm_80" "-gencode=arch=compute_86,code=sm_86" "-gencode=arch=compute_89,code=sm_89" "-gencode=arch=compute_90,code=sm_90"
           dir dmx\dmx_cuda.dll
 
       - name: Build wheel (includes pre-compiled .dll)
