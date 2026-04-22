@@ -1,0 +1,3 @@
+Fair point - I should be clearer about that. The 9.1 GB SVD-XT is FP32, so the 80% includes the FP32 to FP16 conversion as part of BFP encoding. On pure FP16 models the savings are 55-60%.
+
+Good comparison to Q8 - at M=7 (8.25 bits/weight) DMX measured +0.03% perplexity on Llama 3 8B via wikitext-2. I'll make the source precision more prominent in the README. Thanks.

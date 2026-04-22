@@ -1,0 +1,3 @@
+That's the idea! Results depend on the model format - FP32 models see 60-80% reduction, FP16 models around 55-60%. Your mileage will vary by model but the compression is consistent across architectures.
+
+Would love to hear how it works on your collection if you try it.

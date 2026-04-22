@@ -1,0 +1,5 @@
+Good call - DFloat11 and ZipNN are both doing solid work on lossless compression. They get about 30-33% losslessly which is great for bit-exact preservation.
+
+DMX takes a different tradeoff - lossy compression with tunable quality, which lets it push past what lossless methods can achieve. At M=7 the quality loss is only +0.03% perplexity. Different tools for different needs - if you need bit-exact, use DFloat11 or ZipNN. If you need more compression and can tolerate tiny quality loss, that's where DMX lives.
+
+I've updated the paper to cite both. Appreciate the pointer.

@@ -1,0 +1,5 @@
+You're thinking along the same lines as where this is heading. Right now the main value is storage and download size.
+
+But you're right - the interesting direction is exactly what you described: keeping weights compressed and only decompressing the tensors you need, when you need them. I have a prototype smart loader that does this - it checks if the model fits in VRAM, and only compresses when it needs to. Per-layer decompression runs about 2.5ms on GPU.
+
+The goal would be for it to be transparent - the system decides if compression helps and uses it only when it does. Still early and needs proper benchmarking though.

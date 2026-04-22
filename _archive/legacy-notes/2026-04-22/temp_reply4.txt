@@ -1,0 +1,11 @@
+Good question - it depends on the scenario:
+
+As a file compressor (today): zero inference slowdown. You decompress back to a normal safetensors file and load it like any other model. The value here is smaller downloads and less disk space.
+
+For VRAM management (experimental smart loader): this is where it gets interesting. ComfyUI already handles models that don't fit in VRAM by swapping layers to CPU and back over PCIe. That works but each swap costs time.
+
+DMX takes a different approach - compress the model so it fits in VRAM entirely, decompressing layers on-the-fly as needed. If ComfyUI would have been swapping layers over PCIe, DMX may come out ahead since the data is already on the GPU.
+
+The smart loader figures this out automatically - only compresses when it actually helps. Still experimental and not integrated into ComfyUI as a node yet.
+
+To be clear, the goal is to complement ComfyUI's existing VRAM management, not compete with it. The ComfyUI team has done great work there. DMX just makes the models smaller so there's less for their system to manage.
