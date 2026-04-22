@@ -34,17 +34,26 @@ jobs:
           TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
           FORCE_CUDA: "1"
         run: |
-          pip wheel . -w dist/ --no-deps --no-build-isolation
+          pip wheel . -w raw_dist/ --no-deps --no-build-isolation
+
+      - name: Repair wheel (manylinux tag)
+        run: |
+          pip install auditwheel patchelf
+          mkdir -p dist/
+          for whl in raw_dist/*.whl; do
+            auditwheel repair "$whl" -w dist/ --plat manylinux2014_x86_64 || cp "$whl" dist/
+          done
 
       - name: Verify .so in wheel
         run: |
           python -c "
           import zipfile, glob
           whl = glob.glob('dist/*.whl')[0]
+          print(f'Wheel: {whl}')
           with zipfile.ZipFile(whl) as z:
               so = [f for f in z.namelist() if f.endswith('.so')]
               assert so, f'No .so in {whl}'
-              print(f'OK: {whl} contains {so}')
+              print(f'OK: contains {so}')
           "
 
       - uses: actions/upload-artifact@v4
