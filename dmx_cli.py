@@ -201,13 +201,10 @@ _dmx_cuda = None
 def _get_cuda_kernels():
     """Load native CUDA kernels if available. Returns module or None.
 
-    Finds the sibling ``kernel/`` directory relative to this file, so the
-    import works regardless of the caller's cwd or sys.path. This matters
-    because dmx-compress is frequently imported from downstream tools
-    (hope, dmx-vram) that run from their own working directories, and
-    before this the `from kernel.build import get_kernels` statement
-    silently failed with ModuleNotFoundError → returned None → misled
-    callers into thinking CUDA kernels weren't available.
+    Lookup order:
+    1. Pre-compiled extension shipped in the wheel (dmx_cuda_v2)
+    2. JIT-compiled from kernel/ source directory (requires MSVC/nvcc)
+    3. None (falls back to vectorized torch ops — 40-50x slower)
 
     If ``DMX_REQUIRE_NATIVE=1`` is set in the environment, the silent
     exception handler is bypassed and failures raise so downstream code
@@ -219,10 +216,20 @@ def _get_cuda_kernels():
         return _dmx_cuda
     if not torch.cuda.is_available():
         return None
+    _strict = os.environ.get("DMX_REQUIRE_NATIVE", "").strip() == "1"
+
+    # Path 1: Pre-compiled extension (shipped in wheel)
+    try:
+        import dmx_cuda_v2
+        _dmx_cuda = dmx_cuda_v2
+        return _dmx_cuda
+    except ImportError:
+        pass
+
+    # Path 2: JIT compile from source (requires compiler toolchain)
     _this_dir = os.path.dirname(os.path.abspath(__file__))
     if _this_dir not in sys.path:
         sys.path.insert(0, _this_dir)
-    _strict = os.environ.get("DMX_REQUIRE_NATIVE", "").strip() == "1"
     try:
         from kernel.build import get_kernels
         _dmx_cuda = get_kernels()
