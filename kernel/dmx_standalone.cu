@@ -16,6 +16,13 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+// Windows DLL export macro
+#ifdef _WIN32
+#define DMX_API __declspec(dllexport)
+#else
+#define DMX_API
+#endif
+
 // ============================================================
 // BFP Decompress Kernel (identical to dmx_kernels_v2.cu)
 // ============================================================
@@ -80,7 +87,7 @@ extern "C" {
  * @param stream        CUDA stream (0 for default)
  * @return              0 on success, non-zero on error
  */
-int dmx_bfp_decompress(
+DMX_API int dmx_bfp_decompress(
     const void* d_exponents,
     const void* d_mantissas,
     void* d_output,
@@ -109,14 +116,14 @@ int dmx_bfp_decompress(
 /**
  * Get the library version.
  */
-int dmx_version() {
+DMX_API int dmx_version() {
     return 10305;  // 1.3.5
 }
 
 /**
  * Check if CUDA is available.
  */
-int dmx_cuda_available() {
+DMX_API int dmx_cuda_available() {
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) return 0;
