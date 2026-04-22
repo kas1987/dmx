@@ -22,22 +22,29 @@ jobs:
         id: cuda-toolkit
         with:
           cuda: '12.4.0'
+          method: network
 
-      - name: Install build deps
-        run: pip install --upgrade pip setuptools wheel
+      - name: Compile CUDA kernel
+        run: |
+          nvcc -shared -o dmx/dmx_cuda.so kernel/dmx_standalone.cu \
+            -O2 --compiler-options -fPIC \
+            -gencode=arch=compute_70,code=sm_70 \
+            -gencode=arch=compute_75,code=sm_75 \
+            -gencode=arch=compute_80,code=sm_80 \
+            -gencode=arch=compute_86,code=sm_86 \
+            -gencode=arch=compute_89,code=sm_89 \
+            -gencode=arch=compute_90,code=sm_90
+          ls -la dmx/dmx_cuda.so
 
-      - name: Build wheel
-        env:
-          TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
-        run: pip wheel . -w raw_dist/ --no-deps --no-build-isolation
+      - name: Build wheel (includes pre-compiled .so)
+        run: |
+          pip install setuptools wheel
+          python -m pip wheel . -w raw_dist/ --no-deps
 
       - name: Retag wheel (manylinux)
         run: |
-          pip install wheel
+          python -m wheel tags --platform-tag manylinux2014_x86_64 --remove raw_dist/*.whl
           mkdir -p dist/
-          for whl in raw_dist/*.whl; do
-            python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$whl"
-          done
           mv raw_dist/*.whl dist/
 
       - name: Verify .so in wheel
@@ -48,8 +55,9 @@ jobs:
           print(f'Wheel: {whl}')
           with zipfile.ZipFile(whl) as z:
               so = [f for f in z.namelist() if f.endswith('.so')]
-              assert so, f'No .so in {whl}'
-              print(f'OK: contains {so}')
+              print(f'Files: {so}')
+              assert any('dmx_cuda' in f for f in so), f'dmx_cuda.so not in wheel'
+              print('OK')
           "
 
       - uses: actions/upload-artifact@v4
@@ -74,14 +82,15 @@ jobs:
         with:
           cuda: '12.4.0'
 
-      - name: Install build deps
-        run: pip install --upgrade pip setuptools wheel
+      - name: Compile CUDA kernel
+        run: |
+          nvcc -shared -o dmx/dmx_cuda.dll kernel/dmx_standalone.cu -O2 -gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90
+          dir dmx\dmx_cuda.dll
 
-      - name: Build wheel
-        env:
-          TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
-          FORCE_CUDA: "1"
-        run: pip wheel . -w dist/ --no-deps --no-build-isolation
+      - name: Build wheel (includes pre-compiled .dll)
+        run: |
+          pip install setuptools wheel
+          python -m pip wheel . -w dist/ --no-deps
 
       - name: Verify .dll in wheel
         run: |
@@ -90,9 +99,10 @@ jobs:
           whl = glob.glob('dist/*.whl')[0]
           print(f'Wheel: {whl}')
           with zipfile.ZipFile(whl) as z:
-              dll = [f for f in z.namelist() if f.endswith(('.dll', '.pyd', '.so'))]
-              assert dll, f'No native lib in {whl}'
-              print(f'OK: contains {dll}')
+              dll = [f for f in z.namelist() if f.endswith('.dll')]
+              print(f'Files: {dll}')
+              assert any('dmx_cuda' in f for f in dll), f'dmx_cuda.dll not in wheel'
+              print('OK')
           "
 
       - uses: actions/upload-artifact@v4
@@ -110,7 +120,7 @@ jobs:
       - name: Build pure Python wheel (fallback)
         run: |
           pip install setuptools wheel
-          pip wheel . -w dist/ --no-deps
+          python -m pip wheel . -w dist/ --no-deps
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-pure
@@ -128,16 +138,6 @@ jobs:
 
       - name: List wheels
         run: ls -la dist/
-
-      - name: Check token
-        env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          if [ -z "$TWINE_PASSWORD" ]; then
-            echo "ERROR: PYPI_TOKEN secret not set"
-            exit 1
-          fi
-          echo "Token present (${#TWINE_PASSWORD} chars)"
 
       - name: Publish to PyPI
         env:
