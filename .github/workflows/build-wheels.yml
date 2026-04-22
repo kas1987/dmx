@@ -38,8 +38,17 @@ jobs:
       - name: Build wheel (includes pre-compiled .so)
         run: |
           pip install setuptools wheel
-          python setup.py bdist_wheel --plat-name manylinux2014_x86_64
-          mv dist/*.whl dist/ 2>/dev/null || true
+          # Build a normal wheel first
+          pip wheel . -w raw_dist/ --no-deps
+          # Unpack, add .so, repack with platform tag
+          cd raw_dist
+          python -m wheel unpack *.whl
+          WHEEL_DIR=$(ls -d */ | head -1)
+          cp ../dmx/dmx_cuda.so "${WHEEL_DIR}dmx/"
+          # Fix the WHEEL tag
+          sed -i 's/Tag: py3-none-any/Tag: py3-none-manylinux2014_x86_64/' "${WHEEL_DIR}*.dist-info/WHEEL"
+          python -m wheel pack "$WHEEL_DIR" -d ../dist/
+          cd ..
           ls -la dist/
 
       - name: Verify .so in wheel
@@ -86,9 +95,18 @@ jobs:
           dir dmx\dmx_cuda.dll
 
       - name: Build wheel (includes pre-compiled .dll)
+        shell: bash
         run: |
           pip install setuptools wheel
-          python setup.py bdist_wheel --plat-name win_amd64
+          pip wheel . -w raw_dist/ --no-deps
+          cd raw_dist
+          python -m wheel unpack *.whl
+          WHEEL_DIR=$(ls -d */ | head -1)
+          cp ../dmx/dmx_cuda.dll "${WHEEL_DIR}dmx/"
+          sed -i 's/Tag: py3-none-any/Tag: py3-none-win_amd64/' "${WHEEL_DIR}"*.dist-info/WHEEL
+          python -m wheel pack "$WHEEL_DIR" -d ../dist/
+          cd ..
+          ls -la dist/
 
       - name: Verify .dll in wheel
         run: |
@@ -118,7 +136,7 @@ jobs:
       - name: Build pure Python wheel (fallback)
         run: |
           pip install setuptools wheel
-          python setup.py bdist_wheel
+          pip wheel . -w dist/ --no-deps
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-pure
