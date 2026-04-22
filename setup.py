@@ -19,8 +19,7 @@ try:
     from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
     if _nvcc_available() or os.environ.get("FORCE_CUDA", "0") == "1":
-        kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel")
-        cuda_source = os.path.join(kernel_dir, "dmx_kernels_v2.cu")
+        cuda_source = os.path.join("kernel", "dmx_kernels_v2.cu")
 
         if os.path.exists(cuda_source):
             ext_modules.append(
