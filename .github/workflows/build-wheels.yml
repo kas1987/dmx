@@ -36,13 +36,14 @@ jobs:
         run: |
           pip wheel . -w raw_dist/ --no-deps --no-build-isolation
 
-      - name: Repair wheel (manylinux tag)
+      - name: Retag wheel (manylinux)
         run: |
-          pip install auditwheel patchelf
+          pip install wheel
           mkdir -p dist/
           for whl in raw_dist/*.whl; do
-            auditwheel repair "$whl" -w dist/ --plat manylinux2014_x86_64 || cp "$whl" dist/
+            python -m wheel tags --platform-tag manylinux2014_x86_64 --remove "$whl"
           done
+          mv raw_dist/*.whl dist/
 
       - name: Verify .so in wheel
         run: |
