@@ -11,26 +11,34 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
-    container:
-      image: pytorch/manylinux-cuda124
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda-toolkit
+        with:
+          cuda: '12.4.0'
+
+      - name: Install dependencies
         run: |
-          python${{ matrix.python-version }} -m pip install --upgrade pip setuptools wheel ninja
-          python${{ matrix.python-version }} -m pip install torch --index-url https://download.pytorch.org/whl/cu124
-          python${{ matrix.python-version }} -m pip install numpy zstandard safetensors soundfile brotli packaging
+          pip install --upgrade pip setuptools wheel ninja
+          pip install torch --index-url https://download.pytorch.org/whl/cu124
+          pip install numpy zstandard safetensors soundfile brotli packaging
 
       - name: Build wheel
         env:
           TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0"
+          FORCE_CUDA: "1"
         run: |
-          python${{ matrix.python-version }} -m pip wheel . -w dist/ --no-deps --no-build-isolation
+          pip wheel . -w dist/ --no-deps --no-build-isolation
 
       - name: Verify .so in wheel
         run: |
-          python${{ matrix.python-version }} -c "
+          python -c "
           import zipfile, glob
           whl = glob.glob('dist/*.whl')[0]
           with zipfile.ZipFile(whl) as z:
