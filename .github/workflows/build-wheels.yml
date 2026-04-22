@@ -132,13 +132,24 @@ jobs:
       - name: List wheels
         run: ls -la dist/
 
-      - name: List wheels
-        run: ls -la dist/
+      - name: Check token
+        run: |
+          if [ -z "${{ secrets.PYPI_TOKEN }}" ]; then
+            echo "ERROR: PYPI_TOKEN secret is not set!"
+            exit 1
+          fi
+          echo "PYPI_TOKEN is set (${#TWINE_PASSWORD} chars)"
+        env:
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+      - name: Inspect wheel metadata
+        run: |
+          pip install twine
+          twine check dist/*.whl
 
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
-          pip install twine
           twine upload --verbose dist/*.whl
