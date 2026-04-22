@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmx-compress"
-version = "1.4.4"
+version = "1.4.5"
 description = "Lossless compression for neural network weights. Bit-exact storage, content-addressable deltas, embedded provenance."
 readme = "README.md"
 license = {text = "MIT"}
