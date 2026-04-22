@@ -25,6 +25,11 @@ try:
     if hasattr(_cpp_ext, '_check_cuda_version'):
         _cpp_ext._check_cuda_version = lambda *a, **kw: None
 
+    # Set arch list if not already set — avoids querying GPU (which fails
+    # when the CUDA driver doesn't match torch's expected version).
+    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.5;8.0;8.6;8.9;9.0"
+
     if _nvcc_available() or os.environ.get("FORCE_CUDA", "0") == "1":
         cuda_source = os.path.join("kernel", "dmx_kernels_v2.cu")
 
