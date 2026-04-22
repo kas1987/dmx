@@ -214,11 +214,10 @@ def _get_cuda_kernels():
     global _dmx_cuda
     if _dmx_cuda is not None:
         return _dmx_cuda
-    if not torch.cuda.is_available():
-        return None
     _strict = os.environ.get("DMX_REQUIRE_NATIVE", "").strip() == "1"
 
-    # Path 1: Pre-compiled extension (shipped in wheel)
+    # Path 1: Pre-compiled extension (shipped in wheel) — importable
+    # even without CUDA runtime; will fail at call time if no GPU.
     try:
         import dmx_cuda_v2
         _dmx_cuda = dmx_cuda_v2
@@ -226,7 +225,9 @@ def _get_cuda_kernels():
     except ImportError:
         pass
 
-    # Path 2: JIT compile from source (requires compiler toolchain)
+    # Path 2: JIT compile from source (requires CUDA runtime + compiler)
+    if not torch.cuda.is_available():
+        return None
     _this_dir = os.path.dirname(os.path.abspath(__file__))
     if _this_dir not in sys.path:
         sys.path.insert(0, _this_dir)
