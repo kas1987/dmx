@@ -35,20 +35,22 @@ jobs:
             -gencode=arch=compute_90,code=sm_90
           ls -la dmx/dmx_cuda.so
 
-      - name: Build wheel (includes pre-compiled .so)
+      - name: Build platform wheel
         run: |
-          pip install setuptools wheel
-          # Build a normal wheel first
-          pip wheel . -w raw_dist/ --no-deps
-          # Unpack, add .so, repack with platform tag
-          cd raw_dist
-          python -m wheel unpack *.whl
-          WHEEL_DIR=$(ls -d */ | head -1)
-          cp ../dmx/dmx_cuda.so "${WHEEL_DIR}dmx/"
-          # Fix the WHEEL tag
-          sed -i 's/Tag: py3-none-any/Tag: py3-none-manylinux2014_x86_64/' "${WHEEL_DIR}*.dist-info/WHEEL"
-          python -m wheel pack "$WHEEL_DIR" -d ../dist/
-          cd ..
+          pip install setuptools wheel build
+          python -m build --wheel --no-isolation
+          ls -la dist/
+
+      - name: Retag to manylinux via auditwheel
+        run: |
+          pip install auditwheel patchelf
+          auditwheel repair dist/*.whl \
+            --exclude libcudart.so.12 \
+            --exclude libcuda.so.1 \
+            --plat manylinux_2_17_x86_64 \
+            -w dist_fixed/
+          rm dist/*.whl
+          mv dist_fixed/*.whl dist/
           ls -la dist/
 
       - name: Verify .so in wheel
@@ -58,10 +60,12 @@ jobs:
           whl = glob.glob('dist/*.whl')[0]
           print(f'Wheel: {whl}')
           with zipfile.ZipFile(whl) as z:
-              so = [f for f in z.namelist() if f.endswith('.so')]
-              print(f'Files: {so}')
-              assert any('dmx_cuda' in f for f in so), f'dmx_cuda.so not in wheel'
-              print('OK')
+              for f in z.namelist():
+                  if f.endswith(('.so', '.dll', '.py', '.cu')):
+                      print(f'  {f}')
+              so = [f for f in z.namelist() if 'dmx_cuda' in f]
+              assert so, 'dmx_cuda.so not in wheel'
+              print(f'OK: {so}')
           "
 
       - uses: actions/upload-artifact@v4
@@ -91,22 +95,20 @@ jobs:
       - name: Compile CUDA kernel
         shell: cmd
         run: |
-          nvcc -shared -o dmx\dmx_cuda.dll kernel\dmx_standalone.cu -O2 "-gencode=arch=compute_70,code=sm_70" "-gencode=arch=compute_75,code=sm_75" "-gencode=arch=compute_80,code=sm_80" "-gencode=arch=compute_86,code=sm_86" "-gencode=arch=compute_89,code=sm_89" "-gencode=arch=compute_90,code=sm_90"
+          nvcc -shared -o dmx\dmx_cuda.dll kernel\dmx_standalone.cu -O2 ^
+            "-gencode=arch=compute_70,code=sm_70" ^
+            "-gencode=arch=compute_75,code=sm_75" ^
+            "-gencode=arch=compute_80,code=sm_80" ^
+            "-gencode=arch=compute_86,code=sm_86" ^
+            "-gencode=arch=compute_89,code=sm_89" ^
+            "-gencode=arch=compute_90,code=sm_90"
           dir dmx\dmx_cuda.dll
 
-      - name: Build wheel (includes pre-compiled .dll)
-        shell: bash
+      - name: Build platform wheel
         run: |
-          pip install setuptools wheel
-          pip wheel . -w raw_dist/ --no-deps
-          cd raw_dist
-          python -m wheel unpack *.whl
-          WHEEL_DIR=$(ls -d */ | head -1)
-          cp ../dmx/dmx_cuda.dll "${WHEEL_DIR}dmx/"
-          sed -i 's/Tag: py3-none-any/Tag: py3-none-win_amd64/' "${WHEEL_DIR}"*.dist-info/WHEEL
-          python -m wheel pack "$WHEEL_DIR" -d ../dist/
-          cd ..
-          ls -la dist/
+          pip install setuptools wheel build
+          python -m build --wheel --no-isolation
+          ls dist/
 
       - name: Verify .dll in wheel
         run: |
@@ -115,10 +117,9 @@ jobs:
           whl = glob.glob('dist/*.whl')[0]
           print(f'Wheel: {whl}')
           with zipfile.ZipFile(whl) as z:
-              dll = [f for f in z.namelist() if f.endswith('.dll')]
-              print(f'Files: {dll}')
-              assert any('dmx_cuda' in f for f in dll), f'dmx_cuda.dll not in wheel'
-              print('OK')
+              dll = [f for f in z.namelist() if 'dmx_cuda' in f]
+              assert dll, 'dmx_cuda.dll not in wheel'
+              print(f'OK: {dll}')
           "
 
       - uses: actions/upload-artifact@v4
@@ -133,10 +134,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Build pure Python wheel (fallback)
+      - name: Build pure Python wheel (fallback for non-CUDA platforms)
         run: |
-          pip install setuptools wheel
-          pip wheel . -w dist/ --no-deps
+          pip install setuptools wheel build
+          python -m build --wheel --no-isolation
+          ls -la dist/
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-pure
