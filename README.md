@@ -284,6 +284,7 @@ On Llama 3.1 8B (BF16 source), mean KL of 0.001 indicates near-identical distrib
 > **VRAM requirement:** The compressed model must fit entirely in GPU memory. Compressed residency reduces VRAM by ~40%, but there is no automatic paging or CPU offload if the compressed model still exceeds your GPU's capacity. Check that your model's compressed size (roughly 53% of FP16) fits your GPU before loading. Weight paging for oversized models is on the roadmap.
 
 ```bash
+# Install PyTorch first if needed (see Quick Start below)
 pip install dmx-compress dmx-runtime
 ```
 
@@ -504,8 +505,14 @@ For measurement methodology and reproducibility — how the numbers in this docu
 ### Install
 
 ```bash
+# Install PyTorch first (if not already installed) — pick your CUDA version from https://pytorch.org
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# Install DMX
 pip install dmx-compress
 ```
+
+GPU-accelerated inference is included automatically — no compiler or extra setup needed. The package ships with a pre-compiled CUDA kernel for NVIDIA GPUs (sm_70 through sm_90: V100, T4, RTX 30xx/40xx, A100, L40, H100).
 
 ### Compress a model (lossless)
 
