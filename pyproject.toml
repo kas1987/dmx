@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel", "build"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmx-compress"
-version = "1.5.1"
+version = "1.5.2"
 description = "Lossless compression for neural network weights. Bit-exact storage, content-addressable deltas, embedded provenance."
 readme = "README.md"
 license = {text = "MIT"}

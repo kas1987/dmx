@@ -37,20 +37,9 @@ jobs:
 
       - name: Build platform wheel
         run: |
-          pip install setuptools wheel build
-          python -m build --wheel --no-isolation
-          ls -la dist/
-
-      - name: Retag to manylinux via auditwheel
-        run: |
-          pip install auditwheel patchelf
-          auditwheel repair dist/*.whl \
-            --exclude libcudart.so.12 \
-            --exclude libcuda.so.1 \
-            --plat manylinux_2_28_x86_64 \
-            -w dist_fixed/
-          rm dist/*.whl
-          mv dist_fixed/*.whl dist/
+          pip install "setuptools>=68.0" wheel
+          # Set plat-name directly for this build
+          python setup.py bdist_wheel --plat-name manylinux_2_35_x86_64
           ls -la dist/
 
       - name: Verify .so in wheel
@@ -106,8 +95,8 @@ jobs:
 
       - name: Build platform wheel
         run: |
-          pip install "setuptools>=68.0" wheel build
-          python -m build --wheel
+          pip install "setuptools>=68.0" wheel
+          python setup.py bdist_wheel --plat-name win_amd64
           ls dist/
 
       - name: Verify .dll in wheel
@@ -136,8 +125,8 @@ jobs:
           python-version: '3.11'
       - name: Build pure Python wheel (fallback for non-CUDA platforms)
         run: |
-          pip install setuptools wheel build
-          python -m build --wheel --no-isolation
+          pip install "setuptools>=68.0" wheel
+          python setup.py bdist_wheel
           ls -la dist/
       - uses: actions/upload-artifact@v4
         with:
