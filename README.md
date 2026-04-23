@@ -235,11 +235,25 @@ Negative deltas on GPT-2 and GPT-2 Medium are within measurement noise — selec
 
 *\*Identical at BF16 inference precision. The shared-exponent difference is below the output resolution of BF16 computation on these models.*
 
-### What M=7 represents on DMX's curve
+### The M-dial: quality vs compression across M levels
 
-M=7 is not DMX's only operating point — it's the fallback point the cascade defaults to when the lossless source can't fit at FP16. M is a tunable parameter: the BFP mantissa bits preserved per block of 32 values. Lower M values produce smaller files and more aggressive VRAM savings, at increasing quality cost. M=7 is the point where the step-down from FP16 stays within the noise band of the standard FP32→FP16 conversion that production inference already performs.
+M is a tunable parameter: the BFP mantissa bits preserved per block of 32 values. Higher M = more precision, lower M = more compression. The cascade defaults to M=7, but lower settings unlock additional VRAM for models that don't fit at M=7.
 
-Lower M settings (M=6, M=5, M=4) have been characterized on Qwen 1.5B BF16, with PPL deltas ranging from near-zero (M=6) to significant (M=4). Detailed M-dial data will be published in a future update. They would extend DMX's curve toward more aggressive savings, at quality costs appropriate to their precision level. Users who need DMX's file beyond the M=7 regime can re-encode at a lower M; the lossless source remains the source of truth.
+**Measured PPL delta across M levels (BF16 source, wikitext-2):**
+
+| Model | Parameters | M=7 PPL delta | M=6 PPL delta | M=5 PPL delta |
+|---|---|---|---|---|
+| Qwen 2.5 | 1.5B | +0.60% | +0.43% | +2.07% |
+| Mistral | 7B | +0.16% | — | +0.14% |
+| Llama 3.1 | 8B | +0.29% | +0.14% | +0.92% |
+
+| M | File savings | PPL range (7-8B models) | Use case |
+|---|---|---|---|
+| M=7 | 53% | +0.16% to +0.29% | Default. Near-zero quality cost. |
+| M=6 | 59-60% | +0.14% to +0.43% | Sweet spot — more compression, quality still within noise. |
+| M=5 | 65-66% | +0.14% to +0.92% | Aggressive — fits 8B models on 8GB GPUs. |
+
+Larger models are more robust to lower M settings — Mistral 7B at M=5 shows only +0.14% PPL delta. The lossless source remains the source of truth; lower M settings are derived at load time or pre-compressed for distribution.
 
 ### Measured VRAM savings (compressed residency)
 
@@ -270,14 +284,19 @@ Scores are deterministic (std=0 across runs). Max absolute delta: 0.0055. Deltas
 
 **Distribution preservation (KL divergence):**
 
-KL divergence measures whether the compressed model's probability distribution over the vocabulary matches FP16 — catching "confident but wrong" drift that perplexity can miss. On BF16 source models, M=7 keeps all 7 mantissa bits; the only source of difference is the shared block exponent (one exponent per 32 values instead of per-value).
+KL divergence measures whether the compressed model's probability distribution over the vocabulary matches FP16 — catching "confident but wrong" drift that perplexity can miss. On BF16 source models, M=7 keeps all 7 mantissa bits; the only source of difference is the shared block exponent (one exponent per 32 values instead of per-value). Lower M values drop additional mantissa bits.
 
-| Model | Source dtype | Mean KL | P99 KL | Max KL | Top-1 Agreement |
-|---|---|---|---|---|---|
-| Llama 3.1 8B | BF16 | 0.0011 | 0.0132 | 0.0342 | 98.14% |
-| Pythia 160M | FP16 | 0.0318 | 0.0905 | 0.1334 | 88.18% |
+| Model | M | Mean KL | Top-1 Agreement |
+|---|---|---|---|
+| Llama 3.1 8B | M=7 | 0.0011 | 98.1% |
+| Mistral 7B | M=6 | 0.0031 | 97.1% |
+| Llama 3.1 8B | M=6 | 0.0052 | 97.0% |
+| Qwen 2.5 1.5B | M=6 | 0.0105 | 94.9% |
+| Mistral 7B | M=5 | 0.0255 | 95.1% |
+| Llama 3.1 8B | M=5 | 0.0260 | 93.7% |
+| Qwen 2.5 1.5B | M=5 | 0.0467 | 90.3% |
 
-On Llama 3.1 8B (BF16 source), mean KL of 0.001 indicates near-identical distributions. 98% of token positions produce the same greedy prediction; the remaining 2% reflect borderline cases where the shared block exponent shifts probability mass slightly. On FP16-source models (Pythia 160M), M=7 drops 3 of 10 mantissa bits, producing a larger but still moderate shift. Measured on 1024 tokens of wikitext-2 across 8 sliding windows. Additional BF16 architectures and longer-context evaluation are planned.
+M=6 on 7-8B models maintains 97% top-1 agreement — nearly indistinguishable from M=7. Even at M=5, larger models preserve 93-95% agreement. Smaller models (1.5B) show more sensitivity to precision reduction. Measured on 1024 tokens of wikitext-2 across 8 sliding windows (BF16 source models).
 
 ### Try compressed residency yourself
 
@@ -312,11 +331,17 @@ dmx compress model.safetensors model.dmx --mode bfp --mantissa-bits 7
 ```
 
 Pre-compressed models available on HuggingFace:
+
+**M=7 (default):**
 - [Senat1/dmx-pythia-160m-m7](https://huggingface.co/Senat1/dmx-pythia-160m-m7) — Pythia 160M
 - [Senat1/dmx-qwen2.5-1.5b-m7](https://huggingface.co/Senat1/dmx-qwen2.5-1.5b-m7) — Qwen 2.5 1.5B
 - [Senat1/dmx-mistral-7b-m7](https://huggingface.co/Senat1/dmx-mistral-7b-m7) — Mistral 7B
 - [Senat1/dmx-llama-3.1-8b-m7](https://huggingface.co/Senat1/dmx-llama-3.1-8b-m7) — Llama 3.1 8B
 - [Senat1/dmx-qwen2.5-14b-m7](https://huggingface.co/Senat1/dmx-qwen2.5-14b-m7) — Qwen 2.5 14B
+
+**M=6 (60% savings):** [qwen2.5-1.5b-m6](https://huggingface.co/Senat1/dmx-qwen2.5-1.5b-m6) · [mistral-7b-m6](https://huggingface.co/Senat1/dmx-mistral-7b-m6) · [llama-3.1-8b-m6](https://huggingface.co/Senat1/dmx-llama-3.1-8b-m6)
+
+**M=5 (65% savings):** [qwen2.5-1.5b-m5](https://huggingface.co/Senat1/dmx-qwen2.5-1.5b-m5) · [mistral-7b-m5](https://huggingface.co/Senat1/dmx-mistral-7b-m5) · [llama-3.1-8b-m5](https://huggingface.co/Senat1/dmx-llama-3.1-8b-m5)
 
 ### Beyond the default cascade
 
