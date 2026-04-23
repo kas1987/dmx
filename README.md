@@ -244,7 +244,7 @@ M is a tunable parameter: the BFP mantissa bits preserved per block of 32 values
 | Model | Parameters | M=7 PPL delta | M=6 PPL delta | M=5 PPL delta |
 |---|---|---|---|---|
 | Qwen 2.5 | 1.5B | +0.60% | +0.43% | +2.07% |
-| Mistral | 7B | +0.16% | — | +0.14% |
+| Mistral | 7B | +0.16% | +0.14% | +0.14% |
 | Llama 3.1 | 8B | +0.29% | +0.14% | +0.92% |
 
 | M | File savings | PPL range (7-8B models) | Use case |
