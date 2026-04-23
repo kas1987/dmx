@@ -64,7 +64,9 @@ DMX_MAGIC = b"DMX1"            # Legacy format magic
 DMX_MAGIC_PROVENANCE = b"DMX\x00"  # New format with provenance manifest header
 DMX_VERSION = 3
 ZSTD_LEVEL = 19          # Single-file compression (archival, best ratio)
+ZSTD_LEVEL_FAST = 3      # Fast compression (30x faster, ~2% larger files)
 ZSTD_LEVEL_DELTA = 3     # Delta compression (speed matters for training callbacks)
+_zstd_level_override = None  # Set by compress_file() for per-call level control
 
 # Chunk types
 CHUNK_HEADER = 0
@@ -385,7 +387,7 @@ COMPETITIVE_CODECS = [
 ]
 
 
-def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=19):
+def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=None):
     """Encode raw int16 bytes with every available candidate coder.
 
     Returns (codec_id, compressed_bytes) for the smallest output. The codec_id
@@ -400,16 +402,18 @@ def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=19):
     Args:
         raw_bytes: raw int16 PCM data (little-endian)
         num_int16_samples: number of int16 samples (= len(raw_bytes) // 2)
-        zstd_level: zstd compression level. Default 19 (production strength).
+        zstd_level: zstd compression level. None = use module override or default 19.
 
     Returns:
         (codec_id, compressed_bytes)
     """
+    if zstd_level is None:
+        zstd_level = _zstd_level_override if _zstd_level_override is not None else ZSTD_LEVEL
     candidates = []
 
-    # zstd-19 is always available (zstandard is a hard dep)
+    # zstd is always available (zstandard is a hard dep)
     cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
-    candidates.append(("zstd-19", cctx.compress(raw_bytes)))
+    candidates.append((f"zstd-{zstd_level}", cctx.compress(raw_bytes)))
 
     # FLAC via soundfile if available. Skip if backend missing rather than
     # crash the whole compress — the selector is allowed to be a subset on
@@ -454,8 +458,9 @@ def _decompress_int16_dispatch(compressed_bytes, codec_id):
     Returns:
         raw int16 PCM bytes
     """
-    if codec_id == "zstd-19" or codec_id == "zstd" or codec_id is None:
-        # "zstd" alias accepted for files written by earlier DMX versions.
+    if codec_id is None or codec_id == "zstd" or codec_id.startswith("zstd-"):
+        # Any zstd level decompresses identically — the level only affects
+        # compression speed, not the format. Accepts "zstd-19", "zstd-3", etc.
         dctx = zstd.ZstdDecompressor()
         return dctx.decompress(compressed_bytes)
     elif codec_id == "flac" or codec_id == "lpc":
@@ -467,11 +472,11 @@ def _decompress_int16_dispatch(compressed_bytes, codec_id):
     else:
         raise ValueError(
             f"Unknown entropy codec_id {codec_id!r} in tensor metadata. "
-            f"Known: zstd-19, flac, brotli-11 (plus legacy aliases zstd, lpc, brotli)."
+            f"Known: zstd-N, flac, brotli-11 (plus legacy aliases zstd, lpc, brotli)."
         )
 
 
-def _competitive_encode_uint8(raw_bytes, zstd_level=19):
+def _competitive_encode_uint8(raw_bytes, zstd_level=None):
     """Encode arbitrary uint8 (or odd-length) bytes with every available
     candidate coder and return the smallest output.
 
@@ -484,7 +489,7 @@ def _competitive_encode_uint8(raw_bytes, zstd_level=19):
 
     Args:
         raw_bytes: raw byte stream of any length
-        zstd_level: zstd compression level (default 19, production strength)
+        zstd_level: zstd compression level. None = use module override or default 19.
 
     Returns:
         (codec_id, compressed_bytes, codec_meta)
@@ -494,9 +499,11 @@ def _competitive_encode_uint8(raw_bytes, zstd_level=19):
               step can trim padding.
             - For zstd / brotli, it is empty.
     """
+    if zstd_level is None:
+        zstd_level = _zstd_level_override if _zstd_level_override is not None else ZSTD_LEVEL
     candidates = []
     cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
-    candidates.append(("zstd-19", cctx.compress(raw_bytes), {}))
+    candidates.append((f"zstd-{zstd_level}", cctx.compress(raw_bytes), {}))
 
     if _lpc_backend_available():
         try:
@@ -523,7 +530,7 @@ def _decompress_uint8_dispatch(compressed_bytes, codec_id, codec_meta=None):
     metadata; codec_meta carries any additional fields the chosen coder needs
     (e.g. the uint8 original length for the FLAC unpacking step).
     """
-    if codec_id == "zstd-19" or codec_id == "zstd" or codec_id is None:
+    if codec_id is None or codec_id == "zstd" or (isinstance(codec_id, str) and codec_id.startswith("zstd-")):
         dctx = zstd.ZstdDecompressor()
         return dctx.decompress(compressed_bytes)
     elif codec_id == "flac" or codec_id == "lpc":
@@ -1370,7 +1377,8 @@ def encode_tensor(tensor, encoding, entropy_mode=None, mode=None):
         # Exponent stream is always zstd. It's tiny (sub-3% of total bytes
         # for typical group sizes) and the selector overhead would dominate
         # any savings from a different coder.
-        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        _effective_zstd = _zstd_level_override if _zstd_level_override is not None else ZSTD_LEVEL
+        cctx = zstd.ZstdCompressor(level=_effective_zstd)
         exp_compressed = cctx.compress(exp_stream.tobytes())
 
         # Mantissa stream gets the per-tensor entropy step. The candidate set
@@ -1403,7 +1411,7 @@ def encode_tensor(tensor, encoding, entropy_mode=None, mode=None):
                 meta["bfp_mant_codec"] = "zstd-19"
         elif entropy_mode in ("zstd-19", "zstd"):
             mant_data = cctx.compress(mant_bytes)
-            meta["bfp_mant_codec"] = "zstd-19"
+            meta["bfp_mant_codec"] = f"zstd-{_effective_zstd}"
         else:
             # Legacy mode: follow the encoding constant's use_lpc decision.
             # Files written under this branch have no bfp_mant_codec field;
@@ -1833,7 +1841,7 @@ def _is_fast_load_tensor(name):
 
 def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=None,
                   parallel_workers=None, mantissa_bits=None, fast_load=False,
-                  skip_layers=None):
+                  skip_layers=None, compression_level=None):
     """Compress a safetensors file to .dmx format.
 
     mode: 'auto', 'bfp', 'int16', 'int32', or 'transpose'
@@ -1915,6 +1923,18 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         logger.info("Skip-layers: %d patterns — matching tensors stored losslessly", len(_skip_layers_patterns))
         for p in _skip_layers_patterns:
             logger.info("    - %s", p)
+
+    # Resolve compression level. Controls zstd speed/ratio tradeoff.
+    # Default 19 (max compression). --fast sets 3 (30x faster, ~2% larger).
+    global _zstd_level_override
+    _prior_zstd_level = _zstd_level_override
+    if compression_level is not None:
+        if not isinstance(compression_level, int) or compression_level < 1 or compression_level > 22:
+            raise ValueError(f"compression_level must be 1-22; got {compression_level}")
+        _zstd_level_override = compression_level
+        logger.info("Compression level: zstd-%d (default is %d)", compression_level, ZSTD_LEVEL)
+    else:
+        _zstd_level_override = None
 
     # Resolve entropy mode. Normalize legacy aliases to the canonical names
     # used by the selector and dispatch helpers.
@@ -2175,6 +2195,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     # subsequent calls. Done unconditionally to keep the module-level state clean.
     _bfp_mantissa_override = _prior_mantissa_override
     _fast_load_override = False
+    _zstd_level_override = _prior_zstd_level
 
     return original_size, output_size
 
@@ -4734,6 +4755,14 @@ def main():
                                  "Pinned values force a single coder for every tensor. Legacy "
                                  "aliases accepted: 'zstd' -> 'zstd-19', 'lpc' -> 'flac', "
                                  "'brotli' -> 'brotli-11'.")
+    p_compress.add_argument("--compression-level", type=int, default=None,
+                            help="zstd compression level 1-22 (default: 19 = max compression). "
+                                 "Lower levels are faster with slightly larger output. "
+                                 "Level 3 is ~30x faster than 19 with ~2%% larger files.")
+    p_compress.add_argument("--fast", action="store_true",
+                            help="Fast compression mode. Shorthand for --compression-level 3. "
+                                 "~30x faster than default, ~2%% larger files. "
+                                 "Decompress speed is identical regardless of level.")
     p_compress.add_argument("--gpu", action="store_true",
                             help="Use GPU-accelerated compression (CUDA required)")
     p_compress.add_argument("--parallel-workers", type=int, default=None,
@@ -4894,12 +4923,17 @@ def main():
     args = parser.parse_args()
 
     if args.command == "compress":
+        # Resolve --fast shorthand to --compression-level 3
+        _comp_level = args.compression_level
+        if getattr(args, 'fast', False) and _comp_level is None:
+            _comp_level = ZSTD_LEVEL_FAST
         compress_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
                       use_gpu=args.gpu if args.gpu else None,
                       parallel_workers=args.parallel_workers,
                       mantissa_bits=args.mantissa_bits,
                       fast_load=args.fast_load,
-                      skip_layers=args.skip_layers)
+                      skip_layers=args.skip_layers,
+                      compression_level=_comp_level)
         if args.report:
             print()
             print("=== Auto-verify after compression ===")
