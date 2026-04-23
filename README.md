@@ -308,12 +308,12 @@ pip install dmx-compress dmx-runtime
 ```
 
 ```python
-from dmx_runtime import from_dmx_compressed
+from dmx_runtime import from_dmx
 import torch
 
-# Load with compressed residency (~40% less VRAM)
-model = from_dmx_compressed(
-    "path/to/model.dmx",
+# Auto-detects loading mode (inflate, compressed, or pager) based on available VRAM
+model = from_dmx(
+    "Senat1/dmx-qwen2.5-1.5b-m7",
     model_id="Qwen/Qwen2.5-1.5B-Instruct"
 )
 

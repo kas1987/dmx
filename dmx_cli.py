@@ -20,6 +20,7 @@ import datetime
 import hashlib
 import io
 import json
+import logging
 import os
 import shutil
 import struct
@@ -28,6 +29,8 @@ import sys
 import tempfile
 import time
 import wave
+
+logger = logging.getLogger("dmx_compress")
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -764,7 +767,7 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
         return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
     if t.dtype == torch.float32:
-        print("  Source dtype: float32 — converting to float16 for BFP encoding")
+        logger.info("Source dtype: float32 — converting to float16 for BFP encoding")
         t = t.half()
 
     raw = t.view(torch.int16).numpy().astype(np.uint16)
@@ -865,7 +868,7 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
         return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
     if t.dtype == torch.float32:
-        print("  Source dtype: float32 — converting to float16 for BFP encoding")
+        logger.info("Source dtype: float32 — converting to float16 for BFP encoding")
         t = t.half()
 
     # View as uint16 via int16 reinterpret
@@ -1872,10 +1875,10 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     if use_gpu:
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            print(f"  GPU accelerated compression: {gpu_name}")
+            logger.info("GPU accelerated compression: %s", gpu_name)
             _use_gpu_compress = True
         else:
-            print("  WARNING: --gpu requested but CUDA not available. Falling back to CPU.")
+            logger.warning("--gpu requested but CUDA not available. Falling back to CPU.")
             _use_gpu_compress = False
     else:
         _use_gpu_compress = False
@@ -1896,23 +1899,22 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
                 f"M>=8 would overflow the uint8 packing format."
             )
         _bfp_mantissa_override = mantissa_bits
-        print(f"  Mantissa bits override: M={mantissa_bits} "
-              f"(default is {BFP_MANTISSA_BITS})")
+        logger.info("Mantissa bits override: M=%d (default is %d)", mantissa_bits, BFP_MANTISSA_BITS)
 
     # Resolve fast_load override. When True, tensors matching FAST_LOAD_PATTERNS
     # are stored as FP16+entropy instead of BFP, enabling instant loading for
     # compressed residency (no materialize step needed).
     _fast_load_override = bool(fast_load)
     if _fast_load_override:
-        print(f"  Fast-load mode: embed/head tensors stored as FP16 (patterns: {FAST_LOAD_PATTERNS})")
+        logger.info("Fast-load mode: embed/head tensors stored as FP16 (patterns: %s)", FAST_LOAD_PATTERNS)
 
     # Resolve skip_layers. Comma-separated patterns — matching tensors are stored
     # as lossless (ENC_TRANSPOSE_LOSSLESS) instead of BFP. Recorded in manifest.
     _skip_layers_patterns = tuple(p.strip() for p in skip_layers.split(",")) if skip_layers else ()
     if _skip_layers_patterns:
-        print(f"  Skip-layers: {len(_skip_layers_patterns)} patterns — matching tensors stored losslessly")
+        logger.info("Skip-layers: %d patterns — matching tensors stored losslessly", len(_skip_layers_patterns))
         for p in _skip_layers_patterns:
-            print(f"    - {p}")
+            logger.info("    - %s", p)
 
     # Resolve entropy mode. Normalize legacy aliases to the canonical names
     # used by the selector and dispatch helpers.
@@ -1922,13 +1924,13 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         if _lpc_backend_available():
             entropy_mode = "flac"
         else:
-            print("  WARNING: --entropy flac requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd-19.")
+            logger.warning("--entropy flac requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd-19.")
             entropy_mode = "zstd-19"
     elif entropy in ("brotli-11", "brotli"):
         if BROTLI_AVAILABLE:
             entropy_mode = "brotli-11"
         else:
-            print("  WARNING: --entropy brotli-11 requires brotli (pip install brotli). Falling back to zstd-19.")
+            logger.warning("--entropy brotli-11 requires brotli (pip install brotli). Falling back to zstd-19.")
             entropy_mode = "zstd-19"
     elif entropy in ("zstd-19", "zstd"):
         entropy_mode = "zstd-19"
@@ -1938,23 +1940,23 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             f"Use 'auto', 'zstd-19', 'flac', or 'brotli-11'."
         )
 
-    print(f"Loading {input_path}...")
+    logger.info("Loading %s...", input_path)
     start = time.time()
     tensors = load_file(input_path)
     load_time = time.time() - start
-    print(f"  Loaded {len(tensors)} tensors in {load_time:.1f}s")
+    logger.info("Loaded %d tensors in %.1fs", len(tensors), load_time)
 
     original_size = os.path.getsize(input_path)
-    print(f"  Original size: {original_size / 1024 / 1024:.1f} MB")
+    logger.info("Original size: %.1f MB", original_size / 1024 / 1024)
 
     # Resolve auto mode
     if mode == "auto":
         mode = auto_detect_mode(tensors)
-        print(f"  Auto-detected mode: {mode}")
+        logger.info("Auto-detected mode: %s", mode)
     else:
-        print(f"  Mode: {mode}")
+        logger.info("Mode: %s", mode)
 
-    print(f"  Entropy coding: {entropy_mode}")
+    logger.info("Entropy coding: %s", entropy_mode)
 
     # Build manifest and compressed chunks
     manifest = {
@@ -1992,11 +1994,11 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     if parallel_workers is None:
         parallel_workers = 1 if _use_gpu_compress else min(8, os.cpu_count() or 1)
     elif _use_gpu_compress and parallel_workers > 1:
-        print(f"  WARNING: parallel_workers={parallel_workers} ignored in GPU mode (forcing 1)")
+        logger.warning("parallel_workers=%d ignored in GPU mode (forcing 1)", parallel_workers)
         parallel_workers = 1
 
     if parallel_workers > 1:
-        print(f"  Parallel encoding: {parallel_workers} workers")
+        logger.info("Parallel encoding: %d workers", parallel_workers)
 
         def _encode_one(key):
             tensor = tensors[key]
@@ -2028,7 +2030,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
                 total_raw += meta["raw_size"]
                 total_compressed += meta["compressed_size"]
                 if (i + 1) % 100 == 0 or (i + 1) == len(keys):
-                    print(f"  Compressed {i+1}/{len(keys)} tensors...")
+                    logger.info("Compressed %d/%d tensors...", i + 1, len(keys))
     else:
         for i, key in enumerate(keys):
             tensor = tensors[key]
@@ -2055,7 +2057,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             total_compressed += meta["compressed_size"]
 
             if (i + 1) % 100 == 0 or (i + 1) == len(keys):
-                print(f"  Compressed {i+1}/{len(keys)} tensors...")
+                logger.info("Compressed %d/%d tensors...", i + 1, len(keys))
 
     # --- Build provenance manifest ---
     # Compute content_hash over the compressed weight data
@@ -2147,26 +2149,27 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         total_params = 0
     fp32_equivalent = total_params * 4 if total_params > 0 else 0
 
-    print(f"  Encoding breakdown:")
+    logger.info("Encoding breakdown:")
     for enc, count in enc_counts.items():
         if count > 0:
-            print(f"    {enc_names[enc]}: {count} tensors")
-    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB")
+            logger.info("    %s: %d tensors", enc_names[enc], count)
+    logger.info("Output size: %.1f MB", output_size / 1024 / 1024)
     # Dual-denominator reporting: the same compressed bytes can produce wildly
     # different "savings %" depending on whether the baseline is the source
     # file (dtype-dependent) or the FP32 equivalent (canonical). Report both
     # so log parsers and users see both numbers side-by-side.
     savings_vs_source_pct = (1 - output_size / original_size) * 100
-    print(f"    vs source file ({original_size / 1024 / 1024:.1f} MB): "
-          f"{ratio:.1f}% of source, {savings_vs_source_pct:+.1f}% savings")
+    logger.info("    vs source file (%.1f MB): %.1f%% of source, %+.1f%% savings",
+                original_size / 1024 / 1024, ratio, savings_vs_source_pct)
     if fp32_equivalent > 0:
         savings_vs_fp32_pct = (1 - output_size / fp32_equivalent) * 100
         fp32_ratio_pct = output_size / fp32_equivalent * 100
-        print(f"    vs FP32 equivalent ({fp32_equivalent / 1024 / 1024:.1f} MB, "
-              f"{total_params:,} params × 4 bytes): "
-              f"{fp32_ratio_pct:.1f}% of FP32, {savings_vs_fp32_pct:+.1f}% savings")
-    print(f"  Savings: {(original_size - output_size) / 1024 / 1024:.1f} MB")
-    print(f"  Time: {elapsed:.1f}s")
+        logger.info("    vs FP32 equivalent (%.1f MB, %s params × 4 bytes): "
+                    "%.1f%% of FP32, %+.1f%% savings",
+                    fp32_equivalent / 1024 / 1024, f"{total_params:,}",
+                    fp32_ratio_pct, savings_vs_fp32_pct)
+    logger.info("Savings: %.1f MB", (original_size - output_size) / 1024 / 1024)
+    logger.info("Time: %.1fs", elapsed)
 
     # Restore the mantissa-bits and fast-load overrides so they don't leak to
     # subsequent calls. Done unconditionally to keep the module-level state clean.
@@ -2187,15 +2190,15 @@ def decompress_file(input_path, output_path, use_gpu=None):
         use_gpu = torch.cuda.is_available()
     if use_gpu:
         if not torch.cuda.is_available():
-            print("  WARNING: --gpu requested but CUDA not available. Falling back to CPU.")
+            logger.warning("--gpu requested but CUDA not available. Falling back to CPU.")
             use_gpu = False
         else:
             gpu_name = torch.cuda.get_device_name(0)
-            print(f"  GPU accelerated mode: {gpu_name}")
+            logger.info("GPU accelerated mode: %s", gpu_name)
 
     decode_fn = decode_tensor_gpu if use_gpu else decode_tensor
 
-    print(f"Loading {input_path}...")
+    logger.info("Loading %s...", input_path)
     start = time.time()
 
     with open(input_path, "rb") as f:
@@ -2228,18 +2231,18 @@ def decompress_file(input_path, output_path, use_gpu=None):
             tensors[key] = decode_fn(compressed, meta)
 
             if (i + 1) % 500 == 0 or (i + 1) == len(keys):
-                print(f"  Decompressed {i+1}/{len(keys)} tensors...")
+                logger.info("Decompressed %d/%d tensors...", i + 1, len(keys))
 
     if use_gpu:
         torch.cuda.synchronize()
 
-    print(f"  Saving to {output_path}...")
+    logger.info("Saving to %s...", output_path)
     save_file(tensors, output_path)
 
     elapsed = time.time() - start
     output_size = os.path.getsize(output_path)
-    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB")
-    print(f"  Time: {elapsed:.1f}s")
+    logger.info("Output size: %.1f MB", output_size / 1024 / 1024)
+    logger.info("Time: %.1fs", elapsed)
 
     return output_size
 
@@ -2302,7 +2305,7 @@ def _decode_dmx_to_tensors(input_path, use_gpu=None):
             compressed = f.read(meta["compressed_size"])
             tensors[key] = decode_fn(compressed, meta)
             if (i + 1) % 500 == 0 or (i + 1) == len(keys):
-                print(f"  Decompressed {i+1}/{len(keys)} tensors...")
+                logger.info("Decompressed %d/%d tensors...", i + 1, len(keys))
 
     decompress_time = time.time() - start
     return tensors, manifest, decompress_time
@@ -2498,7 +2501,7 @@ def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
                 payloads[key] = decode_fn(compressed, meta)
 
             if (i + 1) % 500 == 0 or (i + 1) == len(keys):
-                print(f"  Partial-decoded {i+1}/{len(keys)} tensors...")
+                logger.info("Partial-decoded %d/%d tensors...", i + 1, len(keys))
 
     elapsed = time.time() - start
     return payloads, manifest, elapsed
