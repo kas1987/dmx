@@ -2892,6 +2892,98 @@ def _decode_bfp_streams_only(compressed_bytes, meta):
     return exp_stream, sign_mant_stream
 
 
+class LazyPayloadDict:
+    """Dict-like that reads and decodes tensors on demand from a .dmx file.
+
+    Drop-in replacement for the dict returned by _decode_dmx_to_bfp_payloads.
+    Peak host RAM drops from O(all tensors) to O(one tensor at a time).
+    """
+
+    def __init__(self, path, manifest, use_gpu=None):
+        self._path = path
+        self._tensor_meta = manifest["tensors"]
+        self._use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()
+        self._decode_fn = decode_tensor_gpu if (self._use_gpu and torch.cuda.is_available()) else decode_tensor
+        self._deleted = set()
+
+    def __contains__(self, key):
+        return key in self._tensor_meta and key not in self._deleted
+
+    def __getitem__(self, key):
+        if key not in self._tensor_meta or key in self._deleted:
+            raise KeyError(key)
+        meta = self._tensor_meta[key]
+        with open(self._path, "rb") as f:
+            f.seek(meta["offset"])
+            compressed = f.read(meta["compressed_size"])
+
+        base_enc = _base_encoding(meta["encoding"])
+        if base_enc == ENC_BFP_ZSTD:
+            exp_np, mant_np = _decode_bfp_streams_only(compressed, meta)
+            exponents = torch.from_numpy(exp_np)
+            packed_mantissa = torch.from_numpy(mant_np)
+            original_dtype_str = meta.get("original_dtype", meta["dtype"])
+            dt = _DTYPE_STR_TO_TORCH.get(original_dtype_str, torch.float16)
+            return BFPPayload(
+                exponents=exponents,
+                packed_mantissa=packed_mantissa,
+                shape=tuple(meta["shape"]),
+                dtype=dt,
+                group_size=meta.get("bfp_group_size", BFP_GROUP_SIZE),
+                mantissa_bits=meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
+                pad_len=meta["bfp_pad_len"],
+                orig_len=meta["bfp_orig_len"],
+                scale=None,
+            )
+        else:
+            return self._decode_fn(compressed, meta)
+
+    def __delitem__(self, key):
+        self._deleted.add(key)
+
+    def keys(self):
+        return [k for k in self._tensor_meta if k not in self._deleted]
+
+    def __len__(self):
+        return len(self._tensor_meta) - len(self._deleted)
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def _lazy_bfp_payloads(path, use_gpu=None):
+    """Like _decode_dmx_to_bfp_payloads but returns a LazyPayloadDict.
+
+    Reads only the manifest upfront. Each tensor is decoded on first access.
+    Peak host RAM: ~100 MB (one tensor) instead of ~68 GB (all tensors for 72B).
+
+    Returns
+    -------
+    (lazy_dict, manifest, 0.0)
+        Same 3-tuple shape as _decode_dmx_to_bfp_payloads for API compat.
+    """
+    with open(path, "rb") as f:
+        _read_provenance_header(f)
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            raise ValueError(f"Not a DMX file (magic: {magic})")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version > DMX_VERSION:
+            raise ValueError(f"Unsupported DMX version: {version}")
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_size))
+
+    lazy = LazyPayloadDict(path, manifest, use_gpu=use_gpu)
+    logger.info("Lazy payload dict: %d tensors (read on demand)", len(lazy))
+    return lazy, manifest, 0.0
+
+
 def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
     """Partial-decode variant of _decode_dmx_to_tensors.
 
