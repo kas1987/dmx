@@ -85,6 +85,21 @@ def get_native_lib():
             ctypes.c_void_p,  # stream
         ]
 
+        # BF16 decompression (may not exist in older builds)
+        try:
+            _lib.dmx_bfp_decompress_bf16.restype = ctypes.c_int
+            _lib.dmx_bfp_decompress_bf16.argtypes = [
+                ctypes.c_void_p,  # d_exponents
+                ctypes.c_void_p,  # d_mantissas
+                ctypes.c_void_p,  # d_output
+                ctypes.c_int,     # num_elements
+                ctypes.c_int,     # group_size
+                ctypes.c_int,     # mantissa_bits
+                ctypes.c_void_p,  # stream
+            ]
+        except AttributeError:
+            pass  # older library without BF16 support
+
         _lib.dmx_version.restype = ctypes.c_int
         _lib.dmx_version.argtypes = []
 
@@ -146,3 +161,55 @@ def bfp_decompress(exponents: torch.Tensor, mantissas: torch.Tensor,
         raise RuntimeError(f"dmx_bfp_decompress failed with CUDA error {err}")
 
     return output.view(torch.float16)
+
+
+def bfp_decompress_bf16(exponents: torch.Tensor, mantissas: torch.Tensor,
+                        group_size: int, mantissa_bits: int) -> torch.Tensor:
+    """Decompress BFP data to bfloat16 using the native CUDA kernel.
+
+    Same interface as bfp_decompress() but produces bfloat16 output.
+
+    Args:
+        exponents: uint8 tensor on CUDA [n_groups]
+        mantissas: uint8 tensor on CUDA [num_elements]
+        group_size: BFP group size (32)
+        mantissa_bits: mantissa precision (1-7)
+
+    Returns:
+        int16 tensor on CUDA [num_elements] (reinterpret as bfloat16)
+    """
+    lib = get_native_lib()
+    if lib is None:
+        raise RuntimeError("dmx_cuda native library not found")
+
+    if not hasattr(lib, 'dmx_bfp_decompress_bf16'):
+        raise RuntimeError("dmx_cuda library does not have BF16 support (rebuild needed)")
+
+    assert exponents.is_cuda and mantissas.is_cuda, "Tensors must be on CUDA"
+    assert exponents.dtype == torch.uint8 and mantissas.dtype == torch.uint8
+
+    n = mantissas.numel()
+    output = torch.empty(n, dtype=torch.int16, device=mantissas.device)
+
+    # Get raw data pointers
+    exp_ptr = exponents.data_ptr()
+    mant_ptr = mantissas.data_ptr()
+    out_ptr = output.data_ptr()
+
+    # Get current CUDA stream
+    stream = torch.cuda.current_stream().cuda_stream
+
+    err = lib.dmx_bfp_decompress_bf16(
+        ctypes.c_void_p(exp_ptr),
+        ctypes.c_void_p(mant_ptr),
+        ctypes.c_void_p(out_ptr),
+        ctypes.c_int(n),
+        ctypes.c_int(group_size),
+        ctypes.c_int(mantissa_bits),
+        ctypes.c_void_p(stream),
+    )
+
+    if err != 0:
+        raise RuntimeError(f"dmx_bfp_decompress_bf16 failed with CUDA error {err}")
+
+    return output.view(torch.bfloat16)

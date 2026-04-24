@@ -10,6 +10,8 @@ Usage:
     python dmx_cli.py compress model.safetensors model.dmx
     python dmx_cli.py compress model.safetensors model.dmx --mode bfp
     python dmx_cli.py compress model.safetensors model.dmx --entropy lpc
+    python dmx_cli.py compress model-00001-of-00037.safetensors model.dmx   # multi-shard
+    python dmx_cli.py compress /path/to/model_dir/ model.dmx               # directory
     python dmx_cli.py decompress model.dmx model.safetensors
     python dmx_cli.py info model.dmx
     python dmx_cli.py verify model.safetensors model.dmx
@@ -17,10 +19,13 @@ Usage:
 
 import argparse
 import datetime
+import glob
 import hashlib
 import io
 import json
+import logging
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -28,7 +33,9 @@ import sys
 import tempfile
 import time
 import wave
-from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger("dmx_compress")
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -61,7 +68,9 @@ DMX_MAGIC = b"DMX1"            # Legacy format magic
 DMX_MAGIC_PROVENANCE = b"DMX\x00"  # New format with provenance manifest header
 DMX_VERSION = 3
 ZSTD_LEVEL = 19          # Single-file compression (archival, best ratio)
+ZSTD_LEVEL_FAST = 3      # Fast compression (30x faster, ~2% larger files)
 ZSTD_LEVEL_DELTA = 3     # Delta compression (speed matters for training callbacks)
+_zstd_level_override = None  # Set by compress_file() for per-call level control
 
 # Chunk types
 CHUNK_HEADER = 0
@@ -108,6 +117,94 @@ _fast_load_override = False
 # bypassing the frozen default arg values captured at function-definition time.
 # Restored to None at the end of each compress_file() call so state never leaks.
 _bfp_mantissa_override = None
+
+# HuggingFace config files to embed in the .dmx manifest for offline loading.
+# These are JSON-serializable text files that describe the model architecture,
+# tokenizer, and generation settings. Embedding them enables from_dmx() to
+# reconstruct the model without any network access to HuggingFace.
+_HF_CONFIG_FILES = [
+    "config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+]
+
+# Binary tokenizer files that may need base64 encoding.
+# tokenizer.json is the fast-tokenizer vocab (JSON, can be large ~2-4 MB).
+# tokenizer.model is sentencepiece binary (needs base64).
+_HF_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer.model",
+]
+
+
+def _collect_hf_configs(source_dir):
+    """Collect HuggingFace config/tokenizer files from a model directory.
+
+    Looks for config.json, tokenizer_config.json, etc. alongside the
+    safetensors files. Returns a dict suitable for embedding in the .dmx
+    manifest under the ``"hf_config"`` key.
+
+    Parameters
+    ----------
+    source_dir : str
+        Directory containing the safetensors files (and hopefully config files).
+
+    Returns
+    -------
+    dict or None
+        Dict with keys like ``"config.json"`` mapped to their parsed JSON
+        contents (for JSON files) or base64-encoded strings (for binary files).
+        Returns None if no config files are found.
+    """
+    import base64
+
+    result = {}
+
+    # JSON config files — store as parsed dicts (natural JSON embedding)
+    for fname in _HF_CONFIG_FILES:
+        fpath = os.path.join(source_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    result[fname] = json.load(f)
+                logger.info("Embedded HF config: %s (%.1f KB)", fname,
+                            os.path.getsize(fpath) / 1024)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning("Skipping %s (parse error: %s)", fname, e)
+
+    # Tokenizer files — JSON or binary
+    for fname in _HF_TOKENIZER_FILES:
+        fpath = os.path.join(source_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                if fname.endswith(".json"):
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        result[fname] = json.load(f)
+                    logger.info("Embedded HF tokenizer: %s (%.1f KB)", fname,
+                                os.path.getsize(fpath) / 1024)
+                else:
+                    # Binary file (e.g. tokenizer.model) — base64 encode
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    result[fname] = {
+                        "_binary": True,
+                        "_encoding": "base64",
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                    logger.info("Embedded HF tokenizer (binary): %s (%.1f KB)", fname,
+                                len(raw) / 1024)
+            except Exception as e:
+                logger.warning("Skipping %s (error: %s)", fname, e)
+
+    if not result:
+        return None
+
+    if "config.json" not in result:
+        logger.warning("No config.json found in %s — model_id will still be "
+                       "required for loading", source_dir)
+
+    return result
 
 
 def build_provenance_manifest(source_path, source_format, param_count,
@@ -382,7 +479,7 @@ COMPETITIVE_CODECS = [
 ]
 
 
-def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=19):
+def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=None):
     """Encode raw int16 bytes with every available candidate coder.
 
     Returns (codec_id, compressed_bytes) for the smallest output. The codec_id
@@ -397,16 +494,18 @@ def _competitive_encode_int16(raw_bytes, num_int16_samples, zstd_level=19):
     Args:
         raw_bytes: raw int16 PCM data (little-endian)
         num_int16_samples: number of int16 samples (= len(raw_bytes) // 2)
-        zstd_level: zstd compression level. Default 19 (production strength).
+        zstd_level: zstd compression level. None = use module override or default 19.
 
     Returns:
         (codec_id, compressed_bytes)
     """
+    if zstd_level is None:
+        zstd_level = _zstd_level_override if _zstd_level_override is not None else ZSTD_LEVEL
     candidates = []
 
-    # zstd-19 is always available (zstandard is a hard dep)
+    # zstd is always available (zstandard is a hard dep)
     cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
-    candidates.append(("zstd-19", cctx.compress(raw_bytes)))
+    candidates.append((f"zstd-{zstd_level}", cctx.compress(raw_bytes)))
 
     # FLAC via soundfile if available. Skip if backend missing rather than
     # crash the whole compress — the selector is allowed to be a subset on
@@ -451,8 +550,9 @@ def _decompress_int16_dispatch(compressed_bytes, codec_id):
     Returns:
         raw int16 PCM bytes
     """
-    if codec_id == "zstd-19" or codec_id == "zstd" or codec_id is None:
-        # "zstd" alias accepted for files written by earlier DMX versions.
+    if codec_id is None or codec_id == "zstd" or codec_id.startswith("zstd-"):
+        # Any zstd level decompresses identically — the level only affects
+        # compression speed, not the format. Accepts "zstd-19", "zstd-3", etc.
         dctx = zstd.ZstdDecompressor()
         return dctx.decompress(compressed_bytes)
     elif codec_id == "flac" or codec_id == "lpc":
@@ -464,11 +564,11 @@ def _decompress_int16_dispatch(compressed_bytes, codec_id):
     else:
         raise ValueError(
             f"Unknown entropy codec_id {codec_id!r} in tensor metadata. "
-            f"Known: zstd-19, flac, brotli-11 (plus legacy aliases zstd, lpc, brotli)."
+            f"Known: zstd-N, flac, brotli-11 (plus legacy aliases zstd, lpc, brotli)."
         )
 
 
-def _competitive_encode_uint8(raw_bytes, zstd_level=19):
+def _competitive_encode_uint8(raw_bytes, zstd_level=None):
     """Encode arbitrary uint8 (or odd-length) bytes with every available
     candidate coder and return the smallest output.
 
@@ -481,7 +581,7 @@ def _competitive_encode_uint8(raw_bytes, zstd_level=19):
 
     Args:
         raw_bytes: raw byte stream of any length
-        zstd_level: zstd compression level (default 19, production strength)
+        zstd_level: zstd compression level. None = use module override or default 19.
 
     Returns:
         (codec_id, compressed_bytes, codec_meta)
@@ -491,9 +591,11 @@ def _competitive_encode_uint8(raw_bytes, zstd_level=19):
               step can trim padding.
             - For zstd / brotli, it is empty.
     """
+    if zstd_level is None:
+        zstd_level = _zstd_level_override if _zstd_level_override is not None else ZSTD_LEVEL
     candidates = []
     cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
-    candidates.append(("zstd-19", cctx.compress(raw_bytes), {}))
+    candidates.append((f"zstd-{zstd_level}", cctx.compress(raw_bytes), {}))
 
     if _lpc_backend_available():
         try:
@@ -520,7 +622,7 @@ def _decompress_uint8_dispatch(compressed_bytes, codec_id, codec_meta=None):
     metadata; codec_meta carries any additional fields the chosen coder needs
     (e.g. the uint8 original length for the FLAC unpacking step).
     """
-    if codec_id == "zstd-19" or codec_id == "zstd" or codec_id is None:
+    if codec_id is None or codec_id == "zstd" or (isinstance(codec_id, str) and codec_id.startswith("zstd-")):
         dctx = zstd.ZstdDecompressor()
         return dctx.decompress(compressed_bytes)
     elif codec_id == "flac" or codec_id == "lpc":
@@ -764,7 +866,7 @@ def bfp_compress(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTISSA_B
         return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
     if t.dtype == torch.float32:
-        print("  Source dtype: float32 — converting to float16 for BFP encoding")
+        logger.info("Source dtype: float32 — converting to float16 for BFP encoding")
         t = t.half()
 
     raw = t.view(torch.int16).numpy().astype(np.uint16)
@@ -865,7 +967,7 @@ def bfp_compress_gpu(tensor, group_size=BFP_GROUP_SIZE, mantissa_bits=BFP_MANTIS
         return exp_stream, sign_mant_stream, pad_len, orig_len, original_dtype
 
     if t.dtype == torch.float32:
-        print("  Source dtype: float32 — converting to float16 for BFP encoding")
+        logger.info("Source dtype: float32 — converting to float16 for BFP encoding")
         t = t.half()
 
     # View as uint16 via int16 reinterpret
@@ -1367,7 +1469,8 @@ def encode_tensor(tensor, encoding, entropy_mode=None, mode=None):
         # Exponent stream is always zstd. It's tiny (sub-3% of total bytes
         # for typical group sizes) and the selector overhead would dominate
         # any savings from a different coder.
-        cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        _effective_zstd = _zstd_level_override if _zstd_level_override is not None else ZSTD_LEVEL
+        cctx = zstd.ZstdCompressor(level=_effective_zstd)
         exp_compressed = cctx.compress(exp_stream.tobytes())
 
         # Mantissa stream gets the per-tensor entropy step. The candidate set
@@ -1400,7 +1503,7 @@ def encode_tensor(tensor, encoding, entropy_mode=None, mode=None):
                 meta["bfp_mant_codec"] = "zstd-19"
         elif entropy_mode in ("zstd-19", "zstd"):
             mant_data = cctx.compress(mant_bytes)
-            meta["bfp_mant_codec"] = "zstd-19"
+            meta["bfp_mant_codec"] = f"zstd-{_effective_zstd}"
         else:
             # Legacy mode: follow the encoding constant's use_lpc decision.
             # Files written under this branch have no bfp_mant_codec field;
@@ -1828,10 +1931,372 @@ def _is_fast_load_tensor(name):
     return any(pat in name for pat in FAST_LOAD_PATTERNS)
 
 
+def _resolve_shard_paths(input_path):
+    """Resolve input_path to a list of safetensors shard file paths.
+
+    Handles three cases:
+    1. Directory: finds all *.safetensors files inside, sorted naturally.
+    2. Single shard file with pattern like ``model-00001-of-00037.safetensors``:
+       auto-detects all sibling shards in the same directory.
+    3. Single file (no shard pattern): returns a one-element list.
+
+    Returns
+    -------
+    list[str]
+        Sorted list of absolute paths to safetensors files.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the input path doesn't exist or no safetensors files are found.
+    """
+    input_path = os.path.abspath(input_path)
+
+    # Case 1: directory
+    if os.path.isdir(input_path):
+        shards = sorted(glob.glob(os.path.join(input_path, "*.safetensors")))
+        if not shards:
+            raise FileNotFoundError(
+                f"No .safetensors files found in directory: {input_path}"
+            )
+        return shards
+
+    # Must be a file
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+
+    # Case 2: detect multi-shard pattern (e.g. model-00001-of-00037.safetensors)
+    basename = os.path.basename(input_path)
+    shard_pattern = re.match(
+        r"^(.+)-(\d{5})-of-(\d{5})(\.safetensors)$", basename
+    )
+    if shard_pattern:
+        prefix = shard_pattern.group(1)
+        total = int(shard_pattern.group(3))
+        ext = shard_pattern.group(4)
+        parent_dir = os.path.dirname(input_path)
+        # Build expected shard list
+        shards = []
+        for i in range(1, total + 1):
+            shard_name = f"{prefix}-{i:05d}-of-{total:05d}{ext}"
+            shard_path = os.path.join(parent_dir, shard_name)
+            if os.path.isfile(shard_path):
+                shards.append(shard_path)
+            else:
+                logger.warning("Expected shard not found: %s", shard_path)
+        if not shards:
+            raise FileNotFoundError(
+                f"No sibling shards found for pattern: {basename}"
+            )
+        return sorted(shards)
+
+    # Case 3: single file
+    return [input_path]
+
+
+# ---------------------------------------------------------------------------
+# Multi-shard parallel compression
+# ---------------------------------------------------------------------------
+
+def _compress_one_shard(args_tuple):
+    """Compress a single safetensors shard -- top-level function for pickling.
+
+    Designed to run in a ProcessPoolExecutor worker.  Each worker loads one
+    shard, compresses all its tensors on CPU (no CUDA -- GPU context is
+    per-process and would block parallelism), and returns the compressed
+    chunks + manifest entries.
+
+    Parameters (packed as a tuple for pool.map compatibility):
+        shard_path, mode, entropy_mode, mantissa_bits, fast_load_enabled,
+        skip_layers_patterns, compression_level, parallel_workers_per_shard
+
+    Returns:
+        dict with keys: shard_path, manifest_tensors, compressed_chunks,
+        total_raw, total_compressed, enc_counts, error
+    """
+    (shard_path, mode, entropy_mode, mantissa_bits, fast_load_enabled,
+     skip_layers_patterns, compression_level, parallel_workers_per_shard) = args_tuple
+
+    result = {
+        "shard_path": shard_path,
+        "manifest_tensors": {},
+        "compressed_chunks": {},
+        "total_raw": 0,
+        "total_compressed": 0,
+        "enc_counts": {},
+        "error": None,
+    }
+
+    try:
+        # Set module-level globals for this worker process
+        global _use_gpu_compress, _bfp_mantissa_override, _fast_load_override, _zstd_level_override
+        _use_gpu_compress = False  # Always CPU in parallel-shard mode
+        _bfp_mantissa_override = mantissa_bits
+        _fast_load_override = fast_load_enabled
+        _zstd_level_override = compression_level
+
+        tensors = load_file(shard_path)
+        keys = sorted(tensors.keys())
+
+        resolved_mode = mode
+        if resolved_mode == "auto":
+            resolved_mode = auto_detect_mode(tensors)
+
+        def _encode_one(key):
+            tensor = tensors[key]
+            encoding = detect_encoding(tensor, mode=resolved_mode, entropy="zstd")
+            is_fl = _fast_load_override and _is_fast_load_tensor(key)
+            if is_fl:
+                encoding = ENC_FP16_ZSTD
+            is_skip = skip_layers_patterns and any(pat in key for pat in skip_layers_patterns)
+            if is_skip:
+                encoding = ENC_TRANSPOSE_LOSSLESS
+            compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
+            if is_fl:
+                meta["fast_load"] = True
+            if is_skip:
+                meta["skip_layer"] = True
+            return key, encoding, compressed, meta
+
+        if parallel_workers_per_shard > 1:
+            with ThreadPoolExecutor(max_workers=parallel_workers_per_shard) as pool:
+                for key, encoding, compressed, meta in pool.map(_encode_one, keys):
+                    result["enc_counts"][encoding] = result["enc_counts"].get(encoding, 0) + 1
+                    result["manifest_tensors"][key] = meta
+                    result["compressed_chunks"][key] = compressed
+                    result["total_raw"] += meta["raw_size"]
+                    result["total_compressed"] += meta["compressed_size"]
+        else:
+            for key in keys:
+                key, encoding, compressed, meta = _encode_one(key)
+                result["enc_counts"][encoding] = result["enc_counts"].get(encoding, 0) + 1
+                result["manifest_tensors"][key] = meta
+                result["compressed_chunks"][key] = compressed
+                result["total_raw"] += meta["raw_size"]
+                result["total_compressed"] += meta["compressed_size"]
+
+        logger.info("Shard complete: %s (%d tensors)", os.path.basename(shard_path), len(keys))
+
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        logger.error("Shard failed: %s -- %s", shard_path, result["error"])
+
+    return result
+
+
+def _compress_shards_parallel(shard_paths, output_path, mode="auto",
+                              entropy_mode="auto", mantissa_bits=None,
+                              fast_load=False, skip_layers=None,
+                              compression_level=None, n_workers=None,
+                              parallel_workers_per_shard=1):
+    """Compress multiple safetensors shards in parallel using ProcessPoolExecutor.
+
+    Each shard is loaded and compressed in a separate process.  GPU BFP
+    encoding is disabled (CPU only) so that N shards can run concurrently
+    across CPU cores -- the right tradeoff for large multi-shard models on
+    machines with many vCPUs.
+
+    Parameters:
+        shard_paths: list[str] -- ordered list of .safetensors shard paths
+        output_path: str -- path for the combined .dmx output file
+        mode: str -- compression mode
+        entropy_mode: str -- resolved entropy mode
+        mantissa_bits: int|None -- BFP mantissa override
+        fast_load: bool -- --fast-load flag
+        skip_layers: str|None -- comma-separated skip-layer patterns
+        compression_level: int|None -- zstd level override
+        n_workers: int|None -- number of parallel shard workers
+            (default: min(8, cpu_count, len(shard_paths)))
+        parallel_workers_per_shard: int -- per-tensor thread parallelism
+            within each shard process
+
+    Returns:
+        (total_original_size, output_size) -- same signature as compress_file()
+    """
+    import multiprocessing as mp
+
+    n_shards = len(shard_paths)
+    if n_workers is None:
+        n_workers = min(8, mp.cpu_count() or 1, n_shards)
+    n_workers = max(1, min(n_workers, n_shards))
+
+    skip_layers_patterns = tuple(p.strip() for p in skip_layers.split(",")) if skip_layers else ()
+
+    logger.info("Parallel shard compression: %d shards, %d workers, %d threads/shard",
+                n_shards, n_workers, parallel_workers_per_shard)
+
+    start = time.time()
+
+    # Build argument tuples for each shard
+    work_items = [
+        (sp, mode, entropy_mode, mantissa_bits, fast_load,
+         skip_layers_patterns, compression_level, parallel_workers_per_shard)
+        for sp in shard_paths
+    ]
+
+    # Dispatch to process pool
+    shard_results = []
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for i, result in enumerate(pool.map(_compress_one_shard, work_items)):
+            shard_results.append(result)
+            if result["error"]:
+                logger.error("Shard %d/%d FAILED: %s", i + 1, n_shards, result["error"])
+            else:
+                logger.info("Shard %d/%d done: %s",
+                            i + 1, n_shards, os.path.basename(result["shard_path"]))
+
+    # Check for failures
+    failed = [r for r in shard_results if r["error"]]
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)}/{n_shards} shards failed during parallel compression. "
+            f"First error: {failed[0]['error']}"
+        )
+
+    # --- Merge results from all shards ---
+    all_manifest_tensors = {}
+    all_compressed_chunks = {}
+    total_raw = 0
+    total_compressed = 0
+    enc_counts = {}
+    total_original_size = 0
+
+    for result in shard_results:
+        total_original_size += os.path.getsize(result["shard_path"])
+        all_manifest_tensors.update(result["manifest_tensors"])
+        all_compressed_chunks.update(result["compressed_chunks"])
+        total_raw += result["total_raw"]
+        total_compressed += result["total_compressed"]
+        for enc, count in result["enc_counts"].items():
+            enc_counts[enc] = enc_counts.get(enc, 0) + count
+
+    all_keys = sorted(all_manifest_tensors.keys())
+
+    # --- Build manifest ---
+    manifest = {
+        "version": DMX_VERSION,
+        "mode": mode,
+        "entropy": entropy_mode,
+        "source_file": os.path.basename(shard_paths[0]),
+        "source_size": total_original_size,
+        "source_shards": [os.path.basename(sp) for sp in shard_paths],
+        "tensor_count": len(all_keys),
+        "tensors": all_manifest_tensors,
+    }
+    if skip_layers_patterns:
+        manifest["skip_layers"] = list(skip_layers_patterns)
+
+    # Embed HuggingFace config files for offline loading
+    source_dir = os.path.dirname(os.path.abspath(shard_paths[0]))
+    hf_configs = _collect_hf_configs(source_dir)
+    if hf_configs:
+        manifest["hf_config"] = hf_configs
+
+    # --- Provenance ---
+    content_hasher = hashlib.sha256()
+    for key in all_keys:
+        content_hasher.update(all_compressed_chunks[key])
+    content_hash = "sha256:" + content_hasher.hexdigest()
+
+    # Approximate param count from raw sizes in manifest metadata
+    total_param_count = sum(
+        meta.get("raw_size", 0) // 4
+        for meta in all_manifest_tensors.values()
+    )
+
+    provenance = build_provenance_manifest(
+        source_path=shard_paths[0],
+        source_format="safetensors",
+        param_count=total_param_count,
+    )
+    provenance["content_hash"] = content_hash
+    provenance["source_shards"] = [os.path.basename(sp) for sp in shard_paths]
+
+    provenance_json = json.dumps(provenance, separators=(",", ":")).encode("utf-8")
+    provenance_header_size = 4 + 4 + len(provenance_json)
+
+    # --- Calculate offsets and write file ---
+    manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    header_size = provenance_header_size + 4 + 4 + 4 + len(manifest_json)
+    offset = header_size
+    for key in all_keys:
+        manifest["tensors"][key]["offset"] = offset
+        offset += len(all_compressed_chunks[key])
+
+    # Re-serialize and stabilize offsets (manifest size may grow with offset digits)
+    manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    header_size_check = provenance_header_size + 4 + 4 + 4 + len(manifest_json)
+    if header_size_check != header_size:
+        header_size = header_size_check
+        offset = header_size
+        for key in all_keys:
+            manifest["tensors"][key]["offset"] = offset
+            offset += len(all_compressed_chunks[key])
+        manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    # One more stabilization pass
+    header_size2 = provenance_header_size + 4 + 4 + 4 + len(manifest_json)
+    if header_size2 != header_size:
+        header_size = header_size2
+        offset = header_size
+        for key in all_keys:
+            manifest["tensors"][key]["offset"] = offset
+            offset += len(all_compressed_chunks[key])
+        manifest_json = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    with open(output_path, "wb") as f:
+        f.write(DMX_MAGIC_PROVENANCE)
+        f.write(struct.pack("<I", len(provenance_json)))
+        f.write(provenance_json)
+        f.write(DMX_MAGIC)
+        f.write(struct.pack("<I", DMX_VERSION))
+        f.write(struct.pack("<I", len(manifest_json)))
+        f.write(manifest_json)
+        for key in all_keys:
+            f.write(all_compressed_chunks[key])
+
+    output_size = os.path.getsize(output_path)
+    elapsed = time.time() - start
+
+    enc_names = {
+        ENC_FP16_ZSTD: "FP16+zstd", ENC_INT16_QUANT: "INT16Q+zstd",
+        ENC_DELTA_ZSTD: "Delta+zstd", ENC_RAW_ZSTD: "Raw+zstd",
+        ENC_BFP_ZSTD: "BFP+zstd", ENC_INT32_QUANT: "INT32Q+zstd",
+        ENC_FP16_LPC: "FP16+lpc", ENC_INT16_QUANT_LPC: "INT16Q+lpc",
+        ENC_DELTA_LPC: "Delta+lpc", ENC_RAW_LPC: "Raw+lpc",
+        ENC_BFP_LPC: "BFP+lpc", ENC_INT32_QUANT_LPC: "INT32Q+lpc",
+        ENC_TRANSPOSE_LOSSLESS: "Transpose+zstd",
+    }
+
+    logger.info("=== Multi-shard compression complete ===")
+    logger.info("Shards: %d, Workers: %d", n_shards, n_workers)
+    logger.info("Encoding breakdown:")
+    for enc, count in enc_counts.items():
+        if count > 0:
+            logger.info("    %s: %d tensors", enc_names.get(enc, f"enc_{enc}"), count)
+    logger.info("Total input: %.1f MB (%d shards)", total_original_size / 1024 / 1024, n_shards)
+    logger.info("Output size: %.1f MB", output_size / 1024 / 1024)
+    ratio = output_size / total_original_size * 100
+    savings = (1 - output_size / total_original_size) * 100
+    logger.info("Compression: %.1f%% of source, %+.1f%% savings", ratio, savings)
+    logger.info("Time: %.1fs (%.1f MB/s input throughput)",
+                elapsed, total_original_size / 1024 / 1024 / max(elapsed, 0.001))
+
+    return total_original_size, output_size
+
+
 def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=None,
-                  parallel_workers=None, mantissa_bits=None, fast_load=False,
-                  skip_layers=None):
-    """Compress a safetensors file to .dmx format.
+                  parallel_workers=None, parallel_shards=None, mantissa_bits=None,
+                  fast_load=False, skip_layers=None, compression_level=None):
+    """Compress safetensors file(s) to a single .dmx file.
+
+    Supports three input forms:
+    - Single file: ``model.safetensors`` (original behaviour)
+    - Multi-shard file: ``model-00001-of-00037.safetensors`` (auto-detects siblings)
+    - Directory: ``/path/to/model_dir/`` (finds all .safetensors inside)
+
+    For multi-shard models, shards are loaded and compressed one at a time to
+    limit peak memory usage. All tensors are written into one .dmx output file.
 
     mode: 'auto', 'bfp', 'int16', 'int32', or 'transpose'
     entropy: 'auto' (default) | 'zstd-19' | 'zstd' | 'flac' | 'lpc' | 'brotli-11' | 'brotli'
@@ -1865,6 +2330,57 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         bfp_compress_gpu at function-definition time; the runtime override
         mechanism here is the supported way to change mantissa width per call.
     """
+    # --- Multi-shard dispatch ---
+    # If input resolves to multiple shards and parallel_shards != 0,
+    # dispatch to the parallel shard compressor instead of single-file path.
+    shard_paths = _resolve_shard_paths(input_path)
+    if len(shard_paths) > 1:
+        import multiprocessing as mp
+        if parallel_shards is None:
+            _n_shard_workers = min(8, mp.cpu_count() or 1, len(shard_paths))
+        elif parallel_shards == 0:
+            _n_shard_workers = None  # Will fall through to sequential below
+        else:
+            _n_shard_workers = parallel_shards
+
+        if _n_shard_workers is not None and _n_shard_workers > 0:
+            # Resolve entropy mode for the parallel path (same logic as below)
+            if entropy in (None, "auto"):
+                _ent = "auto"
+            elif entropy in ("flac", "lpc"):
+                _ent = "flac" if _lpc_backend_available() else "zstd-19"
+            elif entropy in ("brotli-11", "brotli"):
+                _ent = "brotli-11" if BROTLI_AVAILABLE else "zstd-19"
+            elif entropy in ("zstd-19", "zstd"):
+                _ent = "zstd-19"
+            else:
+                raise ValueError(f"Unknown entropy value {entropy!r}")
+
+            # In parallel-shard mode, per-shard thread workers default to 1
+            # (each process compresses one shard serially; parallelism is
+            # across shards, not within them).
+            _pw = parallel_workers if parallel_workers is not None else 1
+
+            logger.info("Multi-shard input detected: %d shards", len(shard_paths))
+            return _compress_shards_parallel(
+                shard_paths=shard_paths,
+                output_path=output_path,
+                mode=mode,
+                entropy_mode=_ent,
+                mantissa_bits=mantissa_bits,
+                fast_load=fast_load,
+                skip_layers=skip_layers,
+                compression_level=compression_level,
+                n_workers=_n_shard_workers,
+                parallel_workers_per_shard=_pw,
+            )
+        # else: parallel_shards=0 means sequential -- fall through to single-file path
+        # For sequential multi-shard, we currently only support the first shard
+        # (full sequential multi-shard merging would need its own path)
+        logger.info("Multi-shard input (%d shards) with parallel_shards=0: "
+                     "compressing first shard only", len(shard_paths))
+        input_path = shard_paths[0]
+
     global _use_gpu_compress, _bfp_mantissa_override, _fast_load_override
     # Auto-detect GPU: use CUDA if available unless explicitly disabled
     if use_gpu is None:
@@ -1872,10 +2388,10 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     if use_gpu:
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0)
-            print(f"  GPU accelerated compression: {gpu_name}")
+            logger.info("GPU accelerated compression: %s", gpu_name)
             _use_gpu_compress = True
         else:
-            print("  WARNING: --gpu requested but CUDA not available. Falling back to CPU.")
+            logger.warning("--gpu requested but CUDA not available. Falling back to CPU.")
             _use_gpu_compress = False
     else:
         _use_gpu_compress = False
@@ -1896,23 +2412,34 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
                 f"M>=8 would overflow the uint8 packing format."
             )
         _bfp_mantissa_override = mantissa_bits
-        print(f"  Mantissa bits override: M={mantissa_bits} "
-              f"(default is {BFP_MANTISSA_BITS})")
+        logger.info("Mantissa bits override: M=%d (default is %d)", mantissa_bits, BFP_MANTISSA_BITS)
 
     # Resolve fast_load override. When True, tensors matching FAST_LOAD_PATTERNS
     # are stored as FP16+entropy instead of BFP, enabling instant loading for
     # compressed residency (no materialize step needed).
     _fast_load_override = bool(fast_load)
     if _fast_load_override:
-        print(f"  Fast-load mode: embed/head tensors stored as FP16 (patterns: {FAST_LOAD_PATTERNS})")
+        logger.info("Fast-load mode: embed/head tensors stored as FP16 (patterns: %s)", FAST_LOAD_PATTERNS)
 
     # Resolve skip_layers. Comma-separated patterns — matching tensors are stored
     # as lossless (ENC_TRANSPOSE_LOSSLESS) instead of BFP. Recorded in manifest.
     _skip_layers_patterns = tuple(p.strip() for p in skip_layers.split(",")) if skip_layers else ()
     if _skip_layers_patterns:
-        print(f"  Skip-layers: {len(_skip_layers_patterns)} patterns — matching tensors stored losslessly")
+        logger.info("Skip-layers: %d patterns — matching tensors stored losslessly", len(_skip_layers_patterns))
         for p in _skip_layers_patterns:
-            print(f"    - {p}")
+            logger.info("    - %s", p)
+
+    # Resolve compression level. Controls zstd speed/ratio tradeoff.
+    # Default 19 (max compression). --fast sets 3 (30x faster, ~2% larger).
+    global _zstd_level_override
+    _prior_zstd_level = _zstd_level_override
+    if compression_level is not None:
+        if not isinstance(compression_level, int) or compression_level < 1 or compression_level > 22:
+            raise ValueError(f"compression_level must be 1-22; got {compression_level}")
+        _zstd_level_override = compression_level
+        logger.info("Compression level: zstd-%d (default is %d)", compression_level, ZSTD_LEVEL)
+    else:
+        _zstd_level_override = None
 
     # Resolve entropy mode. Normalize legacy aliases to the canonical names
     # used by the selector and dispatch helpers.
@@ -1922,13 +2449,13 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         if _lpc_backend_available():
             entropy_mode = "flac"
         else:
-            print("  WARNING: --entropy flac requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd-19.")
+            logger.warning("--entropy flac requires soundfile (pip install soundfile) or ffmpeg. Falling back to zstd-19.")
             entropy_mode = "zstd-19"
     elif entropy in ("brotli-11", "brotli"):
         if BROTLI_AVAILABLE:
             entropy_mode = "brotli-11"
         else:
-            print("  WARNING: --entropy brotli-11 requires brotli (pip install brotli). Falling back to zstd-19.")
+            logger.warning("--entropy brotli-11 requires brotli (pip install brotli). Falling back to zstd-19.")
             entropy_mode = "zstd-19"
     elif entropy in ("zstd-19", "zstd"):
         entropy_mode = "zstd-19"
@@ -1938,41 +2465,66 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
             f"Use 'auto', 'zstd-19', 'flac', or 'brotli-11'."
         )
 
-    print(f"Loading {input_path}...")
+    # --- Resolve input to one or more shard paths ---
+    shard_paths = _resolve_shard_paths(input_path)
+    multi_shard = len(shard_paths) > 1
+    if multi_shard:
+        logger.info("Multi-shard model detected: %d shards", len(shard_paths))
+        for sp in shard_paths:
+            logger.info("    %s", os.path.basename(sp))
+
     start = time.time()
-    tensors = load_file(input_path)
-    load_time = time.time() - start
-    print(f"  Loaded {len(tensors)} tensors in {load_time:.1f}s")
 
-    original_size = os.path.getsize(input_path)
-    print(f"  Original size: {original_size / 1024 / 1024:.1f} MB")
+    # Compute total original size across all shards
+    original_size = sum(os.path.getsize(sp) for sp in shard_paths)
+    logger.info("Original size: %.1f MB (%d shard%s)",
+                original_size / 1024 / 1024, len(shard_paths),
+                "s" if multi_shard else "")
 
-    # Resolve auto mode
+    # Auto-detect mode from first shard (dtype distribution is consistent across shards)
     if mode == "auto":
-        mode = auto_detect_mode(tensors)
-        print(f"  Auto-detected mode: {mode}")
+        logger.info("Loading first shard for mode detection...")
+        first_tensors = load_file(shard_paths[0])
+        mode = auto_detect_mode(first_tensors)
+        del first_tensors  # free memory
+        logger.info("Auto-detected mode: %s", mode)
     else:
-        print(f"  Mode: {mode}")
+        logger.info("Mode: %s", mode)
 
-    print(f"  Entropy coding: {entropy_mode}")
+    logger.info("Entropy coding: %s", entropy_mode)
 
     # Build manifest and compressed chunks
+    # For multi-shard: source_file lists all shard basenames
+    if multi_shard:
+        source_file_entry = [os.path.basename(sp) for sp in shard_paths]
+    else:
+        source_file_entry = os.path.basename(shard_paths[0])
+
     manifest = {
         "version": DMX_VERSION,
         "mode": mode,
         "entropy": entropy_mode,
-        "source_file": os.path.basename(input_path),
+        "source_file": source_file_entry,
         "source_size": original_size,
-        "tensor_count": len(tensors),
+        "tensor_count": 0,  # updated after processing all shards
         "tensors": {},
     }
+    if multi_shard:
+        manifest["shard_count"] = len(shard_paths)
     # Record skip_layers intent in manifest (Option D: loader visibility)
     if _skip_layers_patterns:
         manifest["skip_layers"] = list(_skip_layers_patterns)
 
+    # Embed HuggingFace config files for offline loading
+    source_dir = os.path.dirname(os.path.abspath(shard_paths[0]))
+    hf_configs = _collect_hf_configs(source_dir)
+    if hf_configs:
+        manifest["hf_config"] = hf_configs
+
     compressed_chunks = {}
     total_raw = 0
     total_compressed = 0
+    total_param_count = 0
     enc_counts = {}
     enc_names = {
         ENC_FP16_ZSTD: "FP16+zstd", ENC_INT16_QUANT: "INT16Q+zstd",
@@ -1983,8 +2535,7 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         ENC_BFP_LPC: "BFP+lpc", ENC_INT32_QUANT_LPC: "INT32Q+lpc",
         ENC_TRANSPOSE_LOSSLESS: "Transpose+zstd",
     }
-
-    keys = sorted(tensors.keys())
+    all_keys = []  # ordered list of all tensor keys across shards
 
     # Resolve parallel worker count.
     # GPU mode forces serial because the CUDA context is single-threaded and
@@ -1992,70 +2543,99 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     if parallel_workers is None:
         parallel_workers = 1 if _use_gpu_compress else min(8, os.cpu_count() or 1)
     elif _use_gpu_compress and parallel_workers > 1:
-        print(f"  WARNING: parallel_workers={parallel_workers} ignored in GPU mode (forcing 1)")
+        logger.warning("parallel_workers=%d ignored in GPU mode (forcing 1)", parallel_workers)
         parallel_workers = 1
 
-    if parallel_workers > 1:
-        print(f"  Parallel encoding: {parallel_workers} workers")
+    # --- Process each shard ---
+    global_tensor_idx = 0  # running counter across all shards for progress logging
+    total_tensor_count_est = 0  # will be updated shard-by-shard
 
-        def _encode_one(key):
-            tensor = tensors[key]
-            # detect_encoding always returns the data-shape (*_ZSTD form);
-            # the entropy coder is decided per tensor inside encode_tensor
-            # via entropy_mode, and recorded in meta["entropy_codec"].
-            encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
-            # --fast-load override: store embed/head tensors as FP16+entropy
-            is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
-            if is_fast_load:
-                encoding = ENC_FP16_ZSTD
-            # --skip-layers override: store matching tensors as lossless transpose
-            is_skip_layer = _skip_layers_patterns and any(pat in key for pat in _skip_layers_patterns)
-            if is_skip_layer:
-                encoding = ENC_TRANSPOSE_LOSSLESS
-            compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
-            if is_fast_load:
-                meta["fast_load"] = True
-            if is_skip_layer:
-                meta["skip_layer"] = True
-            return key, encoding, compressed, meta
+    for shard_idx, shard_path in enumerate(shard_paths):
+        shard_label = os.path.basename(shard_path)
+        logger.info("Loading shard %d/%d: %s...", shard_idx + 1, len(shard_paths), shard_label)
 
-        with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
-            # map preserves submission order, so manifest stays deterministic
-            for i, (key, encoding, compressed, meta) in enumerate(pool.map(_encode_one, keys)):
+        shard_start = time.time()
+        tensors = load_file(shard_path)
+        shard_load_time = time.time() - shard_start
+        logger.info("Loaded %d tensors from %s in %.1fs",
+                     len(tensors), shard_label, shard_load_time)
+
+        # Accumulate param count from this shard
+        total_param_count += sum(
+            t.numel() for t in tensors.values() if hasattr(t, "numel")
+        )
+
+        keys = sorted(tensors.keys())
+        all_keys.extend(keys)
+        total_tensor_count_est += len(keys)
+
+        # Compress tensors from this shard
+        if parallel_workers > 1:
+            if shard_idx == 0:
+                logger.info("Parallel encoding: %d workers", parallel_workers)
+
+            def _encode_one(key, _tensors=tensors):
+                tensor = _tensors[key]
+                encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
+                is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
+                if is_fast_load:
+                    encoding = ENC_FP16_ZSTD
+                is_skip_layer = _skip_layers_patterns and any(pat in key for pat in _skip_layers_patterns)
+                if is_skip_layer:
+                    encoding = ENC_TRANSPOSE_LOSSLESS
+                compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
+                if is_fast_load:
+                    meta["fast_load"] = True
+                if is_skip_layer:
+                    meta["skip_layer"] = True
+                return key, encoding, compressed, meta
+
+            with ThreadPoolExecutor(max_workers=parallel_workers) as pool:
+                for i, (key, encoding, compressed, meta) in enumerate(pool.map(_encode_one, keys)):
+                    enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
+                    manifest["tensors"][key] = meta
+                    compressed_chunks[key] = compressed
+                    total_raw += meta["raw_size"]
+                    total_compressed += meta["compressed_size"]
+                    global_tensor_idx += 1
+                    if (i + 1) % 100 == 0 or (i + 1) == len(keys):
+                        logger.info("Compressed %d/%d tensors (shard %d/%d)...",
+                                    i + 1, len(keys), shard_idx + 1, len(shard_paths))
+        else:
+            for i, key in enumerate(keys):
+                tensor = tensors[key]
+                encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
+                is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
+                if is_fast_load:
+                    encoding = ENC_FP16_ZSTD
+                is_skip_layer = _skip_layers_patterns and any(pat in key for pat in _skip_layers_patterns)
+                if is_skip_layer:
+                    encoding = ENC_TRANSPOSE_LOSSLESS
                 enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
+
+                compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
+                if is_fast_load:
+                    meta["fast_load"] = True
+                if is_skip_layer:
+                    meta["skip_layer"] = True
                 manifest["tensors"][key] = meta
                 compressed_chunks[key] = compressed
+
                 total_raw += meta["raw_size"]
                 total_compressed += meta["compressed_size"]
+                global_tensor_idx += 1
+
                 if (i + 1) % 100 == 0 or (i + 1) == len(keys):
-                    print(f"  Compressed {i+1}/{len(keys)} tensors...")
-    else:
-        for i, key in enumerate(keys):
-            tensor = tensors[key]
-            encoding = detect_encoding(tensor, mode=mode, entropy="zstd")
-            # --fast-load override: store embed/head tensors as FP16+entropy
-            is_fast_load = _fast_load_override and _is_fast_load_tensor(key)
-            if is_fast_load:
-                encoding = ENC_FP16_ZSTD
-            # --skip-layers override: store matching tensors as lossless transpose
-            is_skip_layer = _skip_layers_patterns and any(pat in key for pat in _skip_layers_patterns)
-            if is_skip_layer:
-                encoding = ENC_TRANSPOSE_LOSSLESS
-            enc_counts[encoding] = enc_counts.get(encoding, 0) + 1
+                    logger.info("Compressed %d/%d tensors (shard %d/%d)...",
+                                i + 1, len(keys), shard_idx + 1, len(shard_paths))
 
-            compressed, meta = encode_tensor(tensor, encoding, entropy_mode=entropy_mode)
-            if is_fast_load:
-                meta["fast_load"] = True
-            if is_skip_layer:
-                meta["skip_layer"] = True
-            manifest["tensors"][key] = meta
-            compressed_chunks[key] = compressed
+        # Free raw tensors from this shard before loading the next one.
+        # Only the compressed chunks (much smaller) are retained.
+        del tensors
 
-            total_raw += meta["raw_size"]
-            total_compressed += meta["compressed_size"]
-
-            if (i + 1) % 100 == 0 or (i + 1) == len(keys):
-                print(f"  Compressed {i+1}/{len(keys)} tensors...")
+    # Update final tensor count in manifest
+    manifest["tensor_count"] = len(all_keys)
+    keys = all_keys  # use the accumulated ordered list for writing
 
     # --- Build provenance manifest ---
     # Compute content_hash over the compressed weight data
@@ -2064,19 +2644,21 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
         content_hasher.update(compressed_chunks[key])
     content_hash = "sha256:" + content_hasher.hexdigest()
 
-    # Compute total param count
-    total_param_count = sum(t.numel() for t in tensors.values() if hasattr(t, "numel"))
-
     # Detect source format from extension
-    src_ext = os.path.splitext(input_path)[1].lower()
+    src_ext = os.path.splitext(shard_paths[0])[1].lower()
     source_format = "safetensors" if src_ext == ".safetensors" else src_ext.lstrip(".")
 
+    # For multi-shard provenance, hash the first shard (representative source).
+    # The manifest already records all shard names in source_file.
     provenance = build_provenance_manifest(
-        source_path=input_path,
+        source_path=shard_paths[0],
         source_format=source_format,
         param_count=total_param_count,
     )
     provenance["content_hash"] = content_hash
+    if multi_shard:
+        provenance["shard_count"] = len(shard_paths)
+        provenance["source_shards"] = [os.path.basename(sp) for sp in shard_paths]
 
     provenance_json = json.dumps(provenance, separators=(",", ":")).encode("utf-8")
     # Provenance header: [DMX\x00 4B][manifest_len 4B][manifest JSON]
@@ -2136,42 +2718,38 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     ratio = output_size / original_size * 100
 
     # Compute FP32-equivalent baseline for dual-denominator reporting.
-    # total_params is the sum over all tensors. For float tensors, this is the
-    # dtype-independent canonical baseline. Skip if no tensors loaded.
-    try:
-        total_params = sum(
-            t.numel() for t in tensors.values()
-            if hasattr(t, "numel")
-        )
-    except Exception:
-        total_params = 0
-    fp32_equivalent = total_params * 4 if total_params > 0 else 0
+    fp32_equivalent = total_param_count * 4 if total_param_count > 0 else 0
 
-    print(f"  Encoding breakdown:")
+    logger.info("Encoding breakdown:")
     for enc, count in enc_counts.items():
         if count > 0:
-            print(f"    {enc_names[enc]}: {count} tensors")
-    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB")
+            logger.info("    %s: %d tensors", enc_names[enc], count)
+    logger.info("Output size: %.1f MB", output_size / 1024 / 1024)
+    if multi_shard:
+        logger.info("    %d shards consolidated into 1 .dmx file, %d total tensors",
+                     len(shard_paths), len(keys))
     # Dual-denominator reporting: the same compressed bytes can produce wildly
     # different "savings %" depending on whether the baseline is the source
     # file (dtype-dependent) or the FP32 equivalent (canonical). Report both
     # so log parsers and users see both numbers side-by-side.
     savings_vs_source_pct = (1 - output_size / original_size) * 100
-    print(f"    vs source file ({original_size / 1024 / 1024:.1f} MB): "
-          f"{ratio:.1f}% of source, {savings_vs_source_pct:+.1f}% savings")
+    logger.info("    vs source file (%.1f MB): %.1f%% of source, %+.1f%% savings",
+                original_size / 1024 / 1024, ratio, savings_vs_source_pct)
     if fp32_equivalent > 0:
         savings_vs_fp32_pct = (1 - output_size / fp32_equivalent) * 100
         fp32_ratio_pct = output_size / fp32_equivalent * 100
-        print(f"    vs FP32 equivalent ({fp32_equivalent / 1024 / 1024:.1f} MB, "
-              f"{total_params:,} params × 4 bytes): "
-              f"{fp32_ratio_pct:.1f}% of FP32, {savings_vs_fp32_pct:+.1f}% savings")
-    print(f"  Savings: {(original_size - output_size) / 1024 / 1024:.1f} MB")
-    print(f"  Time: {elapsed:.1f}s")
+        logger.info("    vs FP32 equivalent (%.1f MB, %s params x 4 bytes): "
+                    "%.1f%% of FP32, %+.1f%% savings",
+                    fp32_equivalent / 1024 / 1024, f"{total_param_count:,}",
+                    fp32_ratio_pct, savings_vs_fp32_pct)
+    logger.info("Savings: %.1f MB", (original_size - output_size) / 1024 / 1024)
+    logger.info("Time: %.1fs", elapsed)
 
     # Restore the mantissa-bits and fast-load overrides so they don't leak to
     # subsequent calls. Done unconditionally to keep the module-level state clean.
     _bfp_mantissa_override = _prior_mantissa_override
     _fast_load_override = False
+    _zstd_level_override = _prior_zstd_level
 
     return original_size, output_size
 
@@ -2187,15 +2765,15 @@ def decompress_file(input_path, output_path, use_gpu=None):
         use_gpu = torch.cuda.is_available()
     if use_gpu:
         if not torch.cuda.is_available():
-            print("  WARNING: --gpu requested but CUDA not available. Falling back to CPU.")
+            logger.warning("--gpu requested but CUDA not available. Falling back to CPU.")
             use_gpu = False
         else:
             gpu_name = torch.cuda.get_device_name(0)
-            print(f"  GPU accelerated mode: {gpu_name}")
+            logger.info("GPU accelerated mode: %s", gpu_name)
 
     decode_fn = decode_tensor_gpu if use_gpu else decode_tensor
 
-    print(f"Loading {input_path}...")
+    logger.info("Loading %s...", input_path)
     start = time.time()
 
     with open(input_path, "rb") as f:
@@ -2228,18 +2806,18 @@ def decompress_file(input_path, output_path, use_gpu=None):
             tensors[key] = decode_fn(compressed, meta)
 
             if (i + 1) % 500 == 0 or (i + 1) == len(keys):
-                print(f"  Decompressed {i+1}/{len(keys)} tensors...")
+                logger.info("Decompressed %d/%d tensors...", i + 1, len(keys))
 
     if use_gpu:
         torch.cuda.synchronize()
 
-    print(f"  Saving to {output_path}...")
+    logger.info("Saving to %s...", output_path)
     save_file(tensors, output_path)
 
     elapsed = time.time() - start
     output_size = os.path.getsize(output_path)
-    print(f"  Output size: {output_size / 1024 / 1024:.1f} MB")
-    print(f"  Time: {elapsed:.1f}s")
+    logger.info("Output size: %.1f MB", output_size / 1024 / 1024)
+    logger.info("Time: %.1fs", elapsed)
 
     return output_size
 
@@ -2302,7 +2880,7 @@ def _decode_dmx_to_tensors(input_path, use_gpu=None):
             compressed = f.read(meta["compressed_size"])
             tensors[key] = decode_fn(compressed, meta)
             if (i + 1) % 500 == 0 or (i + 1) == len(keys):
-                print(f"  Decompressed {i+1}/{len(keys)} tensors...")
+                logger.info("Decompressed %d/%d tensors...", i + 1, len(keys))
 
     decompress_time = time.time() - start
     return tensors, manifest, decompress_time
@@ -2414,6 +2992,98 @@ def _decode_bfp_streams_only(compressed_bytes, meta):
     return exp_stream, sign_mant_stream
 
 
+class LazyPayloadDict:
+    """Dict-like that reads and decodes tensors on demand from a .dmx file.
+
+    Drop-in replacement for the dict returned by _decode_dmx_to_bfp_payloads.
+    Peak host RAM drops from O(all tensors) to O(one tensor at a time).
+    """
+
+    def __init__(self, path, manifest, use_gpu=None):
+        self._path = path
+        self._tensor_meta = manifest["tensors"]
+        self._use_gpu = use_gpu if use_gpu is not None else torch.cuda.is_available()
+        self._decode_fn = decode_tensor_gpu if (self._use_gpu and torch.cuda.is_available()) else decode_tensor
+        self._deleted = set()
+
+    def __contains__(self, key):
+        return key in self._tensor_meta and key not in self._deleted
+
+    def __getitem__(self, key):
+        if key not in self._tensor_meta or key in self._deleted:
+            raise KeyError(key)
+        meta = self._tensor_meta[key]
+        with open(self._path, "rb") as f:
+            f.seek(meta["offset"])
+            compressed = f.read(meta["compressed_size"])
+
+        base_enc = _base_encoding(meta["encoding"])
+        if base_enc == ENC_BFP_ZSTD:
+            exp_np, mant_np = _decode_bfp_streams_only(compressed, meta)
+            exponents = torch.from_numpy(exp_np)
+            packed_mantissa = torch.from_numpy(mant_np)
+            original_dtype_str = meta.get("original_dtype", meta["dtype"])
+            dt = _DTYPE_STR_TO_TORCH.get(original_dtype_str, torch.float16)
+            return BFPPayload(
+                exponents=exponents,
+                packed_mantissa=packed_mantissa,
+                shape=tuple(meta["shape"]),
+                dtype=dt,
+                group_size=meta.get("bfp_group_size", BFP_GROUP_SIZE),
+                mantissa_bits=meta.get("bfp_mantissa_bits", BFP_MANTISSA_BITS),
+                pad_len=meta["bfp_pad_len"],
+                orig_len=meta["bfp_orig_len"],
+                scale=None,
+            )
+        else:
+            return self._decode_fn(compressed, meta)
+
+    def __delitem__(self, key):
+        self._deleted.add(key)
+
+    def keys(self):
+        return [k for k in self._tensor_meta if k not in self._deleted]
+
+    def __len__(self):
+        return len(self._tensor_meta) - len(self._deleted)
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def _lazy_bfp_payloads(path, use_gpu=None):
+    """Like _decode_dmx_to_bfp_payloads but returns a LazyPayloadDict.
+
+    Reads only the manifest upfront. Each tensor is decoded on first access.
+    Peak host RAM: ~100 MB (one tensor) instead of ~68 GB (all tensors for 72B).
+
+    Returns
+    -------
+    (lazy_dict, manifest, 0.0)
+        Same 3-tuple shape as _decode_dmx_to_bfp_payloads for API compat.
+    """
+    with open(path, "rb") as f:
+        _read_provenance_header(f)
+        magic = f.read(4)
+        if magic != DMX_MAGIC:
+            raise ValueError(f"Not a DMX file (magic: {magic})")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version > DMX_VERSION:
+            raise ValueError(f"Unsupported DMX version: {version}")
+        manifest_size = struct.unpack("<I", f.read(4))[0]
+        manifest = json.loads(f.read(manifest_size))
+
+    lazy = LazyPayloadDict(path, manifest, use_gpu=use_gpu)
+    logger.info("Lazy payload dict: %d tensors (read on demand)", len(lazy))
+    return lazy, manifest, 0.0
+
+
 def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
     """Partial-decode variant of _decode_dmx_to_tensors.
 
@@ -2498,7 +3168,7 @@ def _decode_dmx_to_bfp_payloads(path, use_gpu=None):
                 payloads[key] = decode_fn(compressed, meta)
 
             if (i + 1) % 500 == 0 or (i + 1) == len(keys):
-                print(f"  Partial-decoded {i+1}/{len(keys)} tensors...")
+                logger.info("Partial-decoded %d/%d tensors...", i + 1, len(keys))
 
     elapsed = time.time() - start
     return payloads, manifest, elapsed
@@ -2902,6 +3572,28 @@ def info_file(input_path):
     print(f"  Encoding breakdown:")
     for enc, count in sorted(enc_counts.items()):
         print(f"    {enc_names.get(enc, f'Unknown({enc})')}: {count} tensors")
+
+    # Embedded HF config
+    hf_config = manifest.get("hf_config")
+    if hf_config:
+        embedded_files = sorted(hf_config.keys())
+        total_kb = 0
+        for fname in embedded_files:
+            content = hf_config[fname]
+            if isinstance(content, dict) and content.get("_binary"):
+                import base64
+                total_kb += len(base64.b64decode(content["data"])) / 1024
+            else:
+                total_kb += len(json.dumps(content)) / 1024
+        print(f"  Embedded HF config: {len(embedded_files)} files ({total_kb:.1f} KB)")
+        for fname in embedded_files:
+            print(f"    {fname}")
+        if "config.json" in hf_config:
+            cfg = hf_config["config.json"]
+            arch = cfg.get("architectures", [None])[0] or cfg.get("model_type", "unknown")
+            print(f"    Model architecture: {arch}")
+    else:
+        print(f"  Embedded HF config: none (model_id required for loading)")
 
     # Show a few sample tensors
     keys = sorted(manifest["tensors"].keys())
@@ -4716,7 +5408,9 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     p_compress = sub.add_parser("compress", help="Compress safetensors to .dmx")
-    p_compress.add_argument("input", help="Input .safetensors file")
+    p_compress.add_argument("input", help="Input .safetensors file, multi-shard file "
+                            "(e.g. model-00001-of-00037.safetensors — siblings auto-detected), "
+                            "or directory containing .safetensors shards")
     p_compress.add_argument("output", help="Output .dmx file")
     p_compress.add_argument("--mode", choices=["auto", "bfp", "int16", "int32", "transpose"], default="auto",
                             help="Compression mode: auto (default: lossless transpose), "
@@ -4731,8 +5425,22 @@ def main():
                                  "Pinned values force a single coder for every tensor. Legacy "
                                  "aliases accepted: 'zstd' -> 'zstd-19', 'lpc' -> 'flac', "
                                  "'brotli' -> 'brotli-11'.")
+    p_compress.add_argument("--compression-level", type=int, default=None,
+                            help="zstd compression level 1-22 (default: 19 = max compression). "
+                                 "Lower levels are faster with slightly larger output. "
+                                 "Level 3 is ~30x faster than 19 with ~2%% larger files.")
+    p_compress.add_argument("--fast", action="store_true",
+                            help="Fast compression mode. Shorthand for --compression-level 3. "
+                                 "~30x faster than default, ~2%% larger files. "
+                                 "Decompress speed is identical regardless of level.")
     p_compress.add_argument("--gpu", action="store_true",
                             help="Use GPU-accelerated compression (CUDA required)")
+    p_compress.add_argument("--parallel-shards", type=int, default=None,
+                            help="Number of parallel shard workers for multi-shard models "
+                                 "(default: auto = min(8, cpu_count)). Each shard is "
+                                 "compressed in a separate process on CPU. Set to 0 to "
+                                 "disable parallel shard compression. GPU BFP encoding is "
+                                 "not used in parallel mode (CPU enables N-way parallelism).")
     p_compress.add_argument("--parallel-workers", type=int, default=None,
                             help="Number of threads for per-tensor encoding (default: auto, "
                                  "uses min(8, cpu_count) on CPU and 1 on GPU)")
@@ -4891,12 +5599,18 @@ def main():
     args = parser.parse_args()
 
     if args.command == "compress":
+        # Resolve --fast shorthand to --compression-level 3
+        _comp_level = args.compression_level
+        if getattr(args, 'fast', False) and _comp_level is None:
+            _comp_level = ZSTD_LEVEL_FAST
         compress_file(args.input, args.output, mode=args.mode, entropy=args.entropy,
                       use_gpu=args.gpu if args.gpu else None,
                       parallel_workers=args.parallel_workers,
+                      parallel_shards=args.parallel_shards,
                       mantissa_bits=args.mantissa_bits,
                       fast_load=args.fast_load,
-                      skip_layers=args.skip_layers)
+                      skip_layers=args.skip_layers,
+                      compression_level=_comp_level)
         if args.report:
             print()
             print("=== Auto-verify after compression ===")

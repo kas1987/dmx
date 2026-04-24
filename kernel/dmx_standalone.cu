@@ -68,6 +68,58 @@ __global__ void bfp_decompress_kernel(
 
 
 // ============================================================
+// BFP Decompress Kernel — BFloat16 output
+// ============================================================
+
+__global__ void bfp_decompress_kernel_bf16(
+    const uint8_t* __restrict__ exponents,
+    const uint8_t* __restrict__ mantissas,
+    uint16_t* __restrict__ bf16_output,
+    int num_elements,
+    int group_size,
+    int mantissa_bits)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_elements) return;
+
+    int group_id = i / group_size;
+    int shared_exp = (int)exponents[group_id];
+
+    uint8_t mant_byte = mantissas[i];
+    uint8_t mant_mask = (1 << mantissa_bits) - 1;
+    uint8_t sign = (mant_byte >> mantissa_bits) & 1;
+    uint16_t truncated = (uint16_t)(mant_byte & mant_mask);
+
+    // Zero case: truncated == 0 → output ±0
+    if (truncated == 0) {
+        bf16_output[i] = ((uint16_t)sign << 15);
+        return;
+    }
+
+    // BF16: implicit 1 + 7 mantissa bits = 8 total mantissa bits
+    int total_mant_bits = 8;
+    int shift_amount = total_mant_bits - mantissa_bits;
+    uint32_t recon = (uint32_t)truncated << shift_amount;
+
+    // Leading-one scan: find highest set bit
+    int top_bit = total_mant_bits - 1;  // = 7
+    int bit_pos = 31 - __clz(recon);
+    int offset = top_bit - bit_pos;
+    int actual_exp = shared_exp - offset;
+
+    // Shift up to align leading 1 to bit 7, then mask to get 7-bit mantissa
+    uint16_t mant_7 = (uint16_t)(((recon << offset) & 0x7Fu));
+
+    // Clamp exponent to BF16's 8-bit range [0, 255]
+    if (actual_exp < 0) actual_exp = 0;
+    if (actual_exp > 255) actual_exp = 255;
+
+    uint16_t bits = ((uint16_t)sign << 15) | ((uint16_t)actual_exp << 7) | mant_7;
+    bf16_output[i] = bits;
+}
+
+
+// ============================================================
 // C API (callable via ctypes)
 // ============================================================
 
@@ -102,6 +154,38 @@ DMX_API int dmx_bfp_decompress(
     cudaStream_t cuda_stream = (cudaStream_t)stream;
 
     bfp_decompress_kernel<<<blocks, threads, 0, cuda_stream>>>(
+        (const uint8_t*)d_exponents,
+        (const uint8_t*)d_mantissas,
+        (uint16_t*)d_output,
+        num_elements, group_size, mantissa_bits);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return (int)err;
+
+    return 0;
+}
+
+/**
+ * Decompress BFP data on GPU to bfloat16.
+ *
+ * All pointers must be device (GPU) memory.
+ * Same interface as dmx_bfp_decompress but outputs BF16 bit layout.
+ */
+DMX_API int dmx_bfp_decompress_bf16(
+    const void* d_exponents,
+    const void* d_mantissas,
+    void* d_output,
+    int num_elements,
+    int group_size,
+    int mantissa_bits,
+    void* stream)
+{
+    int threads = 256;
+    int blocks = (num_elements + threads - 1) / threads;
+
+    cudaStream_t cuda_stream = (cudaStream_t)stream;
+
+    bfp_decompress_kernel_bf16<<<blocks, threads, 0, cuda_stream>>>(
         (const uint8_t*)d_exponents,
         (const uint8_t*)d_mantissas,
         (uint16_t*)d_output,
