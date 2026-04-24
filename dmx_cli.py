@@ -118,6 +118,94 @@ _fast_load_override = False
 # Restored to None at the end of each compress_file() call so state never leaks.
 _bfp_mantissa_override = None
 
+# HuggingFace config files to embed in the .dmx manifest for offline loading.
+# These are JSON-serializable text files that describe the model architecture,
+# tokenizer, and generation settings. Embedding them enables from_dmx() to
+# reconstruct the model without any network access to HuggingFace.
+_HF_CONFIG_FILES = [
+    "config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+]
+
+# Binary tokenizer files that may need base64 encoding.
+# tokenizer.json is the fast-tokenizer vocab (JSON, can be large ~2-4 MB).
+# tokenizer.model is sentencepiece binary (needs base64).
+_HF_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer.model",
+]
+
+
+def _collect_hf_configs(source_dir):
+    """Collect HuggingFace config/tokenizer files from a model directory.
+
+    Looks for config.json, tokenizer_config.json, etc. alongside the
+    safetensors files. Returns a dict suitable for embedding in the .dmx
+    manifest under the ``"hf_config"`` key.
+
+    Parameters
+    ----------
+    source_dir : str
+        Directory containing the safetensors files (and hopefully config files).
+
+    Returns
+    -------
+    dict or None
+        Dict with keys like ``"config.json"`` mapped to their parsed JSON
+        contents (for JSON files) or base64-encoded strings (for binary files).
+        Returns None if no config files are found.
+    """
+    import base64
+
+    result = {}
+
+    # JSON config files — store as parsed dicts (natural JSON embedding)
+    for fname in _HF_CONFIG_FILES:
+        fpath = os.path.join(source_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    result[fname] = json.load(f)
+                logger.info("Embedded HF config: %s (%.1f KB)", fname,
+                            os.path.getsize(fpath) / 1024)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning("Skipping %s (parse error: %s)", fname, e)
+
+    # Tokenizer files — JSON or binary
+    for fname in _HF_TOKENIZER_FILES:
+        fpath = os.path.join(source_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                if fname.endswith(".json"):
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        result[fname] = json.load(f)
+                    logger.info("Embedded HF tokenizer: %s (%.1f KB)", fname,
+                                os.path.getsize(fpath) / 1024)
+                else:
+                    # Binary file (e.g. tokenizer.model) — base64 encode
+                    with open(fpath, "rb") as f:
+                        raw = f.read()
+                    result[fname] = {
+                        "_binary": True,
+                        "_encoding": "base64",
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                    logger.info("Embedded HF tokenizer (binary): %s (%.1f KB)", fname,
+                                len(raw) / 1024)
+            except Exception as e:
+                logger.warning("Skipping %s (error: %s)", fname, e)
+
+    if not result:
+        return None
+
+    if "config.json" not in result:
+        logger.warning("No config.json found in %s — model_id will still be "
+                       "required for loading", source_dir)
+
+    return result
+
 
 def build_provenance_manifest(source_path, source_format, param_count,
                               parent_manifest=None):
@@ -2098,6 +2186,12 @@ def _compress_shards_parallel(shard_paths, output_path, mode="auto",
     if skip_layers_patterns:
         manifest["skip_layers"] = list(skip_layers_patterns)
 
+    # Embed HuggingFace config files for offline loading
+    source_dir = os.path.dirname(os.path.abspath(shard_paths[0]))
+    hf_configs = _collect_hf_configs(source_dir)
+    if hf_configs:
+        manifest["hf_config"] = hf_configs
+
     # --- Provenance ---
     content_hasher = hashlib.sha256()
     for key in all_keys:
@@ -2420,6 +2514,12 @@ def compress_file(input_path, output_path, mode="auto", entropy="auto", use_gpu=
     # Record skip_layers intent in manifest (Option D: loader visibility)
     if _skip_layers_patterns:
         manifest["skip_layers"] = list(_skip_layers_patterns)
+
+    # Embed HuggingFace config files for offline loading
+    source_dir = os.path.dirname(os.path.abspath(shard_paths[0]))
+    hf_configs = _collect_hf_configs(source_dir)
+    if hf_configs:
+        manifest["hf_config"] = hf_configs
 
     compressed_chunks = {}
     total_raw = 0
@@ -3472,6 +3572,28 @@ def info_file(input_path):
     print(f"  Encoding breakdown:")
     for enc, count in sorted(enc_counts.items()):
         print(f"    {enc_names.get(enc, f'Unknown({enc})')}: {count} tensors")
+
+    # Embedded HF config
+    hf_config = manifest.get("hf_config")
+    if hf_config:
+        embedded_files = sorted(hf_config.keys())
+        total_kb = 0
+        for fname in embedded_files:
+            content = hf_config[fname]
+            if isinstance(content, dict) and content.get("_binary"):
+                import base64
+                total_kb += len(base64.b64decode(content["data"])) / 1024
+            else:
+                total_kb += len(json.dumps(content)) / 1024
+        print(f"  Embedded HF config: {len(embedded_files)} files ({total_kb:.1f} KB)")
+        for fname in embedded_files:
+            print(f"    {fname}")
+        if "config.json" in hf_config:
+            cfg = hf_config["config.json"]
+            arch = cfg.get("architectures", [None])[0] or cfg.get("model_type", "unknown")
+            print(f"    Model architecture: {arch}")
+    else:
+        print(f"  Embedded HF config: none (model_id required for loading)")
 
     # Show a few sample tensors
     keys = sorted(manifest["tensors"].keys())
