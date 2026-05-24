@@ -1,0 +1,18 @@
+{
+  "portfolio_bridge": {
+    "repo_id": "REPO-DMX",
+    "repo_name": "dmx",
+    "role": "archived-experiments",
+    "github": "kas1987/dmx",
+    "parent_epic": "EPIC-DMX-099",
+    "control_plane": {
+      "path": "e:/.10_AI-project-management-harness/ai-project-management-harness",
+      "portfolio_registry": "08_GOVERNANCE/PORTFOLIO_REGISTRY.yaml"
+    },
+    "surface_map": "PROJECT_INDEX.json",
+    "connections": {
+      "REPO-SYSTEMS": { "path": "e:/.00_Chromatic_Systems", "role": "meta-system" }
+    },
+    "updated_at": "2026-05-24"
+  }
+}

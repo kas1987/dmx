@@ -1,0 +1,21 @@
+{
+  "name": "dmx",
+  "repo_id": "REPO-DMX",
+  "role": "archived-experiments",
+  "parent_epic": "EPIC-DMX-099",
+  "github": "kas1987/dmx",
+  "portfolio_registry": "e:/.10_AI-project-management-harness/ai-project-management-harness/08_GOVERNANCE/PORTFOLIO_REGISTRY.yaml",
+  "control_plane": "e:/.10_AI-project-management-harness/ai-project-management-harness",
+  "project": "dmx — archived-experiments",
+  "version": "0.1.0",
+  "status": "active",
+  "updated_at": "2026-05-24",
+  "chromatic_folder_system": {
+    "parent_standard_ref": "e:/.00_Chromatic_Systems/CHROMATIC_TREES.md",
+    "compliance": "partial"
+  },
+  "source_of_truth": {
+    "agent_rules": "AGENTS.md",
+    "entry_file": "CLAUDE.md"
+  }
+}
